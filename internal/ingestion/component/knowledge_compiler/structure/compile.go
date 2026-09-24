@@ -454,11 +454,38 @@ func declaredOntology(parserConfig map[string]any) (map[string]bool, map[string]
 //   - an assertion whose property the template does not declare at all is kept:
 //     the model graph surfaces such vocabulary drift as "observed, not declared"
 //     rather than hiding it.
-func filterOutOfOntologyRelations(prods []common.Product, parserConfig map[string]any) []common.Product {
+//
+// filterOutOfOntologyRelations splits object-property assertions into the ones
+// the template's declaration admits and the ones it rejects, returning both.
+//
+// This is the ONLY place the declared domain / range is enforced. The prompt
+// states it in prose, and the relation stage never even receives the entities'
+// classes (the "## Known Entities" list is names only), so the model can and
+// does violate it — see ontology.md §8. Enforcing it here costs no extra model
+// call.
+//
+// Three deliberate NON-drops:
+//   - an endpoint whose class is unknown (left unstamped because that entity was
+//     not compiled in this batch) is kept: the declaration is not contradicted,
+//     and dropping would lose data on partial batches — the ontology model graph
+//     reports it as an unattributed relation instead;
+//   - an assertion whose property the template does not declare at all is kept:
+//     vocabulary drift must be visible, not hidden;
+//   - an endpoint class that is a DECLARED DESCENDANT of the declared one is
+//     kept: rdfs:subClassOf is transitive, so a person satisfies a property
+//     declared on agent (ontology.md §8 (20) — the model graph expands
+//     inheritance with ancestorChain, and a writer that did not would silently
+//     disagree with the view it feeds).
+//
+// Rejected assertions are returned rather than discarded, so the caller can
+// write them down: ontology.md §2.7's feedback loop cannot start from evidence
+// that was never recorded (§8 (18)).
+func filterOutOfOntologyRelations(prods []common.Product, parserConfig map[string]any) (kept, rejected []common.Product) {
 	classes, props := declaredOntology(parserConfig)
 	if len(classes) == 0 || len(props) == 0 {
-		return prods
+		return prods, nil
 	}
+	ancestors := ontologyClassAncestors(parserConfig)
 	inList := func(list []string, want string) bool {
 		for _, v := range list {
 			if v == want {
@@ -467,28 +494,107 @@ func filterOutOfOntologyRelations(prods []common.Product, parserConfig map[strin
 		}
 		return false
 	}
-	out := make([]common.Product, 0, len(prods))
+	// satisfies reports whether an observed endpoint class is admissible: either
+	// the declaration names it, or it is a declared descendant of a named class.
+	satisfies := func(observed string, declared []string) bool {
+		if observed == "" || len(declared) == 0 {
+			return true
+		}
+		if inList(declared, observed) {
+			return true
+		}
+		for _, ancestor := range ancestors[observed] {
+			if inList(declared, ancestor) {
+				return true
+			}
+		}
+		return false
+	}
+	kept = make([]common.Product, 0, len(prods))
 	for _, p := range prods {
 		if kind, _ := p.Meta["kind"].(string); kind != "relation" {
-			out = append(out, p)
+			kept = append(kept, p)
 			continue
 		}
 		prop, _ := p.Meta["relation_type"].(string)
-		spec, declared := props[strings.TrimSpace(prop)]
-		if !declared || spec.kind != "object" {
-			out = append(out, p)
+		spec, isDeclared := props[strings.TrimSpace(prop)]
+		if !isDeclared || spec.kind != "object" {
+			kept = append(kept, p)
 			continue
 		}
 		fromType, _ := p.Meta["from_type"].(string)
 		toType, _ := p.Meta["to_type"].(string)
 		fromType, toType = strings.TrimSpace(fromType), strings.TrimSpace(toType)
-		if fromType != "" && len(spec.domains) > 0 && !inList(spec.domains, fromType) {
+		if !satisfies(fromType, spec.domains) {
+			rejected = append(rejected, droppedRelation(p, "domain", prop, fromType, spec.domains))
 			continue
 		}
-		if toType != "" && len(spec.ranges) > 0 && !inList(spec.ranges, toType) {
+		if !satisfies(toType, spec.ranges) {
+			rejected = append(rejected, droppedRelation(p, "range", prop, toType, spec.ranges))
 			continue
 		}
-		out = append(out, p)
+		kept = append(kept, p)
+	}
+	return kept, rejected
+}
+
+// droppedRelation turns a rejected assertion into a row of its own
+// (kind "dropped_relation") instead of letting it vanish. It keeps the same
+// endpoint meta a relation carries, so the row lands with prop_kwd /
+// from_entity_kwd / to_entity_kwd / from_type_kwd / to_type_kwd and the quality
+// panel can list what was rejected, count it per property and point the reader
+// at the document it came from. The reason rides in the content, so no column is
+// added for it.
+func droppedRelation(p common.Product, side, prop, observed string, declared []string) common.Product {
+	meta := make(map[string]any, len(p.Meta)+2)
+	for k, v := range p.Meta {
+		meta[k] = v
+	}
+	meta["kind"] = "dropped_relation"
+	meta["drop_side"] = side
+	out := p
+	out.Meta = meta
+	out.Content = fmt.Sprintf("dropped %s: the template declares %s %s, the assertion used %q",
+		prop, side, strings.Join(declared, "|"), observed)
+	return out
+}
+
+// ontologyClassAncestors maps each declared class to its declared ancestors,
+// nearest first (breadth-first over `parent`, `|`-separated), with cycles cut.
+// It is the writer-side twin of the model graph's ancestorChain: without it the
+// declared domain / range would reject subclass instances that standard
+// semantics admit (ontology.md §8 (20)).
+func ontologyClassAncestors(parserConfig map[string]any) map[string][]string {
+	parents := map[string][]string{}
+	for _, raw := range configFields(common.GetMap(parserConfig, "entity")) {
+		f, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(stringOf(f["type"]))
+		if name == "" {
+			continue
+		}
+		parents[name] = splitPipeList(stringOf(f["parent"]))
+	}
+	out := map[string][]string{}
+	for name := range parents {
+		seen := map[string]bool{name: true}
+		queue := append([]string{}, parents[name]...)
+		var chain []string
+		for len(queue) > 0 {
+			next := queue[0]
+			queue = queue[1:]
+			if next == "" || seen[next] {
+				continue
+			}
+			seen[next] = true
+			chain = append(chain, next)
+			queue = append(queue, parents[next]...)
+		}
+		if len(chain) > 0 {
+			out[name] = chain
+		}
 	}
 	return out
 }

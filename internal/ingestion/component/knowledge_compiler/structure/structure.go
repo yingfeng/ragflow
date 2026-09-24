@@ -232,7 +232,18 @@ func Run(ctx context.Context, deps common.Deps, param common.Param, inputs commo
 	// what resolves each endpoint to its class. A template that declares no
 	// domain / range (every non-ontology template, and knowledge_graph.yaml)
 	// yields no object properties here, so nothing is dropped for them.
-	prods = filterOutOfOntologyRelations(prods, parserConfig)
+	// Rejected assertions come back as rows of their own (kind
+	// "dropped_relation") instead of disappearing. The feedback loop has to see
+	// what was rejected before it can act on it, and a later re-projection after
+	// widening a declaration cannot recover an assertion that was never written
+	// down (ontology.md §2.7 (1) / §8 (18)).
+	prods, rejectedRelations := filterOutOfOntologyRelations(prods, parserConfig)
+	if len(rejectedRelations) > 0 {
+		runtime.ReportProgressMessage(ctx, "Compiler", fmt.Sprintf(
+			"%s-template: %d relation(s) rejected by the declared domain/range, kept as dropped_relation rows",
+			compileType, len(rejectedRelations)))
+	}
+	prods = append(prods, rejectedRelations...)
 	// Then materialize the hypernode / hyperedge layer OG-RAG's retrieval
 	// consumes (ontology.md §5 step ④⑤). Runs on the final rows — after dedup,
 	// stamping and filtering — because the descent needs settled names and

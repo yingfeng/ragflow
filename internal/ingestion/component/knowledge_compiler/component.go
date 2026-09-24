@@ -681,7 +681,8 @@ func applyVariantColumns(doc *schema.ChunkDoc, p common.Product) error {
 
 // applyStructureGraphColumns emits the structure-graph row columns shared by the
 // structure and tree variants (Python _struct_to_doc_storage_doc contract):
-//   - knowledge_graph_kwd: "entity" | "relation" | "hyperedge" | "hypernode"
+//   - knowledge_graph_kwd: "entity" | "relation" | "dropped_relation" |
+//     "hyperedge" | "hypernode"
 //   - relations: from_entity_kwd / to_entity_kwd / prop_kwd /
 //     from_type_kwd / to_type_kwd
 //   - entities: name_kwd (lowercased) / entity_type_kwd
@@ -695,7 +696,11 @@ func applyStructureGraphColumns(doc *schema.ChunkDoc, p common.Product, kind str
 			return err
 		}
 	}
-	if kind == "relation" {
+	// A dropped assertion carries the same endpoint columns as the relation it
+	// would have been: the quality panel lists what was rejected exactly the way
+	// it lists what survived, and the reason is in the row's content rather than
+	// in a column of its own (ontology.md §2.7 (1)).
+	if kind == "relation" || kind == "dropped_relation" {
 		if v := metaString(p.Meta, "from"); v != "" {
 			if err := doc.SetExtraValue("from_entity_kwd", v); err != nil {
 				return err

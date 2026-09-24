@@ -618,6 +618,10 @@ func (r *Router) Setup(engine *gin.Engine) {
 			// Compilation template routes
 			v1.GET("/compilation-templates/builtins", r.compilationTemplateHandler.ListBuiltins)
 			v1.GET("/compilation-templates/wiki-presets", r.compilationTemplateHandler.ListWikiPresets)
+			// One confirmed edit from the compile-quality ledger. Served by the
+			// group handler because the write path (and its validation) is the
+			// group's.
+			v1.POST("/compilation-templates/:template_id/ontology-fix", r.compilationTemplateGroupHandler.ApplyOntologyFix)
 
 			// Compilation template group routes
 			v1.GET("/compilation-template-groups", r.compilationTemplateGroupHandler.List)

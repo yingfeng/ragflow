@@ -101,6 +101,13 @@ export interface IOntologyProperty {
   target: string;
   relations: number;
   declared: boolean;
+  /**
+   * The template declares this property BY NAME, but not this source → target
+   * pair. Kept apart from `declared` because the edit differs: a name the
+   * template already has cannot be declared again (the writer refuses it), so
+   * this pair is fixed by widening the side the template left out.
+   */
+  declared_name?: boolean;
 }
 
 /** rdfs:subClassOf, drawn as its own edge type so it can be toggled. */
@@ -124,6 +131,41 @@ export interface IOntologyPitfall {
   subjects: string[];
 }
 
+/** One assertion the declared domain / range rejected, as the compiler recorded it. */
+export interface IOntologyDroppedRelation {
+  property: string;
+  from?: string;
+  to?: string;
+  from_type?: string;
+  to_type?: string;
+  /** The compiler's own sentence, naming the declaration that was violated. */
+  reason?: string;
+  doc_id?: string;
+}
+
+/**
+ * The compile-quality ledger: the numbers a reader checks to decide whether this
+ * scope is good enough yet. Every one of them is acted on by editing the TEMPLATE
+ * or re-reading the documents — never by editing a row.
+ */
+export interface IOntologyQuality {
+  /** Property names the data carries that the template never declared. */
+  undeclared_properties: number;
+  /** Assertions the declared domain / range rejected (kept as their own rows). */
+  dropped_relations: number;
+  /** Compiled entities whose class stamp is missing, so they are off the graph. */
+  untyped_entities: number;
+  /** Declared classes this scope produced no instance for. */
+  classes_without_instances: number;
+  /** Declared object properties this scope produced no assertion for. */
+  properties_without_assertions: number;
+  /** Declaration findings, mirroring the pitfalls list. */
+  pitfalls: number;
+  dropped_samples?: IOntologyDroppedRelation[];
+  /** Only a page of the rejections is included; the count above is complete. */
+  samples_truncated: boolean;
+}
+
 export interface IOntologyGraph {
   classes: IOntologyClass[];
   properties: IOntologyProperty[];
@@ -135,6 +177,7 @@ export interface IOntologyGraph {
   counts_truncated: boolean;
   /** Relations whose endpoints carry no class, so they are off the model graph. */
   unattributed_relations: number;
+  quality?: IOntologyQuality;
 }
 
 /**

@@ -163,6 +163,12 @@ type OntologyPropertyEdge struct {
 	// Declared is false for a property observed in the data but not declared by
 	// the template.
 	Declared bool `json:"declared"`
+	// DeclaredName is true when the template declares this property BY NAME but
+	// not this source → target pair. The two cases are not the same problem and
+	// must not share an edit: a name the template already declares cannot be
+	// declared again (the writer refuses it), so this pair's edit is widening the
+	// side the template left out.
+	DeclaredName bool `json:"declared_name,omitempty"`
 }
 
 // OntologyGraph is the ontology view of one template bucket.
@@ -191,6 +197,53 @@ type OntologyGraph struct {
 	// stamp, so they cannot be placed on the class-level graph. Reported so the
 	// per-edge counts reconcile against TotalRelations.
 	UnattributedRelations int `json:"unattributed_relations"`
+	// Quality is the ledger the host page shows: the numbers a reader checks to
+	// decide whether this compile is good enough yet (ontology.md §2.7 (1b)).
+	Quality OntologyQuality `json:"quality"`
+}
+
+// OntologyQuality answers "does this ontology hold for this scope" with counts
+// rather than prose, because the reader's next action depends on which number is
+// non-zero (ontology.md §2.7 (4)).
+type OntologyQuality struct {
+	// UndeclaredProperties: properties observed in the data that the template
+	// never declared (vocabulary drift). Zero is the goal; a non-zero number is
+	// either a missing declaration or a name the extractor invented.
+	UndeclaredProperties int `json:"undeclared_properties"`
+	// DroppedRelations: assertions the declared domain / range rejected. They are
+	// kept as rows of their own, so this number exists at all — before, they
+	// vanished silently and nothing could count them (ontology.md §8 (18)).
+	DroppedRelations int `json:"dropped_relations"`
+	// UntypedEntities: entity rows with no class stamp, which cannot be placed on
+	// the class-level graph.
+	UntypedEntities int `json:"untyped_entities"`
+	// ClassesWithoutInstances / PropertiesWithoutAssertions: the declarations the
+	// data never exercised. Coverage as a number a reader can act on.
+	ClassesWithoutInstances     int `json:"classes_without_instances"`
+	PropertiesWithoutAssertions int `json:"properties_without_assertions"`
+	// Pitfalls mirrors the declaration findings so the reader does not have to
+	// count a list to know whether the template itself is sound.
+	Pitfalls int `json:"pitfalls"`
+	// DroppedSamples are the first few rejections, so the panel can list them and
+	// point at the property whose declaration wants widening.
+	DroppedSamples []OntologyDroppedRelation `json:"dropped_samples,omitempty"`
+	// SamplesTruncated reports that only a page of rejections is included, so the
+	// reader is not misled into thinking the list is complete.
+	SamplesTruncated bool `json:"samples_truncated"`
+}
+
+// OntologyDroppedRelation is one assertion the declaration rejected, carrying the
+// endpoints it used. The fix for it is always in the template, never in the row.
+type OntologyDroppedRelation struct {
+	Property string `json:"property"`
+	From     string `json:"from,omitempty"`
+	To       string `json:"to,omitempty"`
+	FromType string `json:"from_type,omitempty"`
+	ToType   string `json:"to_type,omitempty"`
+	// Reason is the compiler's own sentence (the row's content), which names the
+	// declared class that was violated.
+	Reason string `json:"reason,omitempty"`
+	DocID  string `json:"doc_id,omitempty"`
 }
 
 // declaredOntology is the template-declared half of the model graph.
@@ -865,7 +918,7 @@ func (s *DatasetArtifactService) buildOntologyGraph(
 		return nil, err
 	}
 
-	classCounts, attributeCounts, truncated, err := countOntologyClasses(ctx, tenantID, datasetID, entityFilter)
+	classCounts, attributeCounts, untypedEntities, truncated, err := countOntologyClasses(ctx, tenantID, datasetID, entityFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -874,6 +927,11 @@ func (s *DatasetArtifactService) buildOntologyGraph(
 		return nil, err
 	}
 	truncated = truncated || relTruncated
+
+	droppedTotal, droppedSamples, samplesTruncated, err := countDroppedRelations(ctx, tenantID, datasetID, baseFilter)
+	if err != nil {
+		return nil, err
+	}
 
 	graph := &OntologyGraph{
 		TotalEntities:         int(entityTotal),
@@ -885,7 +943,97 @@ func (s *DatasetArtifactService) buildOntologyGraph(
 		Inheritance:           mergeOntologyInheritance(declared),
 		Pitfalls:              buildOntologyPitfalls(declared, classCounts),
 	}
+	graph.Quality = buildOntologyQuality(graph, untypedEntities, droppedTotal, droppedSamples, samplesTruncated)
 	return graph, nil
+}
+
+// ontologyDroppedSampleLimit caps the rejection samples carried in the graph
+// response: enough to see the pattern and act on it, small enough to keep the
+// payload the size of a view (§2.7 (1b)).
+const ontologyDroppedSampleLimit = 50
+
+// countDroppedRelations counts the assertions the declared domain / range
+// rejected and returns a page of them. They are ordinary rows — kind
+// "dropped_relation", written by the compiler so a rejection left a trace
+// instead of disappearing (ontology.md §8 (18)) — so this is one scan, the same
+// shape as every other count on this page.
+func countDroppedRelations(
+	ctx context.Context, tenantID, datasetID string, baseFilter map[string]interface{},
+) (total int, samples []OntologyDroppedRelation, truncated bool, err error) {
+	filter := withKnowledgeGraphKWD(baseFilter, []string{"dropped_relation"})
+	_, totalCount, err := graphRowSearch(ctx, tenantID, datasetID, []string{"id"}, filter, nil, 0, 1, nil)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	if totalCount == 0 {
+		return 0, nil, false, nil
+	}
+	rows, _, err := graphRowSearch(ctx, tenantID, datasetID,
+		[]string{"prop_kwd", "from_entity_kwd", "to_entity_kwd", "from_type_kwd", "to_type_kwd",
+			"content_with_weight", "doc_id"},
+		filter, nil, 0, ontologyDroppedSampleLimit, nil)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	for _, row := range rows {
+		samples = append(samples, OntologyDroppedRelation{
+			Property: strings.TrimSpace(firstStringValue(row["prop_kwd"])),
+			From:     strings.TrimSpace(firstStringValue(row["from_entity_kwd"])),
+			To:       strings.TrimSpace(firstStringValue(row["to_entity_kwd"])),
+			FromType: strings.TrimSpace(firstStringValue(row["from_type_kwd"])),
+			ToType:   strings.TrimSpace(firstStringValue(row["to_type_kwd"])),
+			Reason:   strings.TrimSpace(firstStringValue(row["content_with_weight"])),
+			DocID:    strings.TrimSpace(firstStringValue(row["doc_id"])),
+		})
+	}
+	return int(totalCount), samples, int(totalCount) > len(samples), nil
+}
+
+// buildOntologyQuality folds the numbers the caller already computed into the
+// ledger. It issues no query of its own: drift and coverage are read off the
+// graph that was just assembled, so the ledger costs nothing extra
+// (ontology.md §6.5 D).
+func buildOntologyQuality(
+	graph *OntologyGraph,
+	untypedEntities, droppedTotal int,
+	droppedSamples []OntologyDroppedRelation,
+	samplesTruncated bool,
+) OntologyQuality {
+	quality := OntologyQuality{
+		UntypedEntities:  untypedEntities,
+		DroppedRelations: droppedTotal,
+		DroppedSamples:   droppedSamples,
+		SamplesTruncated: samplesTruncated,
+		Pitfalls:         len(graph.Pitfalls),
+	}
+	for _, property := range graph.Properties {
+		if !property.Declared {
+			if property.DeclaredName {
+				// The name is declared; only this endpoint pair is not. Counting
+				// it here would report a problem the reader cannot fix by
+				// declaring anything — and would keep the number above zero even
+				// after every declaration was added.
+				continue
+			}
+			// Vocabulary drift: the data carries a property the template never
+			// declared. mergeOntologyProperties has already marked it, so this is
+			// a count over the merged list rather than another scan.
+			quality.UndeclaredProperties++
+			continue
+		}
+		if property.Relations == 0 {
+			// Declared, but no assertion in this scope exercised it. Only object
+			// properties appear in this list, so a datatype property is not
+			// miscounted as uncovered.
+			quality.PropertiesWithoutAssertions++
+		}
+	}
+	for _, class := range graph.Classes {
+		if class.Declared && class.Entities == 0 {
+			quality.ClassesWithoutInstances++
+		}
+	}
+	return quality
 }
 
 // mergeOntologyInheritance turns each class's declared parent into one edge per
@@ -921,7 +1069,7 @@ func ontologyEdgeKey(prop, source, target string) string {
 // not-yet-wired JSON path filter of §8.
 func countOntologyClasses(
 	ctx context.Context, tenantID, datasetID string, filter map[string]interface{},
-) (counts map[string]int, attrs attributeCounts, truncated bool, err error) {
+) (counts map[string]int, attrs attributeCounts, untyped int, truncated bool, err error) {
 	counts = map[string]int{}
 	attrs = attributeCounts{}
 	scanned := 0
@@ -929,15 +1077,19 @@ func countOntologyClasses(
 		page, _, searchErr := graphRowSearch(ctx, tenantID, datasetID,
 			[]string{"id", "entity_type_kwd", "attr"}, filter, nil, offset, ontologyCountPageSize, nil)
 		if searchErr != nil {
-			return nil, nil, false, searchErr
+			return nil, nil, 0, false, searchErr
 		}
 		if len(page) == 0 {
-			return counts, attrs, false, nil
+			return counts, attrs, untyped, false, nil
 		}
 		for _, row := range page {
 			scanned++
 			typ := strings.TrimSpace(firstStringValue(row["entity_type_kwd"]))
 			if typ == "" {
+				// Counted rather than skipped: an entity with no class cannot be
+				// placed on the class-level graph, and the quality ledger is where
+				// that has to be visible (ontology.md §2.7 (4)).
+				untyped++
 				continue
 			}
 			counts[typ]++
@@ -952,10 +1104,10 @@ func countOntologyClasses(
 			}
 		}
 		if scanned >= ontologyCountScanCap {
-			return counts, attrs, true, nil
+			return counts, attrs, untyped, true, nil
 		}
 		if len(page) < ontologyCountPageSize {
-			return counts, attrs, false, nil
+			return counts, attrs, untyped, false, nil
 		}
 	}
 }
@@ -1103,11 +1255,15 @@ func mergeOntologyProperties(declared declaredOntology, counts map[string]int) [
 		if len(parts) != 3 {
 			continue
 		}
+		// The name may still be declared, with a different endpoint pair. Keep
+		// that apart: the reader can widen a side, not re-declare a name.
+		_, nameDeclared := declared.props[parts[0]]
 		out = append(out, OntologyPropertyEdge{
-			Type:      parts[0],
-			Source:    parts[1],
-			Target:    parts[2],
-			Relations: counts[key],
+			Type:         parts[0],
+			Source:       parts[1],
+			Target:       parts[2],
+			Relations:    counts[key],
+			DeclaredName: nameDeclared,
 		})
 	}
 	return out

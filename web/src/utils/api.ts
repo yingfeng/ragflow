@@ -419,6 +419,9 @@ export default {
   compilationTemplateGroup: (id: string) =>
     `${restAPIv1}/compilation-template-groups/${id}`,
   wikiPresets: `${restAPIv1}/compilation-templates/wiki-presets`,
+  // One confirmed edit from the compile-quality ledger (ontology.md §2.7).
+  compilationTemplateOntologyFix: (id: string) =>
+    `${restAPIv1}/compilation-templates/${id}/ontology-fix`,
 
   // mcp server
   listMcpServer: `${restAPIv1}/mcp/servers`,

@@ -43,6 +43,7 @@ import {
   type OntologyDetailPanelState,
 } from '@/components/structure-graph/ontology-model-graph/detail-panel';
 import { OntologyStats } from '@/components/structure-graph/ontology-model-graph/ontology-stats';
+import { OntologyQualityPanel } from '@/components/structure-graph/ontology-model-graph/quality-panel';
 import { useRunEndEffect } from './hooks/use-run-end-effect';
 import { CompilationLoadingCard } from './loading-card';
 import { CompilationUpdateButton } from './update-button';
@@ -223,8 +224,14 @@ export function DatasetStructureView({ kind }: DatasetStructureViewProps) {
         // The ontology's numbers are page-level information, so they are laid
         // out here rather than floated over the canvas — an overlay wider than
         // the canvas column spills under the detail panel next to it.
-        <div className="px-4 pt-3">
+        // Shrunk-to-content: the canvas row below is `flex-1`, so nothing here
+        // may grow. The ledger stays one line until it is opened, and its
+        // details carry their own height cap.
+        <div className="flex shrink-0 flex-col gap-2 px-4 pt-3">
           <OntologyStats graph={template?.ontology} />
+          {/* The ledger sits next to the totals: the totals say what the scope
+              contains, the ledger says what still has to be fixed. */}
+          <OntologyQualityPanel graph={template?.ontology} />
         </div>
       )}
       <div className="mt-0 flex flex-1 min-h-0 gap-3">

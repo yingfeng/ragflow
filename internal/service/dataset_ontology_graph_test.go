@@ -281,6 +281,53 @@ func TestMergeOntologyPropertiesKeepsOnlyObjectProperties(t *testing.T) {
 	}
 }
 
+// A name the template declares, observed with an endpoint pair it does not
+// declare, is NOT an undeclared property. The writer refuses to declare a name
+// the template already has, so the ledger has to tell the two apart and offer
+// the edit that can actually be applied — widening the side left out.
+func TestMergeOntologyPropertiesSeparatesADeclaredNameFromAnUndeclaredPair(t *testing.T) {
+	declared := parseDeclaredOntology(ontologyTestConfig(
+		[]map[string]interface{}{{"type": "event"}, {"type": "place"}, {"type": "work"}},
+		[]map[string]interface{}{
+			{"type": "part_of", "kind": "object", "domain": "event", "range": "place"},
+		},
+	))
+	edges := mergeOntologyProperties(declared, map[string]int{
+		ontologyEdgeKey("part_of", "event", "place"): 5,
+		ontologyEdgeKey("part_of", "event", "work"):  2,
+		ontologyEdgeKey("genre", "work", "place"):    1,
+	})
+	byKey := map[string]OntologyPropertyEdge{}
+	for _, edge := range edges {
+		byKey[edge.Type+"|"+edge.Source+"|"+edge.Target] = edge
+	}
+	if got := byKey["part_of|event|work"]; got.Declared || !got.DeclaredName {
+		t.Fatalf("part_of event->work = %+v, want declared=false and declared_name=true", got)
+	}
+	if got := byKey["genre|work|place"]; got.Declared || got.DeclaredName {
+		t.Fatalf("genre work->place = %+v, want a genuinely undeclared property", got)
+	}
+}
+
+// The counter above the list has to agree with the list: a declared name with an
+// undeclared pair is not counted as an undeclared property, or the ledger would
+// show a number the reader can never bring down.
+func TestBuildOntologyQualityCountsOnlyGenuinelyUndeclaredProperties(t *testing.T) {
+	quality := buildOntologyQuality(
+		&OntologyGraph{
+			Properties: []OntologyPropertyEdge{
+				{Type: "part_of", Source: "event", Target: "work", Relations: 2, DeclaredName: true},
+				{Type: "genre", Source: "work", Target: "place", Relations: 1},
+				{Type: "part_of", Source: "event", Target: "place", Relations: 5, Declared: true},
+			},
+		},
+		0, 0, nil, false,
+	)
+	if quality.UndeclaredProperties != 1 {
+		t.Fatalf("undeclared = %d, want 1 (only genre)", quality.UndeclaredProperties)
+	}
+}
+
 // A parent the template does not declare is dropped from the edge list: there is
 // no node to point at.
 func TestMergeOntologyInheritanceSkipsUndeclaredParent(t *testing.T) {

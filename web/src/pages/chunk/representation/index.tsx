@@ -5,10 +5,12 @@ import { SkeletonCard } from '@/components/skeleton-card';
 import { Button } from '@/components/ui/button';
 import { CompilationTemplateKind } from '@/constants/compilation';
 import {
+  DocumentStructureKeys,
   useDeleteDocumentStructureGraph,
   useFetchDocumentClaims,
 } from '@/hooks/use-document-request';
 import { useIsGoBackend } from '@/utils/backend-variant';
+import { useQueryClient } from '@tanstack/react-query';
 import { Trash2 } from 'lucide-react';
 import { memo, useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -24,6 +26,10 @@ import { RepresentationSelect } from './components/representation-select';
 import { useGraphEntitySearch } from './hooks/use-graph-entity-search';
 import type { OntologyDetailPanelState } from '@/components/structure-graph/ontology-model-graph/detail-panel';
 import { OntologyStats } from '@/components/structure-graph/ontology-model-graph/ontology-stats';
+import { OntologyQualityPanel } from '@/components/structure-graph/ontology-model-graph/quality-panel';
+import type { OntologyFixAction } from '@/components/structure-graph/ontology-model-graph/quality-panel';
+import { applyOntologyFixes } from '@/services/compilation-template-group-service';
+import { useRunDocument } from '@/hooks/use-document-request';
 import { useGetKnowledgeSearchParams } from '@/hooks/route-hook';
 
 export type {
@@ -64,6 +70,7 @@ function Representation({
   onOntologyPanelChange,
   onOntologyViewChange,
 }: RepresentationProps) {
+
   const { t } = useTranslation();
   const isGo = useIsGoBackend();
   // Both halves of the scope: the graph on this page is one DOCUMENT's, so the
@@ -97,6 +104,55 @@ function Representation({
     handleTemplateChange,
     handleNodeClick,
   } = useGraphEntitySearch(onNodeClick);
+
+  // Applying a ledger edit is two steps the reader asked for as one action:
+  // change the template, then re-compile the documents the finding came from.
+  // This page's scope is a single document, so the target is never ambiguous.
+  const { runDocumentByIds } = useRunDocument();
+  const queryClient = useQueryClient();
+  const handleApplyOntologyFixes = useCallback(
+    async (fixes: OntologyFixAction[]) => {
+      const templateId = (selectedTemplate as { template_id?: string } | undefined)
+        ?.template_id;
+      if (!templateId) {
+        throw new Error('this template has no id to edit');
+      }
+      // One write for the whole selection, then ONE re-compile of the union of
+      // the documents the selection came from: re-compiling calls the model, so
+      // selecting five lines must not mean five compiles.
+      const envelope = await applyOntologyFixes(
+        templateId,
+        fixes.map((fix) => ({
+          op: fix.op,
+          property: fix.property,
+          side: fix.side,
+          class: fix.class,
+          domain: fix.domain,
+          range: fix.range,
+          datatype: fix.datatype,
+        })),
+      );
+      if (envelope && envelope.code !== 0) {
+        // The service names the edit it refused, which is what the reader needs
+        // to fix it; the fallback is only for a response that carried nothing.
+        throw new Error(envelope.message || 'the template refused the change');
+      }
+      const documentIds = Array.from(
+        new Set(fixes.flatMap((fix) => fix.docIds)),
+      );
+      const target = documentIds.length > 0 ? documentIds : documentId ? [documentId] : [];
+      if (target.length > 0) {
+        await runDocumentByIds({ documentIds: target, run: 1 });
+      }
+      // The ledger is the page's own read of the same template. Without this the
+      // lines that were just applied stay on screen, and the next click offers
+      // the same edit again — which the writer now refuses as a duplicate.
+      queryClient.invalidateQueries({
+        queryKey: DocumentStructureKeys.graph(datasetId, documentId),
+      });
+    },
+    [selectedTemplate, documentId, runDocumentByIds, queryClient, datasetId],
+  );
 
   // Tree leaves carry a claim-count badge: clicking one opens its claims in the
   // artifact page's middle column, in addition to the usual chunk navigation.
@@ -296,8 +352,15 @@ function Representation({
         // The ontology's numbers live in the page header rather than as a canvas
         // overlay: an overlay is wider than this column the moment the detail
         // column opens, and it then spills under the panel.
-        <div className="mt-3">
+        // Shrunk-to-content, for the same reason as the dataset page: the
+        // representation below must keep its height, and the ledger below is one
+        // line until it is opened.
+        <div className="mt-3 flex shrink-0 flex-col gap-2">
           <OntologyStats graph={selectedTemplate.ontology} />
+          <OntologyQualityPanel
+            graph={selectedTemplate.ontology}
+            onApplyFixes={handleApplyOntologyFixes}
+          />
         </div>
       )}
       {loading && !data && <SkeletonCard className="mt-6" />}

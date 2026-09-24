@@ -959,7 +959,7 @@ func TestFilterOutOfOntologyRelations(t *testing.T) {
 		relationRow("invented", "place", "place"),               // undeclared => keep
 		{Meta: map[string]any{"kind": "entity", "name": "Ada"}}, // not a relation
 	}
-	got := filterOutOfOntologyRelations(rows, cfg)
+	got, _ := filterOutOfOntologyRelations(rows, cfg)
 	if len(got) != 4 {
 		t.Fatalf("rows = %d, want 4 (only the two contradicting endpoints dropped)", len(got))
 	}
@@ -976,6 +976,59 @@ func TestFilterOutOfOntologyRelations(t *testing.T) {
 	}
 }
 
+// A subclass instance satisfies a property declared on its superclass: person is
+// declared as a child of agent, so an assertion typed (person, place) must
+// survive a property whose domain is agent. The model graph expands inheritance
+// the same way (ancestorChain), and a writer that did not would drop rows the
+// view then claims exist — ontology.md §8 (20).
+func TestFilterOutOfOntologyRelationsKeepsSubclassEndpoints(t *testing.T) {
+	cfg := ontologyParserConfig()
+	rel := cfg["relation"].(map[string]any)
+	rel["fields"] = append(rel["fields"].([]any), map[string]any{
+		"type": "leads", "kind": "object", "domain": "agent", "range": "place",
+	})
+	rows := []common.Product{
+		relationRow("leads", "person", "place"), // person is a declared child of agent => keep
+		relationRow("leads", "agent", "place"),  // the declared class itself => keep
+		relationRow("leads", "place", "place"),  // unrelated class => the domain rejects it
+	}
+	kept, rejected := filterOutOfOntologyRelations(rows, cfg)
+	if len(kept) != 2 {
+		t.Fatalf("kept = %d, want 2 (the subclass and the declared class itself)", len(kept))
+	}
+	if len(rejected) != 1 {
+		t.Fatalf("rejected = %d, want 1", len(rejected))
+	}
+}
+
+// A rejected assertion is handed back as a row instead of vanishing: it keeps
+// the property and both endpoint classes so the quality panel can list it, and
+// the reason rides in the content (no column of its own). A rejection nobody
+// wrote down cannot drive the feedback loop — ontology.md §2.7 (1).
+func TestFilterOutOfOntologyRelationsReportsRejected(t *testing.T) {
+	rows := []common.Product{relationRow("born_in", "place", "person")} // reversed => domain rejects
+	kept, rejected := filterOutOfOntologyRelations(rows, ontologyParserConfig())
+	if len(kept) != 0 || len(rejected) != 1 {
+		t.Fatalf("kept = %d rejected = %d, want 0 / 1", len(kept), len(rejected))
+	}
+	got := rejected[0]
+	if kind, _ := got.Meta["kind"].(string); kind != "dropped_relation" {
+		t.Fatalf("kind = %q, want dropped_relation", kind)
+	}
+	if side, _ := got.Meta["drop_side"].(string); side != "domain" {
+		t.Fatalf("drop_side = %q, want domain", side)
+	}
+	if prop, _ := got.Meta["relation_type"].(string); prop != "born_in" {
+		t.Fatalf("prop = %q, want born_in", prop)
+	}
+	if from, _ := got.Meta["from_type"].(string); from != "place" {
+		t.Fatalf("from_type = %q, want the observed class kept for the panel", from)
+	}
+	if !strings.Contains(got.Content, "person") {
+		t.Fatalf("content %q must name the declared class", got.Content)
+	}
+}
+
 // A template that declares no domain / range (every non-ontology template, and
 // knowledge_graph.yaml specifically) must see its relations untouched — the
 // enforcement cannot silently change existing behaviour.
@@ -984,7 +1037,7 @@ func TestFilterOutOfOntologyRelationsLeavesPlainGraphAlone(t *testing.T) {
 		relationRow("linked", "letter", "letter"),
 		relationRow("linked", "anything", "whatever"),
 	}
-	got := filterOutOfOntologyRelations(rows, graphParserConfig())
+	got, _ := filterOutOfOntologyRelations(rows, graphParserConfig())
 	if len(got) != len(rows) {
 		t.Fatalf("rows = %d, want %d untouched", len(got), len(rows))
 	}
