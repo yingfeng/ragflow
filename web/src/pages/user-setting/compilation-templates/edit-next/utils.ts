@@ -56,6 +56,20 @@ export const isConfigMetaKey = (key: string) =>
     'rechunk_rules',
   ].includes(key);
 
+/**
+ * Config keys whose value is a structured object the section editor does not
+ * model: `guideline` carries the extraction instructions (target /
+ * rules_for_entities / rules_for_relations) for the structure variants.
+ *
+ * They are carried through the form verbatim. Treating one as a section would
+ * reset it to `{description: '', fields: []}` on the way in and write that back
+ * on save, silently dropping the instructions from the stored template.
+ */
+export const ConfigPassthroughKeys: string[] = ['guideline'];
+
+export const isConfigPassthroughKey = (key: string) =>
+  ConfigPassthroughKeys.includes(key);
+
 export const createEmptyField = (keys: string[]) =>
   Object.fromEntries(keys.map((key) => [key, '']));
 
@@ -146,6 +160,10 @@ export const buildConfigFromBuiltin = (
 
   Object.entries(builtinTemplate.config ?? {}).forEach(([key, value]) => {
     if (isConfigMetaKey(key)) return;
+    if (isConfigPassthroughKey(key)) {
+      sections[key] = value as TemplateSchemaType['config'][string];
+      return;
+    }
     sections[key] = normalizeSection(
       value as ICompilationTemplateSection,
     ) as TemplateSchemaType['config'][string];
@@ -220,6 +238,10 @@ export const transformDetailToForm = (
 
   Object.entries(config).forEach(([key, value]) => {
     if (isConfigMetaKey(key)) return;
+    if (isConfigPassthroughKey(key)) {
+      base[key] = value as TemplateSchemaType['config'][string];
+      return;
+    }
     base[key] = normalizeSection(
       value as ICompilationTemplateSection,
     ) as TemplateSchemaType['config'][string];
@@ -258,6 +280,10 @@ export const transformTemplateToPayload = (template: TemplateSchemaType) => {
     if (key === 'kind') return;
     if (key === 'example' || key === 'instruction') return;
     if (key === 'synthesis') {
+      config[key] = value as ICompilationTemplateConfigRequest[string];
+      return;
+    }
+    if (isConfigPassthroughKey(key)) {
       config[key] = value as ICompilationTemplateConfigRequest[string];
       return;
     }

@@ -1618,7 +1618,15 @@ func (c *Consumer) mergeStructureDataset(ctx context.Context, tenant, kb string,
 			k := rkey{template: template, from: normalizedStructureEntityName(from), typ: structureRelationType(relType), to: normalizedStructureEntityName(to), ckwd: ckwd}
 			b := relByKey[k]
 			if b == nil {
-				b = &StructureBucket{Name: from + " -> " + to, Type: "relation", FromEntity: from, ToEntity: to, CompileKwd: ckwd, TemplateID: p.TemplateID, TemplateKind: p.Kind, RelationType: relType}
+				b = &StructureBucket{
+					Name: from + " -> " + to, Type: "relation",
+					FromEntity: from, ToEntity: to,
+					// Endpoint classes come from the doc-level stamp; the
+					// dataset-level pass below re-resolves them from the merged
+					// entity buckets when it can.
+					FromType: metaString(p.Meta, "from_type"), ToType: metaString(p.Meta, "to_type"),
+					CompileKwd: ckwd, TemplateID: p.TemplateID, TemplateKind: p.Kind, RelationType: relType,
+				}
 				relByKey[k] = b
 			}
 			appendBucket(b, p)
@@ -1643,6 +1651,29 @@ func (c *Consumer) mergeStructureDataset(ctx context.Context, tenant, kb string,
 		}
 		appendBucket(b, p)
 	}
+	// Re-resolve each relation bucket's endpoint classes from the dataset-level
+	// entity buckets. The doc-level stamp can go stale once several documents
+	// merge, and the dataset-level entity type is what the dataset-level
+	// ontology graph draws, so the two must agree.
+	datasetEntityTypes := make(map[string]string, len(entByKey))
+	for _, b := range entByKey {
+		name := normalizedStructureEntityName(b.Name)
+		if name == "" || b.Type == "" {
+			continue
+		}
+		if _, seen := datasetEntityTypes[name]; !seen {
+			datasetEntityTypes[name] = b.Type
+		}
+	}
+	for _, b := range relByKey {
+		if t, ok := datasetEntityTypes[normalizedStructureEntityName(b.FromEntity)]; ok {
+			b.FromType = t
+		}
+		if t, ok := datasetEntityTypes[normalizedStructureEntityName(b.ToEntity)]; ok {
+			b.ToType = t
+		}
+	}
+
 	buckets := make([]StructureBucket, 0, len(entByKey)+len(relByKey))
 	for _, b := range entByKey {
 		buckets = append(buckets, *b)

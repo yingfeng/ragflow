@@ -29,7 +29,13 @@ const (
 	graphExpansionCap      = 4096 // hub-node expansion cap
 )
 
-var graphEntityFields = []string{"id", "content_with_weight", "name_kwd", "mention_count_int", "source_chunk_ids", "doc_id", "doc_ids_kwd", "source_doc_ids"}
+// `attr` is the ontology's datatype attributes (ontology.md §4.6). It is
+// requested here because this projection is the only place an entity's VALUES
+// can leave the engine — the canvas draws classes, the class panel lists
+// attribute names, and without the column the ontology's data itself would be
+// unreachable from the UI. Non-ontology rows have no such column, so the cost is
+// paid only where the value exists.
+var graphEntityFields = []string{"id", "content_with_weight", "name_kwd", "mention_count_int", "source_chunk_ids", "doc_id", "doc_ids_kwd", "source_doc_ids", "attr"}
 var graphRelationFields = []string{"id", "content_with_weight", "from_entity_kwd", "to_entity_kwd", "doc_id", "doc_ids_kwd", "source_doc_ids"}
 var graphAllFields = []string{
 	"id", "content_with_weight", "name_kwd", "mention_count_int", "source_chunk_ids",
@@ -50,6 +56,10 @@ type DocumentStructureGraphTemplate struct {
 	Kind         string                   `json:"kind"`
 	Entities     []StructureGraphNode     `json:"entities"`
 	Relations    []StructureGraphRelation `json:"relations"`
+	// Ontology is set only for kind=ontology buckets: the class-level model
+	// graph (classes as nodes, properties as edges) rather than the instance
+	// graph carried by Entities/Relations. See dataset_ontology_graph.go.
+	Ontology *OntologyGraph `json:"ontology,omitempty"`
 }
 
 // DocumentStructureGraphResponse mirrors Python's {"templates": [...]}.
@@ -184,6 +194,13 @@ func projectEntity(row map[string]interface{}) StructureGraphNode {
 	}
 	if mc, ok := graphMentionCount(row); ok {
 		node["mention_count"] = mc
+	}
+	// The datatype attributes, decoded by the same helper the class-level count
+	// uses — one decoder means "the panel says 52 persons carry birth_date" and
+	// "these rows show birth_date" can never disagree about what counts as a
+	// value.
+	if attrs := attrValues(row); len(attrs) > 0 {
+		node["attributes"] = attrs
 	}
 	return node
 }
@@ -666,6 +683,8 @@ func resolveDatasetStructureKind(kind string) string {
 		return "mind_map"
 	case "timeline":
 		return "timeline"
+	case "ontology":
+		return "ontology"
 	case "session_essence":
 		return "session_essence"
 	case "session_graph":
@@ -698,6 +717,10 @@ type DocumentStructureGraphInput struct {
 func (s *DatasetArtifactService) GetDocumentGraph(ctx context.Context, in DocumentStructureGraphInput) (*DocumentStructureGraphResponse, error) {
 	templateIDs := []string{}
 	templateMeta := map[string]map[string]interface{}{}
+	// Hoisted so every path that may produce an ontology bucket can load its
+	// template config by id — including the keyword and empty-shell paths, which
+	// return before the normal-mode loop declares it.
+	templateDAO := dao.NewCompilationTemplateDAO()
 
 	resp := &DocumentStructureGraphResponse{Templates: []DocumentStructureGraphTemplate{}}
 	entityCountFilter := map[string]interface{}{
@@ -721,6 +744,11 @@ func (s *DatasetArtifactService) GetDocumentGraph(ctx context.Context, in Docume
 				return nil, err
 			}
 			resp.Templates = buildDocumentGraphTemplateShells(templateIDs, templateMeta)
+			for i := range resp.Templates {
+				if err := s.attachDocumentOntology(ctx, in.TenantID, in.DatasetID, in.DocumentID, &resp.Templates[i], templateDAO); err != nil {
+					return nil, err
+				}
+			}
 			return resp, nil
 		}
 		resp.Templates = append(resp.Templates, DocumentStructureGraphTemplate{
@@ -730,6 +758,11 @@ func (s *DatasetArtifactService) GetDocumentGraph(ctx context.Context, in Docume
 			Entities:     entities,
 			Relations:    relations,
 		})
+		// A keyword narrows which INSTANCES are shown; the declared skeleton is
+		// not a result set, so it stays complete — same rule as normal mode.
+		if err := s.attachDocumentOntology(ctx, in.TenantID, in.DatasetID, in.DocumentID, &resp.Templates[len(resp.Templates)-1], templateDAO); err != nil {
+			return nil, err
+		}
 		resp.ReturnedEntities = len(entities)
 		return resp, nil
 	}
@@ -758,7 +791,6 @@ func (s *DatasetArtifactService) GetDocumentGraph(ctx context.Context, in Docume
 	}
 	bucketMetas := map[string]map[string]interface{}{}
 	bucketScopes := map[string]map[string]interface{}{}
-	templateDAO := dao.NewCompilationTemplateDAO()
 	for _, row := range metaRows {
 		// Resolve template metadata from the persisted graph row. The template
 		// name is loaded only as display metadata; the row remains authoritative
@@ -772,6 +804,10 @@ func (s *DatasetArtifactService) GetDocumentGraph(ctx context.Context, in Docume
 						"template_id":   templateID,
 						"template_name": template.Name,
 						"kind":          template.Kind,
+						// The declared ontology (classes, properties and their
+						// domain/range) lives in the config, so the ontology view
+						// draws its skeleton without touching the index.
+						"config": map[string]interface{}(template.Config),
 					}
 				}
 			}
@@ -792,16 +828,25 @@ func (s *DatasetArtifactService) GetDocumentGraph(ctx context.Context, in Docume
 		if err != nil {
 			return nil, err
 		}
-		if len(entities) == 0 && len(relations) == 0 {
+		// An ontology bucket still has something to show when the document
+		// contributed no instances: the declared skeleton with zero counts.
+		isOntology := compilationTemplateKind(graphStr(meta["kind"])) == "ontology"
+		if len(entities) == 0 && len(relations) == 0 && !isOntology {
 			continue
 		}
-		grouped[bid] = DocumentStructureGraphTemplate{
+		bucket := DocumentStructureGraphTemplate{
 			TemplateID:   graphStr(meta["template_id"]),
 			TemplateName: graphStr(meta["template_name"]),
 			Kind:         graphStr(meta["kind"]),
 			Entities:     entities,
 			Relations:    relations,
 		}
+		if isOntology {
+			if err := s.attachDocumentOntology(ctx, in.TenantID, in.DatasetID, in.DocumentID, &bucket, templateDAO); err != nil {
+				return nil, err
+			}
+		}
+		grouped[bid] = bucket
 	}
 
 	// Order: discovered templates first, then any buckets not seen in the scan.
@@ -817,10 +862,15 @@ func (s *DatasetArtifactService) GetDocumentGraph(ctx context.Context, in Docume
 		}
 	}
 	for _, bid := range orderedIDs {
-		if g, ok := grouped[bid]; ok && (len(g.Entities) > 0 || len(g.Relations) > 0) {
-			resp.Templates = append(resp.Templates, g)
-			resp.ReturnedEntities += len(g.Entities)
+		g, ok := grouped[bid]
+		if !ok {
+			continue
 		}
+		if len(g.Entities) == 0 && len(g.Relations) == 0 && g.Ontology == nil {
+			continue
+		}
+		resp.Templates = append(resp.Templates, g)
+		resp.ReturnedEntities += len(g.Entities)
 	}
 	return resp, nil
 }
@@ -854,6 +904,40 @@ func buildDocumentGraphTemplateShells(templateIDs []string, templateMeta map[str
 		})
 	}
 	return templates
+}
+
+// attachDocumentOntology fills a document bucket's declared ontology skeleton.
+//
+// The skeleton (classes, object properties, inheritance, datatype attributes)
+// comes from the template config while the counts come from the index, so the
+// graph is built even when the document contributed no instance: it is the
+// ontology the template declares, not a result set. That is why every document
+// path that can produce an ontology bucket attaches it — normal mode, keyword
+// mode and the empty shell — instead of only the path that happened to be
+// written first.
+//
+// The config is loaded by id rather than read from the bucket meta:
+// resolveGraphBucket rebuilds a bucket from template_id/name/kind only, so a
+// config stored upstream does not survive into it. Without the config the
+// declaration is empty and every observed class comes back as undeclared, with
+// no labels, no datatype attributes and no inheritance.
+func (s *DatasetArtifactService) attachDocumentOntology(
+	ctx context.Context,
+	tenantID, datasetID, documentID string,
+	bucket *DocumentStructureGraphTemplate,
+	templateDAO *dao.CompilationTemplateDAO,
+) error {
+	if compilationTemplateKind(bucket.Kind) != "ontology" {
+		return nil
+	}
+	graph, err := s.buildOntologyGraph(ctx, tenantID, datasetID,
+		documentBucketFilter(documentID, bucket.TemplateID),
+		loadTemplateConfig(ctx, templateDAO, tenantID, bucket.TemplateID))
+	if err != nil {
+		return err
+	}
+	bucket.Ontology = graph
+	return nil
 }
 
 func (s *DatasetArtifactService) discoverDocumentGraphTemplateMeta(ctx context.Context, tenantID, datasetID, documentID string, templateIDs *[]string, templateMeta map[string]map[string]interface{}) error {
@@ -893,12 +977,19 @@ func (s *DatasetArtifactService) discoverDocumentGraphTemplateMeta(ctx context.C
 			}
 
 			templateName := templateID
+			var templateConfig map[string]interface{}
 			if !strings.HasPrefix(templateID, "legacy:") {
 				if template, loadErr := templateDAO.GetTemplate(ctx, dao.DB, tenantID, templateID); loadErr == nil && template != nil {
 					templateName = template.Name
 					if kind == "" {
 						kind = template.Kind
 					}
+					// Carry the config so an ontology bucket can draw its declared
+					// skeleton on the paths that build their meta here (empty
+					// shell, keyword subgraph). resolveGraphBucket rebuilds a bucket
+					// from template_id/name/kind only, so anything that needs the
+					// config must either take it from this map or reload it by id.
+					templateConfig = map[string]interface{}(template.Config)
 				}
 			} else {
 				templateName = "Legacy (" + strings.TrimPrefix(templateID, "legacy:") + ")"
@@ -910,6 +1001,9 @@ func (s *DatasetArtifactService) discoverDocumentGraphTemplateMeta(ctx context.C
 				"template_id":   templateID,
 				"template_name": templateName,
 				"kind":          kind,
+			}
+			if templateConfig != nil {
+				templateMeta[templateID]["config"] = templateConfig
 			}
 			*templateIDs = append(*templateIDs, templateID)
 			seen[templateID] = true
@@ -1063,6 +1157,7 @@ func (s *DatasetArtifactService) GetDatasetStructure(ctx context.Context, in Dat
 	}
 
 	// Read each template's dataset entity/relation rows.
+	templateDAO := dao.NewCompilationTemplateDAO()
 	for tid := range templateIDs {
 		scope := map[string]interface{}{
 			"scope_kwd":                     []string{"dataset"},
@@ -1073,16 +1168,27 @@ func (s *DatasetArtifactService) GetDatasetStructure(ctx context.Context, in Dat
 		if err != nil {
 			return nil, err
 		}
-		if len(entities) == 0 && len(relations) == 0 {
+		// An ontology bucket still has something to show when nothing has been
+		// compiled yet: the declared skeleton with zero counts.
+		if len(entities) == 0 && len(relations) == 0 && resolved != "ontology" {
 			continue
 		}
-		resp.Templates = append(resp.Templates, DocumentStructureGraphTemplate{
+		bucket := DocumentStructureGraphTemplate{
 			TemplateID:   tid,
 			TemplateName: tid,
 			Kind:         resolved,
 			Entities:     entities,
 			Relations:    relations,
-		})
+		}
+		if resolved == "ontology" {
+			graph, err := s.buildOntologyGraph(ctx, in.TenantID, in.DatasetID,
+				datasetBucketFilter(resolved, tid), loadTemplateConfig(ctx, templateDAO, in.TenantID, tid))
+			if err != nil {
+				return nil, err
+			}
+			bucket.Ontology = graph
+		}
+		resp.Templates = append(resp.Templates, bucket)
 		resp.ReturnedEntities += len(entities)
 		resp.ReturnedRelations += len(relations)
 	}

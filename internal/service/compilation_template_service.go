@@ -162,6 +162,133 @@ func (s *CompilationTemplateService) LoadWikiPresets() ([]*WikiPreset, error) {
 	return presets, nil
 }
 
+// ontologyDatatypeKinds are the datatype ranges an ontology template may
+// declare for a datatype property. The declared range decides which JSON value
+// the projection writes into the entity row's `attr` column, so an unknown one
+// has to be rejected at save time rather than silently mis-stored later.
+var ontologyDatatypeKinds = map[string]bool{
+	"string": true, "list": true,
+	"int": true, "integer": true,
+	"float": true, "number": true,
+	"bool": true, "boolean": true,
+	"date": true,
+}
+
+// validateOntologyTemplate checks the cross-references a standard ontology
+// template carries: rdfs:subClassOf (class `parent`), and a property's
+// `domain` / `range` / `datatype`. Every one of them is a reference from one
+// field to another, so none can be checked inside the per-field loop.
+//
+// A dangling reference is not a cosmetic problem: the projection flips edges
+// whose endpoints do not match the declaration, so a typo in `range` silently
+// kills every edge of that property (see ontology.md §8).
+func validateOntologyTemplate(configMap map[string]interface{}) error {
+	fieldsOf := func(section string) []map[string]interface{} {
+		sec, _ := configMap[section].(map[string]interface{})
+		raw, _ := sec["fields"].([]interface{})
+		out := make([]map[string]interface{}, 0, len(raw))
+		for _, f := range raw {
+			if fm, ok := f.(map[string]interface{}); ok {
+				out = append(out, fm)
+			}
+		}
+		return out
+	}
+
+	classes := map[string]bool{}
+	parentOf := map[string]string{}
+	for _, f := range fieldsOf("entity") {
+		name := strings.TrimSpace(yamlStr(f["type"]))
+		if name == "" {
+			continue
+		}
+		classes[name] = true
+		if parent := strings.TrimSpace(yamlStr(f["parent"])); parent != "" {
+			parentOf[name] = parent
+		}
+	}
+	if len(classes) == 0 {
+		return errors.New("ontology template must declare at least one class")
+	}
+
+	for child, parent := range parentOf {
+		for _, p := range splitTypeList(parent) {
+			if !classes[p] {
+				return fmt.Errorf("class %q declares unknown parent %q", child, p)
+			}
+		}
+	}
+	// A cyclic parent chain would make the inherited-attribute walk used by the
+	// ontology queries (class -> all its attributes) never terminate.
+	for child := range parentOf {
+		seen := map[string]bool{child: true}
+		for cur := parentOf[child]; cur != ""; cur = parentOf[cur] {
+			if seen[cur] {
+				return fmt.Errorf("class %q has a cyclic parent chain", child)
+			}
+			seen[cur] = true
+		}
+	}
+
+	for _, f := range fieldsOf("relation") {
+		name := strings.TrimSpace(yamlStr(f["type"]))
+		if name == "" {
+			continue
+		}
+		kind := strings.ToLower(strings.TrimSpace(yamlStr(f["kind"])))
+		domain := strings.TrimSpace(yamlStr(f["domain"]))
+		rangeRaw := strings.TrimSpace(yamlStr(f["range"]))
+		datatype := strings.ToLower(strings.TrimSpace(yamlStr(f["datatype"])))
+
+		if kind == "" {
+			// Infer from the declaration: a range naming a declared class is an
+			// object property, anything else a datatype property.
+			kind = "datatype"
+			for _, r := range splitTypeList(rangeRaw) {
+				if classes[r] {
+					kind = "object"
+					break
+				}
+			}
+		}
+
+		switch kind {
+		case "object":
+			if len(splitTypeList(domain)) == 0 {
+				return fmt.Errorf("object property %q declares no domain", name)
+			}
+			if len(splitTypeList(rangeRaw)) == 0 {
+				return fmt.Errorf("object property %q declares no range", name)
+			}
+			for _, d := range splitTypeList(domain) {
+				if !classes[d] {
+					return fmt.Errorf("property %q declares unknown domain class %q", name, d)
+				}
+			}
+			for _, r := range splitTypeList(rangeRaw) {
+				if !classes[r] {
+					return fmt.Errorf("property %q declares unknown range class %q", name, r)
+				}
+			}
+		case "datatype":
+			if len(splitTypeList(domain)) == 0 {
+				return fmt.Errorf("datatype property %q declares no domain", name)
+			}
+			for _, d := range splitTypeList(domain) {
+				if !classes[d] {
+					return fmt.Errorf("property %q declares unknown domain class %q", name, d)
+				}
+			}
+			if datatype != "" && !ontologyDatatypeKinds[datatype] {
+				return fmt.Errorf("property %q declares unsupported datatype %q", name, datatype)
+			}
+		default:
+			return fmt.Errorf("property %q has invalid kind %q (want object or datatype)", name, kind)
+		}
+	}
+	return nil
+}
+
 // ValidateTemplatePayload validates a single template payload, mirroring the
 // Python compilation_template_validation module. It returns an error describing
 // the first problem found.
@@ -230,6 +357,14 @@ func ValidateTemplatePayload(req map[string]interface{}, requireAll bool) error 
 				if utf8.RuneCountInString(yamlStr(fm["rule"])) > 1024 {
 					return fmt.Errorf("%s field rule is too long", capitalizeTitle(section))
 				}
+			}
+		}
+		// Ontology templates additionally carry cross-references between fields
+		// (class parent, property domain / range / datatype), which the per-field
+		// loop above cannot see.
+		if yamlStr(configMap["kind"]) == "ontology" || yamlStr(req["kind"]) == "ontology" {
+			if err := validateOntologyTemplate(configMap); err != nil {
+				return err
 			}
 		}
 		if configMap["kind"] == "wiki" || req["kind"] == "wiki" {

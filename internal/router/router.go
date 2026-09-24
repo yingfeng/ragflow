@@ -420,6 +420,11 @@ func (r *Router) Setup(engine *gin.Engine) {
 				datasets.GET("/:dataset_id/documents/:document_id/structure/graph", r.datasetArtifactHandler.GetDocumentGraph)
 				datasets.GET("/:dataset_id/documents/:document_id/structure/claims", r.datasetArtifactHandler.GetDocumentClaims)
 				datasets.DELETE("/:dataset_id/documents/:document_id/structure/graph", r.datasetArtifactHandler.DeleteDocumentGraph)
+				// Ontology model graph drill-down: the graph is a skeleton
+				// (classes / object properties / inheritance) and these two
+				// pages turn one of its nodes or edges into rows.
+				datasets.GET("/:dataset_id/ontology/classes/:class/entities", r.datasetArtifactHandler.GetOntologyClassEntities)
+				datasets.GET("/:dataset_id/ontology/properties/:property/relations", r.datasetArtifactHandler.GetOntologyPropertyRelations)
 				datasets.POST("/:dataset_id/metadata/update", r.documentHandler.MetadataBatchUpdate)
 				datasets.PATCH("/:dataset_id/documents/metadatas", r.documentHandler.UpdateDocumentMetadatas)
 			}

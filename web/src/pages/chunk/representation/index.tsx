@@ -22,6 +22,9 @@ import type {
 } from './components/claim-list';
 import { RepresentationSelect } from './components/representation-select';
 import { useGraphEntitySearch } from './hooks/use-graph-entity-search';
+import type { OntologyDetailPanelState } from '@/components/structure-graph/ontology-model-graph/detail-panel';
+import { OntologyStats } from '@/components/structure-graph/ontology-model-graph/ontology-stats';
+import { useGetKnowledgeSearchParams } from '@/hooks/route-hook';
 
 export type {
   ClaimsPanelState,
@@ -30,6 +33,22 @@ export type {
 
 interface RepresentationProps {
   onNodeClick?: (node: ClickableNode) => void;
+  /**
+   * The ontology model graph publishes the class it has selected; the page owns
+   * the column that shows it. Kept a separate prop from the claims / evidence
+   * panels because it comes from a different representation and has its own
+   * shape.
+   */
+  onOntologyPanelChange?: (state: OntologyDetailPanelState | null) => void;
+  /**
+   * Tells the page whether the ontology representation is the one on screen.
+   *
+   * The ontology view is the only one that does not read the raw chunk list —
+   * its data arrives in the detail panel — so the page can give its width back
+   * to the graph while it is showing. Only this component knows, because the
+   * template selection lives here.
+   */
+  onOntologyViewChange?: (active: boolean) => void;
   // The claims / evidence panels belong to the artifact page's middle column,
   // not inside this tree view. The selection still lives here (it is driven by
   // node clicks), but the resolved content is published upward and the page
@@ -42,9 +61,17 @@ function Representation({
   onNodeClick,
   onClaimsPanelChange,
   onEvidencePanelChange,
+  onOntologyPanelChange,
+  onOntologyViewChange,
 }: RepresentationProps) {
   const { t } = useTranslation();
   const isGo = useIsGoBackend();
+  // Both halves of the scope: the graph on this page is one DOCUMENT's, so the
+  // ontology panel's drill-down has to be narrowed the same way. Without the
+  // document id the panel's count and its list would be counting different
+  // scopes — the panel would say "5 instances" and list rows from other
+  // documents.
+  const { knowledgeId: datasetId, documentId } = useGetKnowledgeSearchParams();
   const { deleteDocumentStructureGraph, loading: deleting } =
     useDeleteDocumentStructureGraph();
 
@@ -155,6 +182,20 @@ function Representation({
     supportsClaims,
   ]);
 
+  // Report the ontology view to the page so it can reclaim the chunk column's
+  // width for the graph. Published as a boolean rather than derived by the host,
+  // because the template selection — which is what decides it — lives here.
+  //
+  // The cleanup matters as much as the body: leaving this view (the chunk page
+  // switches to the preview, which unmounts this component) must retract the
+  // claim, or the chunk column would stay hidden for every other view.
+  useEffect(() => {
+    onOntologyViewChange?.(
+      selectedTemplate?.kind === CompilationTemplateKind.Ontology,
+    );
+    return () => onOntologyViewChange?.(false);
+  }, [onOntologyViewChange, selectedTemplate?.kind]);
+
   useEffect(() => {
     if (!supportsClaims) {
       onEvidencePanelChange?.(null);
@@ -251,6 +292,14 @@ function Representation({
           </ConfirmDeleteDialog>
         )}
       </div>
+      {selectedTemplate?.kind === CompilationTemplateKind.Ontology && (
+        // The ontology's numbers live in the page header rather than as a canvas
+        // overlay: an overlay is wider than this column the moment the detail
+        // column opens, and it then spills under the panel.
+        <div className="mt-3">
+          <OntologyStats graph={selectedTemplate.ontology} />
+        </div>
+      )}
       {loading && !data && <SkeletonCard className="mt-6" />}
       {!(loading && !data) && templates.length === 0 && (
         <div className="mt-6 text-text-secondary">
@@ -264,6 +313,12 @@ function Representation({
           highlightNodeId={highlightNodeId}
           totalEntities={data?.total_entities}
           returnedEntities={data?.returned_entities}
+          // The document-level artifact column is where the ontology graph is
+          // read, so the drill-down scope comes from the route.
+          datasetId={datasetId}
+          documentId={documentId}
+          templateId={selectedTemplateId}
+          onOntologyDetailChange={onOntologyPanelChange}
         />
       )}
     </section>

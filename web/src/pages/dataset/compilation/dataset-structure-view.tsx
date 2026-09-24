@@ -38,6 +38,11 @@ import {
   ViewModeLabelKeyMap,
 } from './constants';
 import CompilationEmptyState from './empty-state';
+import {
+  OntologyDetailPanel,
+  type OntologyDetailPanelState,
+} from '@/components/structure-graph/ontology-model-graph/detail-panel';
+import { OntologyStats } from '@/components/structure-graph/ontology-model-graph/ontology-stats';
 import { useRunEndEffect } from './hooks/use-run-end-effect';
 import { CompilationLoadingCard } from './loading-card';
 import { CompilationUpdateButton } from './update-button';
@@ -55,6 +60,8 @@ export function DatasetStructureView({ kind }: DatasetStructureViewProps) {
   const { data: knowledgeBase } = useFetchKnowledgeBaseConfiguration();
   const [graphKeywords, setGraphKeywords] = useState('');
   const [selectedNodeId, setSelectedNodeId] = useState('');
+  const [ontologyPanel, setOntologyPanel] =
+    useState<OntologyDetailPanelState | null>(null);
   const { data, loading } = useFetchDatasetStructureGraph(kind, graphKeywords);
   const template = data?.templates?.[0];
   const { deleteDatasetStructure, loading: deleting } =
@@ -212,12 +219,38 @@ export function DatasetStructureView({ kind }: DatasetStructureViewProps) {
           />
         )}
       </div>
-      <RepresentationRenderer
-        template={template}
-        highlightNodeId={selectedEntityName || null}
-        totalEntities={data?.total_entities}
-        returnedEntities={data?.returned_entities}
-      />
+      {kind === ViewMode.Ontology && (
+        // The ontology's numbers are page-level information, so they are laid
+        // out here rather than floated over the canvas — an overlay wider than
+        // the canvas column spills under the detail panel next to it.
+        <div className="px-4 pt-3">
+          <OntologyStats graph={template?.ontology} />
+        </div>
+      )}
+      <div className="mt-0 flex flex-1 min-h-0 gap-3">
+        <div className="flex min-w-0 flex-1">
+          <RepresentationRenderer
+            template={template}
+            highlightNodeId={selectedEntityName || null}
+            totalEntities={data?.total_entities}
+            returnedEntities={data?.returned_entities}
+            // The ontology model graph is the one representation that drills
+            // into the index (instances of a class, assertions of a property),
+            // so it needs the scope the page is already showing.
+            datasetId={knowledgeBaseId}
+            templateId={template?.template_id}
+            onOntologyDetailChange={setOntologyPanel}
+          />
+        </div>
+        {ontologyPanel && (
+          // The ontology graph's class panel is a column of this page rather
+          // than something it draws inside its own canvas, so it keeps its own
+          // width instead of being squeezed by the canvas's container.
+          <aside className="relative z-20 w-80 shrink-0 overflow-auto rounded-md border border-border-button bg-bg-card">
+            <OntologyDetailPanel {...ontologyPanel} />
+          </aside>
+        )}
+      </div>
       <UpdateLogSheet
         open={updateSheetOpen}
         onOpenChange={setUpdateSheetOpen}

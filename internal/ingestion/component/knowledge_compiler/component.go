@@ -681,8 +681,9 @@ func applyVariantColumns(doc *schema.ChunkDoc, p common.Product) error {
 
 // applyStructureGraphColumns emits the structure-graph row columns shared by the
 // structure and tree variants (Python _struct_to_doc_storage_doc contract):
-//   - knowledge_graph_kwd: "entity" | "relation" | "graph"
-//   - relations: from_entity_kwd / to_entity_kwd
+//   - knowledge_graph_kwd: "entity" | "relation" | "hyperedge" | "hypernode"
+//   - relations: from_entity_kwd / to_entity_kwd / prop_kwd /
+//     from_type_kwd / to_type_kwd
 //   - entities: name_kwd (lowercased) / entity_type_kwd
 //   - mention_count_int
 //
@@ -705,8 +706,56 @@ func applyStructureGraphColumns(doc *schema.ChunkDoc, p common.Product, kind str
 				return err
 			}
 		}
+		// prop_kwd is the ontology property name; from_type_kwd / to_type_kwd are
+		// the endpoint classes. The three of them are the whole input the
+		// class-level ontology model graph is drawn and counted from, which is
+		// why they are columns and not payload-only fields. Property and class
+		// names are values here — never column names.
+		if v := metaString(p.Meta, "relation_type"); v != "" {
+			if err := doc.SetExtraValue("prop_kwd", v); err != nil {
+				return err
+			}
+		}
+		if v := metaString(p.Meta, "from_type"); v != "" {
+			if err := doc.SetExtraValue("from_type_kwd", v); err != nil {
+				return err
+			}
+		}
+		if v := metaString(p.Meta, "to_type"); v != "" {
+			if err := doc.SetExtraValue("to_type_kwd", v); err != nil {
+				return err
+			}
+		}
 	}
 	if kind == "entity" {
+		if v := metaString(p.Meta, "name"); v != "" {
+			if err := doc.SetExtraValue("name_kwd", strings.ToLower(v)); err != nil {
+				return err
+			}
+		}
+		// attr carries the entity's declared datatype attributes as one JSON
+		// object, so a property's value is filterable by name, by value and by
+		// range without a column per property (ontology.md §4.6). It is read
+		// from Product.Meta rather than derived here because this layer has no
+		// template config; buildRows already resolved the declared attribute set
+		// for the entity's class, inheritance included.
+		if v, ok := p.Meta["attr"]; ok && v != nil {
+			if err := doc.SetExtraValue("attr", v); err != nil {
+				return err
+			}
+		}
+		if v := metaString(p.Meta, "entity_type"); v != "" {
+			if err := doc.SetExtraValue("entity_type_kwd", v); err != nil {
+				return err
+			}
+		}
+	}
+	if kind == "hyperedge" {
+		// A hyperedge is one flattened factual block. name_kwd / entity_type_kwd
+		// carry its ROOT and are written lowercased, matching the entity rows'
+		// name_kwd (see the entity branch above) — that shared spelling is the
+		// only join between the hypergraph layer and the typed graph, and the two
+		// sides disagreeing would silently break it (ontology.md §4.7).
 		if v := metaString(p.Meta, "name"); v != "" {
 			if err := doc.SetExtraValue("name_kwd", strings.ToLower(v)); err != nil {
 				return err
@@ -716,6 +765,44 @@ func applyStructureGraphColumns(doc *schema.ChunkDoc, p common.Product, kind str
 			if err := doc.SetExtraValue("entity_type_kwd", v); err != nil {
 				return err
 			}
+		}
+	}
+	if kind == "hypernode" {
+		// node_role_kwd splits the two halves of one hypernode, so each retrieval
+		// leg can filter to its own half; path_kwd is the mechanical attribute
+		// path and prop_kwd its leaf attribute name.
+		//
+		// Deliberately NO name_kwd / entity_type_kwd here: a hypernode is keyed
+		// on (path, value) alone and can belong to several roots, so a single
+		// root name would be wrong rather than merely redundant (ontology.md
+		// §4.2).
+		if v := metaString(p.Meta, "node_role"); v != "" {
+			if err := doc.SetExtraValue("node_role_kwd", v); err != nil {
+				return err
+			}
+		}
+		if v := metaString(p.Meta, "path"); v != "" {
+			if err := doc.SetExtraValue("path_kwd", v); err != nil {
+				return err
+			}
+		}
+		if v := metaString(p.Meta, "prop"); v != "" {
+			if err := doc.SetExtraValue("prop_kwd", v); err != nil {
+				return err
+			}
+		}
+		// hyperedge_ids is the membership relation (E(n) in the paper): every
+		// hyperedge this hypernode belongs to. An array, because the same
+		// hypernode is shared by every block whose path reaches it.
+		if v, ok := p.Meta["hyperedge_ids"]; ok && v != nil {
+			if err := doc.SetExtraValue("hyperedge_ids", v); err != nil {
+				return err
+			}
+		}
+	}
+	if v, ok := metaInt(p.Meta, "depth"); ok && (kind == "hyperedge" || kind == "hypernode") {
+		if err := doc.SetExtraValue("depth_int", v); err != nil {
+			return err
 		}
 	}
 	if v, ok := metaInt(p.Meta, "mention_count"); ok {

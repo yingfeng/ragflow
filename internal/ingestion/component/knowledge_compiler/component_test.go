@@ -15,6 +15,7 @@ import (
 	"ragflow/internal/agent/runtime"
 	"ragflow/internal/ingestion/component/globals"
 	"ragflow/internal/ingestion/component/knowledge_compiler/common"
+	"ragflow/internal/ingestion/component/schema"
 
 	"gorm.io/gorm"
 )
@@ -1481,6 +1482,121 @@ func TestProductsToChunkDocs_PageVsSectionCompileKWD(t *testing.T) {
 	}
 	if sectionParent != "page-id" {
 		t.Errorf("section parent_kwd = %q, want page-id", sectionParent)
+	}
+}
+
+// The hypernode / hyperedge rows go through the same column applier as the
+// entity / relation rows, so their two branches are pinned here: a mistyped key
+// would not fail anything else — it would just leave the layer unqueryable.
+func TestApplyStructureGraphColumnsWritesHypergraphRows(t *testing.T) {
+	cases := []struct {
+		name   string
+		meta   map[string]any
+		want   map[string]any
+		absent []string
+	}{
+		{
+			name: "hyperedge identifies its root",
+			meta: map[string]any{
+				"kind": "hyperedge", "name": "Ada Lovelace",
+				"entity_type": "person", "depth": 1,
+			},
+			want: map[string]any{
+				"knowledge_graph_kwd": "hyperedge",
+				// Lowercased, so it joins the entity rows' name_kwd.
+				"name_kwd":        "ada lovelace",
+				"entity_type_kwd": "person",
+				"depth_int":       1,
+			},
+		},
+		{
+			name: "hypernode carries its role, path and membership",
+			meta: map[string]any{
+				"kind": "hypernode", "node_role": "key",
+				"path": "person:born_in.place:name", "prop": "name",
+				"hyperedge_ids": []string{"e1", "e2"}, "depth": 1,
+			},
+			want: map[string]any{
+				"knowledge_graph_kwd": "hypernode",
+				"node_role_kwd":       "key",
+				"path_kwd":            "person:born_in.place:name",
+				"prop_kwd":            "name",
+				"depth_int":           1,
+			},
+			// A hypernode is keyed on (path, value) alone and can be shared by
+			// several roots, so one root's name would be wrong, not merely
+			// redundant.
+			absent: []string{"name_kwd", "entity_type_kwd"},
+		},
+	}
+	for _, tc := range cases {
+		doc := &schema.ChunkDoc{}
+		if err := applyVariantColumns(doc, common.Product{
+			Variant: common.VariantStructure,
+			Meta:    tc.meta,
+		}); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		out := doc.ToMap()
+		for key, want := range tc.want {
+			if got := out[key]; fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("%s: %s = %v, want %v", tc.name, key, got, want)
+			}
+		}
+		for _, key := range tc.absent {
+			if _, ok := out[key]; ok {
+				t.Errorf("%s: %s must not be written", tc.name, key)
+			}
+		}
+	}
+}
+
+// hyperedge_ids is the membership relation (E(n) in the paper). It has to survive
+// as a list: a single value would make a shared hypernode look like it belongs to
+// exactly one block. A string list arrives as []string (decodeExtraValue tries the
+// string-slice shape before the generic one), which is the shape the engines'
+// filter layer takes for a list-valued column.
+func TestHyperedgeIDsAreWrittenAsAList(t *testing.T) {
+	doc := &schema.ChunkDoc{}
+	if err := applyVariantColumns(doc, common.Product{
+		Variant: common.VariantStructure,
+		Meta: map[string]any{
+			"kind": "hypernode", "node_role": "value",
+			"hyperedge_ids": []string{"e1", "e2", "e3"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ids, ok := doc.ToMap()["hyperedge_ids"].([]string)
+	if !ok {
+		t.Fatalf("hyperedge_ids = %#v, want a string list", doc.ToMap()["hyperedge_ids"])
+	}
+	if len(ids) != 3 {
+		t.Fatalf("hyperedge_ids = %v, want 3 members", ids)
+	}
+}
+
+// An entity row must not grow the hypergraph columns: the two layers are
+// separate, and a leaked key would make an entity filter match a hypernode.
+func TestEntityRowsDoNotCarryHypergraphColumns(t *testing.T) {
+	doc := &schema.ChunkDoc{}
+	if err := applyVariantColumns(doc, common.Product{
+		Variant: common.VariantStructure,
+		Meta: map[string]any{
+			"kind": "entity", "name": "Ada Lovelace", "entity_type": "person",
+			"node_role": "key", "hyperedge_ids": []string{"e1"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out := doc.ToMap()
+	for _, key := range []string{"node_role_kwd", "hyperedge_ids", "path_kwd"} {
+		if _, ok := out[key]; ok {
+			t.Errorf("entity row carries %s", key)
+		}
+	}
+	if out["name_kwd"] != "ada lovelace" || out["entity_type_kwd"] != "person" {
+		t.Errorf("entity row = %v", out)
 	}
 }
 

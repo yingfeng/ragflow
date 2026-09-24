@@ -216,7 +216,7 @@ func (p Param) PlanEnabled() bool {
 //	wiki                            -> wiki
 //	page_index / session_essence /  -> structure (the graph/knowledge-graph path)
 //	session_graph / timeline /      ->
-//	knowledge_graph                 ->
+//	knowledge_graph / ontology      ->
 //
 // The canonical variant names are also accepted as identity (so a template kind
 // may equal the variant). Unknown kinds return ErrUnknownVariant; the caller
@@ -235,7 +235,7 @@ func KindToVariant(kind string) (Variant, error) {
 	case "wiki":
 		return VariantWiki, nil
 	case "page_index", "session_essence", "session_graph", "timeline",
-		"knowledge_graph", "structure", "knowledgegraph", "graph":
+		"knowledge_graph", "ontology", "structure", "knowledgegraph", "graph":
 		return VariantStructure, nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrUnknownVariant, kind)
@@ -252,7 +252,7 @@ func KindToTaskType(kind string) (string, error) {
 		return TaskTypeWiki, nil
 	case "tree":
 		return TaskTypeTree, nil
-	case "knowledge_graph", "knowledgegraph", "graph":
+	case "knowledge_graph", "knowledgegraph", "graph", "ontology":
 		return TaskTypeGraph, nil
 	case "mind_map", "mindmap":
 		return TaskTypeMindmap, nil

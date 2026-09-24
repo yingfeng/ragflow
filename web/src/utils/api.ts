@@ -264,6 +264,13 @@ export default {
     `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/structure/graph`,
   documentStructureClaims: (datasetId: string, documentId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/structure/claims`,
+  // Ontology model graph drill-down: the graph itself is a class-level skeleton
+  // (classes / object properties / inheritance) plus counts, and these two
+  // pages turn one of its nodes or edges into rows.
+  ontologyClassEntities: (datasetId: string, classType: string) =>
+    `${restAPIv1}/datasets/${datasetId}/ontology/classes/${encodeURIComponent(classType)}/entities`,
+  ontologyPropertyRelations: (datasetId: string, property: string) =>
+    `${restAPIv1}/datasets/${datasetId}/ontology/properties/${encodeURIComponent(property)}/relations`,
   retrievalTest: `${restAPIv1}/datasets/search`,
 
   // document

@@ -262,17 +262,28 @@ func buildRows(ctx context.Context, deps common.Deps, cfg CompileConfig, nodes, 
 			// entity_type_kwd is only stamped when the payload has a type —
 			// Python omits the column entirely for an untyped entity rather
 			// than writing a synthesized "other".
-			if typ := strings.TrimSpace(stringOf(s.payload["type"])); typ != "" {
+			typ := strings.TrimSpace(stringOf(s.payload["type"]))
+			if typ != "" {
 				meta["entity_type"] = typ
+			}
+			// The declared datatype attributes travel to the row's `attr` json
+			// column, which is what makes them filterable by property name,
+			// value and range (ontology.md §4.6). They deliberately stay out of
+			// the row's vector: PayloadDescription does not recurse into maps,
+			// so the entity vector is not diluted by its attribute values.
+			if attrs := ontologyAttributes(s.payload, typ, cfg.ParserConfig); len(attrs) > 0 {
+				meta["attr"] = attrs
 			}
 			if desc := strings.TrimSpace(stringOf(s.payload["description"])); desc != "" {
 				meta["description"] = desc
 			}
 		} else {
-			if from := relationEndpoint(s.payload, srcField, "source", "src", "from"); from != "" {
+			from := relationEndpoint(s.payload, srcField, "source", "src", "from")
+			to := relationEndpoint(s.payload, tgtField, "target", "tgt", "to")
+			if from != "" {
 				meta["from"] = from
 			}
-			if to := relationEndpoint(s.payload, tgtField, "target", "tgt", "to"); to != "" {
+			if to != "" {
 				meta["to"] = to
 			}
 			if typ := strings.TrimSpace(stringOf(s.payload["type"])); typ != "" {
@@ -296,6 +307,348 @@ func isSelfLoopRelation(payload map[string]any, sourceField, targetField string)
 	from := relationEndpoint(payload, sourceField, "source", "src", "from")
 	to := relationEndpoint(payload, targetField, "target", "tgt", "to")
 	return isSelfLoop(from, to)
+}
+
+// entityTypeKey normalizes an entity name for the name → class map. Only case
+// and surrounding whitespace are folded: the edge stage is told to reuse the
+// entity list verbatim, so any other difference means a different entity
+// rather than a variant spelling of the same one.
+func entityTypeKey(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// stampRelationEndpointTypes writes each relation's endpoint classes into its
+// from_type / to_type meta, resolved from the entity rows of the same compile.
+//
+// These two keys are what the ontology model graph is drawn and counted from,
+// so this must run after local dedup: by then aliases have been merged and
+// relation endpoints rewritten, and the names being resolved are the final
+// ones. An endpoint with no matching entity row is left unstamped rather than
+// guessed.
+func stampRelationEndpointTypes(prods []common.Product) {
+	types := make(map[string]string, len(prods))
+	for _, p := range prods {
+		if kind, _ := p.Meta["kind"].(string); kind != "entity" {
+			continue
+		}
+		typ, _ := p.Meta["entity_type"].(string)
+		if typ = strings.TrimSpace(typ); typ == "" {
+			continue
+		}
+		name := entityNameValue(p)
+		if name == "" {
+			continue
+		}
+		if _, seen := types[entityTypeKey(name)]; !seen {
+			types[entityTypeKey(name)] = typ
+		}
+	}
+	if len(types) == 0 {
+		return
+	}
+	for i := range prods {
+		if kind, _ := prods[i].Meta["kind"].(string); kind != "relation" {
+			continue
+		}
+		from, _ := prods[i].Meta["from"].(string)
+		to, _ := prods[i].Meta["to"].(string)
+		if t, ok := types[entityTypeKey(from)]; ok {
+			prods[i].Meta["from_type"] = t
+		}
+		if t, ok := types[entityTypeKey(to)]; ok {
+			prods[i].Meta["to_type"] = t
+		}
+	}
+}
+
+// ---- The declared ontology (standard model) ----
+//
+// An ontology template declares one entry per property in its relation section:
+// `type` is the property name, `kind` says whether it joins two individuals
+// ("object") or gives one a literal ("datatype"), and `domain` / `range` name
+// the classes it runs between. `domain` and `range` take a "|"-separated list
+// when a property is legitimately polymorphic.
+
+// ontologyProperty is one declared property, keyed by its `type`.
+type ontologyProperty struct {
+	kind     string // "object" | "datatype"
+	domains  []string
+	ranges   []string
+	datatype string
+}
+
+// splitPipeList splits a "|"-separated class list, trimming and deduplicating.
+func splitPipeList(raw string) []string {
+	parts := strings.Split(raw, "|")
+	out := make([]string, 0, len(parts))
+	seen := map[string]bool{}
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// declaredOntology reads the classes and properties a template declares. A
+// property's kind is inferred from its range when the template omits `kind` — a
+// range that names a declared class means an object property — mirroring
+// validateOntologyTemplate in the template service.
+func declaredOntology(parserConfig map[string]any) (map[string]bool, map[string]ontologyProperty) {
+	classes := map[string]bool{}
+	for _, raw := range configFields(common.GetMap(parserConfig, "entity")) {
+		f, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name := strings.TrimSpace(stringOf(f["type"])); name != "" {
+			classes[name] = true
+		}
+	}
+	props := map[string]ontologyProperty{}
+	for _, raw := range configFields(common.GetMap(parserConfig, "relation")) {
+		f, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(stringOf(f["type"]))
+		if name == "" {
+			continue
+		}
+		p := ontologyProperty{
+			kind:     strings.ToLower(strings.TrimSpace(stringOf(f["kind"]))),
+			domains:  splitPipeList(stringOf(f["domain"])),
+			ranges:   splitPipeList(stringOf(f["range"])),
+			datatype: strings.ToLower(strings.TrimSpace(stringOf(f["datatype"]))),
+		}
+		if p.kind == "" {
+			p.kind = "datatype"
+			for _, r := range p.ranges {
+				if classes[r] {
+					p.kind = "object"
+					break
+				}
+			}
+		}
+		props[name] = p
+	}
+	return classes, props
+}
+
+// filterOutOfOntologyRelations drops object-property assertions whose endpoint
+// classes contradict the template's declaration.
+//
+// This is the ONLY place the declared domain / range is enforced. The prompt
+// states it in prose, and the relation stage never even receives the entities'
+// classes (the "## Known Entities" list is names only), so the model can and
+// does violate it — see ontology.md §8. Enforcing it here costs no extra model
+// call.
+//
+// Two deliberate NON-drops:
+//   - an endpoint whose class is unknown (left unstamped because that entity was
+//     not compiled in this batch) is kept: the declaration is not contradicted,
+//     and dropping would lose data on partial batches — the ontology model graph
+//     reports it as an unattributed relation instead;
+//   - an assertion whose property the template does not declare at all is kept:
+//     the model graph surfaces such vocabulary drift as "observed, not declared"
+//     rather than hiding it.
+func filterOutOfOntologyRelations(prods []common.Product, parserConfig map[string]any) []common.Product {
+	classes, props := declaredOntology(parserConfig)
+	if len(classes) == 0 || len(props) == 0 {
+		return prods
+	}
+	inList := func(list []string, want string) bool {
+		for _, v := range list {
+			if v == want {
+				return true
+			}
+		}
+		return false
+	}
+	out := make([]common.Product, 0, len(prods))
+	for _, p := range prods {
+		if kind, _ := p.Meta["kind"].(string); kind != "relation" {
+			out = append(out, p)
+			continue
+		}
+		prop, _ := p.Meta["relation_type"].(string)
+		spec, declared := props[strings.TrimSpace(prop)]
+		if !declared || spec.kind != "object" {
+			out = append(out, p)
+			continue
+		}
+		fromType, _ := p.Meta["from_type"].(string)
+		toType, _ := p.Meta["to_type"].(string)
+		fromType, toType = strings.TrimSpace(fromType), strings.TrimSpace(toType)
+		if fromType != "" && len(spec.domains) > 0 && !inList(spec.domains, fromType) {
+			continue
+		}
+		if toType != "" && len(spec.ranges) > 0 && !inList(spec.ranges, toType) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// ontologyAttributeSpec is one declared datatype attribute, as the entity prompt
+// states it: the property name plus the literal type the value is expected in.
+type ontologyAttributeSpec struct {
+	name     string
+	datatype string
+}
+
+// ontologyAttributeSpecs maps each declared class to the datatype attributes it
+// carries — its own plus the ones it inherits.
+//
+// Inheritance matters: rdfs:subClassOf says a subclass has every attribute its
+// parent has, so an attribute declared on `agent` belongs to `person` and
+// `organization` too. Own attributes come first, then inherited ones, so a
+// subclass overrides its parent for the same name. Order follows declaration
+// order in the template, keeping the prompt text and stored keys deterministic.
+func ontologyAttributeSpecs(parserConfig map[string]any) map[string][]ontologyAttributeSpec {
+	_, props := declaredOntology(parserConfig)
+
+	parentOf := map[string]string{}
+	order := []string{}
+	for _, raw := range configFields(common.GetMap(parserConfig, "entity")) {
+		f, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(stringOf(f["type"]))
+		if name == "" {
+			continue
+		}
+		order = append(order, name)
+		if parents := splitPipeList(stringOf(f["parent"])); len(parents) > 0 {
+			parentOf[name] = parents[0]
+		}
+	}
+
+	own := map[string][]ontologyAttributeSpec{}
+	for _, raw := range configFields(common.GetMap(parserConfig, "relation")) {
+		f, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(stringOf(f["type"]))
+		if name == "" {
+			continue
+		}
+		spec, known := props[name]
+		if !known || spec.kind != "datatype" {
+			continue
+		}
+		for _, d := range spec.domains {
+			own[d] = append(own[d], ontologyAttributeSpec{name: name, datatype: spec.datatype})
+		}
+	}
+
+	out := make(map[string][]ontologyAttributeSpec, len(order))
+	for _, class := range order {
+		seen := map[string]bool{}
+		attrs := []ontologyAttributeSpec{}
+		for cur := class; cur != ""; cur = parentOf[cur] {
+			for _, a := range own[cur] {
+				if !seen[a.name] {
+					seen[a.name] = true
+					attrs = append(attrs, a)
+				}
+			}
+		}
+		if len(attrs) > 0 {
+			out[class] = attrs
+		}
+	}
+	return out
+}
+
+// datatypePropertiesByClass is ontologyAttributeSpecs reduced to the attribute
+// names, which is all the projection needs.
+func datatypePropertiesByClass(parserConfig map[string]any) map[string][]string {
+	out := map[string][]string{}
+	for class, specs := range ontologyAttributeSpecs(parserConfig) {
+		names := make([]string, 0, len(specs))
+		for _, s := range specs {
+			names = append(names, s.name)
+		}
+		out[class] = names
+	}
+	return out
+}
+
+// ontologyAttributes collects one entity's declared datatype attributes out of
+// its payload, keyed for the row's `attr` json column.
+//
+// Two shapes are accepted, so the template decides how the model is asked to
+// return them:
+//
+//   - a top-level payload key named after the attribute (what listing them as
+//     entity `output_fields[]` scalars would produce);
+//   - a nested object under one of the entity section's declared
+//     `output_fields[].name` values — the `shape` mechanism, which is the
+//     practical choice when each class carries a different attribute set.
+//
+// Only DECLARED attributes survive, so a model that invents one cannot smuggle
+// it into the filterable `attr` column.
+func ontologyAttributes(payload map[string]any, entityType string, parserConfig map[string]any) map[string]any {
+	if entityType == "" || payload == nil {
+		return nil
+	}
+	declared := datatypePropertiesByClass(parserConfig)[entityType]
+	if len(declared) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	for _, name := range declared {
+		if v, ok := payload[name]; ok && !isEmptyScalar(v) {
+			out[name] = v
+		}
+	}
+	for _, raw := range configOutputFields(common.GetMap(parserConfig, "entity")) {
+		f, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		nested, ok := payload[strings.TrimSpace(stringOf(f["name"]))].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, name := range declared {
+			if _, taken := out[name]; taken {
+				continue
+			}
+			if v, ok := nested[name]; ok && !isEmptyScalar(v) {
+				out[name] = v
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// isEmptyScalar reports whether a payload value carries nothing worth storing.
+// Maps count as empty: an attribute value is a scalar or a list of scalars, and
+// a map here would be an un-declared nested object.
+func isEmptyScalar(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(x) == ""
+	case []any:
+		return len(x) == 0
+	case []string:
+		return len(x) == 0
+	case map[string]any:
+		return true
+	}
+	return false
 }
 
 func isSelfLoop(from, to string) bool {

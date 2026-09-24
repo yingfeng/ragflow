@@ -224,6 +224,24 @@ func Run(ctx context.Context, deps common.Deps, param common.Param, inputs commo
 	}
 	stats := deduper.Stats()
 	prods := filterSelfLoopRelations(deduper.Rows())
+	// Relations carry their endpoint classes so the ontology model graph can be
+	// drawn and counted from relation rows alone. Run after dedup so aliases and
+	// merges have settled; see stampRelationEndpointTypes.
+	stampRelationEndpointTypes(prods)
+	// Then enforce the declared domain / range. Must run after stamping, which is
+	// what resolves each endpoint to its class. A template that declares no
+	// domain / range (every non-ontology template, and knowledge_graph.yaml)
+	// yields no object properties here, so nothing is dropped for them.
+	prods = filterOutOfOntologyRelations(prods, parserConfig)
+	// Then materialize the hypernode / hyperedge layer OG-RAG's retrieval
+	// consumes (ontology.md §5 step ④⑤). Runs on the final rows — after dedup,
+	// stamping and filtering — because the descent needs settled names and
+	// endpoint classes. Returns nothing unless the template is an ontology.
+	hyperRows, err := buildHypergraph(ctx, deps, cfg, prods)
+	if err != nil {
+		return common.Outputs{}, err
+	}
+	prods = append(prods, hyperRows...)
 	runtime.ReportProgressMessage(ctx, "Compiler", fmt.Sprintf(
 		"%s-template: dedup done: %d row(s), %d duplicate(s) dropped",
 		compileType, len(prods), stats.DuplicatesDropped))

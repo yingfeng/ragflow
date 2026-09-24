@@ -50,6 +50,14 @@ export const buildSynthesisSchema = () =>
     })
     .passthrough();
 
+/**
+ * Structured config the section editor carries through verbatim instead of
+ * modelling as a field grid (see ConfigPassthroughKeys in utils.ts). It needs
+ * its own union member so validation does not depend on buildSynthesisSchema
+ * happening to accept an object with unrelated keys.
+ */
+export const buildPassthroughConfigSchema = () => z.object({}).passthrough();
+
 export const buildTemplateSchema = (t: (key: string) => string) =>
   z
     .object({
@@ -61,6 +69,7 @@ export const buildTemplateSchema = (t: (key: string) => string) =>
         z.union([
           buildRaptorConfigSchema(t),
           buildSectionSchema(t),
+          buildPassthroughConfigSchema(),
           buildSynthesisSchema(),
           z.string(),
           z.boolean(),

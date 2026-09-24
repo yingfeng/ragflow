@@ -898,3 +898,407 @@ func TestGroupedDeduperTracksNameAfterSemanticMerge(t *testing.T) {
 		t.Fatalf("semantic and exact-name merges lost provenance: %v", ids)
 	}
 }
+
+// ---- ontology domain / range enforcement ----
+
+func ontologyParserConfig() map[string]any {
+	return map[string]any{
+		"kind": "ontology",
+		"entity": map[string]any{
+			"fields": []any{
+				map[string]any{"type": "agent", "description": "anything bearing a role"},
+				map[string]any{"type": "person", "parent": "agent", "description": "a person"},
+				map[string]any{"type": "place", "description": "a place"},
+			},
+			"output_fields": []any{
+				map[string]any{"name": "attributes", "shape": `{"<attribute>": <value>}`},
+			},
+		},
+		"relation": map[string]any{"fields": []any{
+			map[string]any{
+				"type": "born_in", "kind": "object",
+				"domain": "person", "range": "place",
+				"description": "a person was born in a place",
+			},
+			map[string]any{
+				"type": "alias", "kind": "datatype",
+				"domain": "agent", "datatype": "list",
+				"description": "alternative names",
+			},
+			map[string]any{
+				"type": "birth_date", "kind": "datatype",
+				"domain": "person", "datatype": "date",
+				"description": "the date of birth",
+			},
+		}},
+	}
+}
+
+func relationRow(prop, fromType, toType string) common.Product {
+	meta := map[string]any{"kind": "relation", "relation_type": prop}
+	if fromType != "" {
+		meta["from_type"] = fromType
+	}
+	if toType != "" {
+		meta["to_type"] = toType
+	}
+	return common.Product{Meta: meta}
+}
+
+// A contradicting endpoint class is the one case the projection drops; an
+// unknown class or an undeclared property must survive, because neither
+// contradicts the declaration and both are reported elsewhere (the model graph's
+// unattributed count and its "observed, not declared" class).
+func TestFilterOutOfOntologyRelations(t *testing.T) {
+	cfg := ontologyParserConfig()
+	rows := []common.Product{
+		relationRow("born_in", "person", "place"),               // matches the declaration
+		relationRow("born_in", "place", "person"),               // reversed => drop
+		relationRow("born_in", "person", "person"),              // wrong range => drop
+		relationRow("born_in", "person", ""),                    // class unknown => keep
+		relationRow("invented", "place", "place"),               // undeclared => keep
+		{Meta: map[string]any{"kind": "entity", "name": "Ada"}}, // not a relation
+	}
+	got := filterOutOfOntologyRelations(rows, cfg)
+	if len(got) != 4 {
+		t.Fatalf("rows = %d, want 4 (only the two contradicting endpoints dropped)", len(got))
+	}
+	// Order is preserved, so the survivors are rows 0, 3, 4 and 5.
+	wantProp := []string{"born_in", "born_in", "invented", ""}
+	wantFrom := []string{"person", "person", "place", ""}
+	for i := range got {
+		prop, _ := got[i].Meta["relation_type"].(string)
+		from, _ := got[i].Meta["from_type"].(string)
+		if prop != wantProp[i] || from != wantFrom[i] {
+			t.Fatalf("survivor %d = (%q, from %q), want (%q, from %q)",
+				i, prop, from, wantProp[i], wantFrom[i])
+		}
+	}
+}
+
+// A template that declares no domain / range (every non-ontology template, and
+// knowledge_graph.yaml specifically) must see its relations untouched — the
+// enforcement cannot silently change existing behaviour.
+func TestFilterOutOfOntologyRelationsLeavesPlainGraphAlone(t *testing.T) {
+	rows := []common.Product{
+		relationRow("linked", "letter", "letter"),
+		relationRow("linked", "anything", "whatever"),
+	}
+	got := filterOutOfOntologyRelations(rows, graphParserConfig())
+	if len(got) != len(rows) {
+		t.Fatalf("rows = %d, want %d untouched", len(got), len(rows))
+	}
+}
+
+// A subclass carries its parent's attributes: `alias` is declared on agent but
+// belongs to person too. Own attributes come first, then inherited ones, so a
+// subclass overrides its parent for the same name (the dedup keeps the first
+// occurrence).
+func TestDatatypePropertiesByClassInherits(t *testing.T) {
+	byClass := datatypePropertiesByClass(ontologyParserConfig())
+	want := map[string][]string{
+		"agent":  {"alias"},
+		"person": {"birth_date", "alias"},
+	}
+	for class, wantAttrs := range want {
+		got := byClass[class]
+		if len(got) != len(wantAttrs) {
+			t.Fatalf("%s attributes = %v, want %v", class, got, wantAttrs)
+		}
+		for i := range wantAttrs {
+			if got[i] != wantAttrs[i] {
+				t.Fatalf("%s attributes = %v, want %v", class, got, wantAttrs)
+			}
+		}
+	}
+	if _, present := byClass["place"]; present {
+		t.Fatalf("a class with no attributes must not appear: %v", byClass)
+	}
+}
+
+func TestOntologyAttributes(t *testing.T) {
+	cfg := ontologyParserConfig()
+
+	// Flat payload keys, plus the inherited `alias`.
+	flat := ontologyAttributes(map[string]any{
+		"type": "person", "alias": []any{"Ada Augusta Byron"}, "birth_date": "1815-12-10",
+	}, "person", cfg)
+	if len(flat) != 2 || flat["birth_date"] != "1815-12-10" {
+		t.Fatalf("flat attributes = %v, want alias + birth_date", flat)
+	}
+
+	// The nested shape object the entity output_fields ask for. The invented key
+	// must not reach the filterable column.
+	nested := ontologyAttributes(map[string]any{
+		"type":       "person",
+		"attributes": map[string]any{"birth_date": "1815-12-10", "invented": "x"},
+	}, "person", cfg)
+	if len(nested) != 1 || nested["birth_date"] != "1815-12-10" {
+		t.Fatalf("nested attributes = %v, want only birth_date", nested)
+	}
+
+	// Values that carry nothing must not bloat the column.
+	if got := ontologyAttributes(map[string]any{
+		"type": "person", "birth_date": "   ", "alias": []any{},
+	}, "person", cfg); got != nil {
+		t.Fatalf("empty attribute values must yield no attr, got %v", got)
+	}
+
+	// A template declaring no datatype properties yields nothing, so every
+	// non-ontology template is unaffected.
+	if got := ontologyAttributes(map[string]any{"type": "letter", "x": "y"}, "letter", graphParserConfig()); got != nil {
+		t.Fatalf("plain graph template must yield no attr, got %v", got)
+	}
+}
+
+// The entity stage must state each class's datatype attributes — inheritance
+// included — because that list is what makes the model emit them at all, and the
+// relation stage must state the standard model's structure (kind / domain /
+// range / datatype) so it can honour domain and range.
+func TestOntologyPromptsCarryTheStandardModel(t *testing.T) {
+	node, edge := HypergraphPrompts(ontologyParserConfig(), "en")
+
+	for _, want := range []string{
+		"  parent: agent",
+		"  attributes: birth_date (date), alias (list)",
+	} {
+		if !strings.Contains(node, want) {
+			t.Errorf("entity prompt missing %q\n---\n%s", want, node)
+		}
+	}
+	for _, want := range []string{
+		"  kind: object",
+		"  kind: datatype",
+		"  domain: person",
+		"  range: place",
+		"  datatype: date",
+	} {
+		if !strings.Contains(edge, want) {
+			t.Errorf("relation prompt missing %q\n---\n%s", want, edge)
+		}
+	}
+}
+
+// ---- the hypernode / hyperedge layer ----
+
+func entityRow(name, class string, attrs map[string]any, chunks ...string) common.Product {
+	meta := map[string]any{"kind": "entity", "name": name, "entity_type": class}
+	if len(attrs) > 0 {
+		meta["attr"] = attrs
+	}
+	if len(chunks) > 0 {
+		meta["source_chunk_ids"] = chunks
+	} else {
+		meta["source_chunk_ids"] = []string{"c1"}
+	}
+	return common.Product{Meta: meta}
+}
+
+func TestNLKeyIsTheMechanicalPathPhrased(t *testing.T) {
+	got := nlKey("crop:has_growing_zones.crop_growing_zone:name")
+	if want := "crop has growing zones crop growing zone name"; got != want {
+		t.Fatalf("nlKey = %q, want %q", got, want)
+	}
+}
+
+// A list-valued attribute contributes one fact per item: joining them would
+// silently drop the extra values from the value side of the index.
+func TestFlattenValues(t *testing.T) {
+	if got := flattenValues([]any{"A", "B"}); len(got) != 2 {
+		t.Fatalf("list = %v, want 2 items", got)
+	}
+	if got := flattenValues("  x  "); len(got) != 1 || got[0] != "x" {
+		t.Fatalf("scalar = %v, want [x]", got)
+	}
+	if got := flattenValues([]any{}); len(got) != 0 {
+		t.Fatalf("empty list = %v, want nothing", got)
+	}
+	if got := flattenValues("   "); len(got) != 0 {
+		t.Fatalf("blank = %v, want nothing", got)
+	}
+}
+
+func adaAndLondon() []common.Product {
+	return []common.Product{
+		entityRow("Ada Lovelace", "person", map[string]any{
+			"birth_date": "1815-12-10",
+			"alias":      []any{"Ada Augusta Byron"},
+		}, "c1"),
+		entityRow("London", "place", nil, "c2"),
+		{Meta: map[string]any{
+			"kind": "relation", "from": "Ada Lovelace", "to": "London",
+			"relation_type": "born_in",
+		}},
+	}
+}
+
+// The layer is the whole input of OG-RAG's Algorithm 1: one hyperedge per
+// flattened block (the dictionary payload RAG_QUERY_PROMPT asks for), and two
+// rows per unique (path, value) so the key leg and the value leg each have their
+// own vector.
+func TestBuildHypergraphMaterializesFacts(t *testing.T) {
+	cfg := CompileConfig{DocID: "d1", TenantID: "t1", TemplateID: "tpl", ParserConfig: ontologyParserConfig()}
+	rows, err := buildHypergraph(context.Background(), common.Deps{Embed: hashEmbedder{dim: 8}}, cfg, adaAndLondon())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var edges, keyRows, valueRows []common.Product
+	for _, r := range rows {
+		switch kind, _ := r.Meta["kind"].(string); kind {
+		case "hyperedge":
+			edges = append(edges, r)
+		case "hypernode":
+			if role, _ := r.Meta["node_role"].(string); role == "key" {
+				keyRows = append(keyRows, r)
+			} else {
+				valueRows = append(valueRows, r)
+			}
+		default:
+			t.Fatalf("unexpected row kind %q", kind)
+		}
+	}
+	// Ada is the only root (London is targeted), so: Ada's own block plus the
+	// block extended through born_in.
+	if len(edges) != 2 {
+		t.Fatalf("hyperedges = %d, want 2", len(edges))
+	}
+	// 3 facts on Ada (name, birth_date, alias) + 1 on London = 4 unique pairs.
+	if len(keyRows) != 4 || len(valueRows) != 4 {
+		t.Fatalf("hypernode rows = %d key / %d value, want 4 / 4", len(keyRows), len(valueRows))
+	}
+
+	// The deepest block is the dictionary OG-RAG hands to the model.
+	deep := parsePayload(edges[1].Content)
+	for wantKey, wantVal := range map[string]string{
+		"person name":               "Ada Lovelace",
+		"person birth date":         "1815-12-10",
+		"person alias":              "Ada Augusta Byron",
+		"person born in place name": "London",
+	} {
+		if got, _ := deep[wantKey].(string); got != wantVal {
+			t.Errorf("deep block[%q] = %q, want %q", wantKey, got, wantVal)
+		}
+	}
+
+	// The root's own pair belongs to BOTH blocks; the nested pair to one. This
+	// many-to-many membership is why hyperedge_ids is an array column.
+	rootEdgeIDs := metaStrings(edges[0].Meta, "id")
+	_ = rootEdgeIDs
+	for _, r := range keyRows {
+		path, _ := r.Meta["path"].(string)
+		ids := metaStrings(r.Meta, "hyperedge_ids")
+		switch path {
+		case "person:name":
+			if len(ids) != 2 {
+				t.Errorf("person:name belongs to %d hyperedges, want 2 (both blocks)", len(ids))
+			}
+		case "person:born_in.place:name":
+			if len(ids) != 1 {
+				t.Errorf("nested fact belongs to %d hyperedges, want 1", len(ids))
+			}
+		}
+		if prop, _ := r.Meta["prop"].(string); prop == "" {
+			t.Errorf("hypernode %q carries no prop", path)
+		}
+	}
+
+	// Each half carries only its own key so PayloadDescription cannot mix them.
+	for _, r := range keyRows {
+		p := parsePayload(r.Content)
+		if _, ok := p["key"]; !ok || len(p) != 1 {
+			t.Errorf("key row payload = %v, want exactly {key}", p)
+		}
+	}
+	for _, r := range valueRows {
+		p := parsePayload(r.Content)
+		if _, ok := p["value"]; !ok || len(p) != 1 {
+			t.Errorf("value row payload = %v, want exactly {value}", p)
+		}
+	}
+
+	// The two halves of one hypernode share the hash and differ by the suffix.
+	if !strings.HasSuffix(keyRows[0].ID, ":k") || !strings.HasSuffix(valueRows[0].ID, ":v") {
+		t.Fatalf("ids = %q / %q, want :k / :v suffixes", keyRows[0].ID, valueRows[0].ID)
+	}
+	if strings.TrimSuffix(keyRows[0].ID, ":k") != strings.TrimSuffix(valueRows[0].ID, ":v") {
+		t.Fatalf("the two halves must share hypernode_hash: %q vs %q", keyRows[0].ID, valueRows[0].ID)
+	}
+}
+
+// The same (path, value) reached from two different roots must collapse into ONE
+// hypernode whose hyperedge_ids names both blocks. That is what keeps the value
+// side of the index small, and why membership is an array column rather than a
+// single parent pointer.
+func TestBuildHypergraphHypernodeIsSharedAcrossRoots(t *testing.T) {
+	cfg := CompileConfig{DocID: "d1", TenantID: "t1", TemplateID: "tpl", ParserConfig: ontologyParserConfig()}
+	prods := []common.Product{
+		entityRow("Ada Lovelace", "person", nil, "c1"),
+		entityRow("Grace Hopper", "person", nil, "c2"),
+		entityRow("London", "place", nil, "c3"),
+		{Meta: map[string]any{"kind": "relation", "from": "Ada Lovelace", "to": "London", "relation_type": "born_in"}},
+		{Meta: map[string]any{"kind": "relation", "from": "Grace Hopper", "to": "London", "relation_type": "born_in"}},
+	}
+	rows, err := buildHypergraph(context.Background(), common.Deps{Embed: hashEmbedder{dim: 8}}, cfg, prods)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// London is reached from both roots, so this pair is produced twice.
+	const shared = "person:born_in.place:name"
+	found := 0
+	for _, r := range rows {
+		if kind, _ := r.Meta["kind"].(string); kind != "hypernode" {
+			continue
+		}
+		if role, _ := r.Meta["node_role"].(string); role != "key" {
+			continue
+		}
+		if path, _ := r.Meta["path"].(string); path != shared {
+			continue
+		}
+		found++
+		if ids := metaStrings(r.Meta, "hyperedge_ids"); len(ids) != 2 {
+			t.Errorf("shared hypernode belongs to %d hyperedges, want 2", len(ids))
+		}
+	}
+	if found != 1 {
+		t.Fatalf("the shared (path, value) produced %d hypernode rows, want 1", found)
+	}
+
+	// Both roots still produced their own block, so the two memberships are two
+	// distinct hyperedges rather than one block counted twice.
+	edges := 0
+	for _, r := range rows {
+		if kind, _ := r.Meta["kind"].(string); kind == "hyperedge" {
+			edges++
+		}
+	}
+	if edges != 4 {
+		t.Fatalf("hyperedges = %d, want 4 (two roots x two blocks each)", edges)
+	}
+}
+
+// A template with no declared object properties writes no extra rows, so every
+// other variant's row count is untouched.
+func TestBuildHypergraphSkippedWithoutOntology(t *testing.T) {
+	for name, pc := range map[string]map[string]any{
+		"plain graph": graphParserConfig(),
+		"ontology without object properties": func() map[string]any {
+			c := ontologyParserConfig()
+			c["relation"] = map[string]any{"fields": []any{
+				map[string]any{"type": "alias", "kind": "datatype", "domain": "person", "datatype": "list", "description": "a"},
+			}}
+			return c
+		}(),
+	} {
+		cfg := CompileConfig{DocID: "d1", ParserConfig: pc}
+		rows, err := buildHypergraph(context.Background(), common.Deps{Embed: hashEmbedder{dim: 8}}, cfg, adaAndLondon())
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("%s: wrote %d rows, want 0", name, len(rows))
+		}
+	}
+}

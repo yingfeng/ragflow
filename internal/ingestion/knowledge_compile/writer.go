@@ -104,6 +104,11 @@ type StructureBucket struct {
 	VecCount       int    // number of vectors folded into Vector (for true mean)
 	FromEntity     string // relation only
 	ToEntity       string // relation only
+	// FromType / ToType are the endpoint classes of a relation (from_type_kwd /
+	// to_type_kwd). They are what the class-level ontology graph is drawn and
+	// counted from, so a relation row without them cannot be placed on it.
+	FromType string // relation only
+	ToType   string // relation only
 	// CompileKwd is the raw compile keyword (the inferred compile type / autotype,
 	// e.g. "hypergraph", "timeline", "mindmap", "list") that produced this bucket.
 	// It is stamped on the stored row's compile_kwd so distinct structure kinds
@@ -566,6 +571,23 @@ func (w engineWriter) WriteMergedStructure(ctx context.Context, tenant, kb strin
 			row["type_kwd"] = "relation"
 			row["from_entity_kwd"] = b.FromEntity
 			row["to_entity_kwd"] = b.ToEntity
+			// prop_kwd / from_type_kwd / to_type_kwd are the ontology view's
+			// input: the property name and the endpoint classes. They are values
+			// here, never column names, so the template vocabulary is free to
+			// change without a schema change.
+			if b.RelationType != "" {
+				// Written verbatim (not through structureRelationType): the doc
+				// rows carry the model's own spelling and the ontology view keys
+				// its counts by it, so both levels must agree on the raw value.
+				// Normalisation stays where it belongs — in the bucket identity.
+				row["prop_kwd"] = b.RelationType
+			}
+			if b.FromType != "" {
+				row["from_type_kwd"] = b.FromType
+			}
+			if b.ToType != "" {
+				row["to_type_kwd"] = b.ToType
+			}
 		} else {
 			row["knowledge_graph_kwd"] = "entity"
 			row["type_kwd"] = "entity"
@@ -658,6 +680,7 @@ func mergeExistingStructureBuckets(ctx context.Context, eng engine.DocEngine, ba
 			SelectFields: []string{
 				"id", "compile_kwd", "compilation_template_ids", "compilation_template_kind_kwd",
 				"knowledge_graph_kwd", "name_kwd", "entity_type_kwd", "from_entity_kwd", "to_entity_kwd",
+				"prop_kwd", "from_type_kwd", "to_type_kwd",
 				"content_with_weight", "kc_payload", "source_doc_ids", "source_chunk_ids",
 			},
 			Filter: map[string]interface{}{
@@ -691,6 +714,17 @@ func mergeExistingStructureBuckets(ctx context.Context, eng engine.DocEngine, ba
 					existingType = structureString(payload["type"])
 				}
 				bucket.Type = preferredStructureEntityType(existingType, bucket.Type)
+			} else {
+				// Relation bucket: keep the endpoint classes already stored when
+				// this batch could not resolve them (its endpoint entity was
+				// compiled in an earlier pass), so a partial rewrite never drops
+				// a relation off the ontology graph.
+				if bucket.FromType == "" {
+					bucket.FromType = structureString(row["from_type_kwd"])
+				}
+				if bucket.ToType == "" {
+					bucket.ToType = structureString(row["to_type_kwd"])
+				}
 			}
 			id := structureString(row["id"])
 			newID := datasetLevelStructureID(tenant, kb, structureTemplateIdentity(bucket.TemplateID, bucket.TemplateKind), bucket.Name, bucket.Type, bucket.CompileKwd, bucket.RelationType)

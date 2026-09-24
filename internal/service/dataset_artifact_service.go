@@ -896,9 +896,12 @@ func (s *DatasetArtifactService) DeleteDocumentGraph(ctx context.Context, tenant
 	if docEngine == nil {
 		return 0, fmt.Errorf("document engine is not initialized")
 	}
+	// The structure compiler stores its output as entity and relation rows only
+	// — knowledge_graph_kwd="graph" stopped being a storage row — so those two
+	// kinds are the document's whole structure graph.
 	filter := map[string]interface{}{
-		"doc_id":             []string{documentID},
-		"compiled_graph_kwd": []string{"graph"},
+		"doc_id":              []string{documentID},
+		"knowledge_graph_kwd": []string{"entity", "relation"},
 	}
 	chunks, _, err := s.searchCompiled(ctx, tenantID, datasetID, filter, []string{"id"}, 0, 10000, nil)
 	if err != nil {
