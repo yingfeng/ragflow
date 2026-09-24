@@ -120,6 +120,10 @@ type OntologyInheritanceEdge struct {
 // which needs one count that the instance scan already produced.
 type OntologyPitfall struct {
 	Code string `json:"code"`
+	// Category groups the finding the way OntoBricks' detector does, so a reader
+	// can tell "this model cannot be satisfied" (logical) from "this name will
+	// age badly" (naming) instead of reading fifteen flat lines.
+	Category string `json:"category"`
 	// Severity is "error" for a declaration that cannot be satisfied and
 	// "warning" for a gap that only costs coverage.
 	Severity string `json:"severity"`
@@ -127,6 +131,14 @@ type OntologyPitfall struct {
 	// Subjects names the classes / properties the finding is about.
 	Subjects []string `json:"subjects"`
 }
+
+// The four groups, mirroring OntoBricks' report.
+const (
+	pitfallLogical    = "logical"
+	pitfallStructural = "structural"
+	pitfallNaming     = "naming"
+	pitfallSemantic   = "semantic"
+)
 
 // OntologyPropertyEdge is one OBJECT property of the model graph. A property
 // with a polymorphic domain or range yields one edge per domain × range
@@ -396,6 +408,12 @@ func (d declaredOntology) classHasProperty(class string) bool {
 // OntoBricks' Pitfalls panel for the findings this design can make
 // (ontology.md §6.5 A5/A6, §10.8.7). Every check reads the template alone except
 // orphan_class, which needs the instance count the caller already has.
+//
+// Two of OntoBricks' nineteen checks are deliberately absent, because this model
+// cannot express what they are about: `disjointWith` (so "parent disjoint with
+// children" and "superfluous disjointness" have nothing to read) and
+// `subPropertyOf` (so "single subproperty parent" has nothing to read).
+// Reporting a finding the reader cannot act on is worse than not reporting it.
 func buildOntologyPitfalls(d declaredOntology, classCounts map[string]int) []OntologyPitfall {
 	var out []OntologyPitfall
 
@@ -421,6 +439,7 @@ func buildOntologyPitfalls(d declaredOntology, classCounts map[string]int) []Ont
 	if len(danglingProps) > 0 {
 		out = append(out, OntologyPitfall{
 			Code:     "dangling_property",
+			Category: pitfallLogical,
 			Severity: "error",
 			Message: fmt.Sprintf("declared property/ies name an endpoint class the template does not declare: %s -> %s",
 				strings.Join(danglingProps, ", "),
@@ -445,9 +464,254 @@ func buildOntologyPitfalls(d declaredOntology, classCounts map[string]int) []Ont
 	if len(danglingChildren) > 0 {
 		out = append(out, OntologyPitfall{
 			Code:     "dangling_parent",
+			Category: pitfallLogical,
 			Severity: "error",
 			Message:  "declared class(es) whose parent is not a declared class: " + strings.Join(danglingChildren, ", "),
 			Subjects: danglingChildren,
+		})
+	}
+
+	// children is the inverse index of `parents`, used by three checks below.
+	children := map[string][]string{}
+	for _, class := range d.classOrder {
+		for _, parent := range d.classes[class].parents {
+			children[parent] = append(children[parent], class)
+		}
+	}
+
+	// A class that declares a parent AND one of that parent's own ancestors.
+	// rdfs:subClassOf is transitive, so the second edge says nothing — but it
+	// makes a hierarchy read as flatter than it is when traced by hand, and it
+	// survives a later rewiring as a lie.
+	var redundantParents []string
+	for _, class := range d.classOrder {
+		parents := d.classes[class].parents
+		for _, parent := range parents {
+			for _, ancestor := range d.ancestorChain(parent) {
+				if containsStr(parents, ancestor) {
+					redundantParents = append(redundantParents, class+" -> "+ancestor+" (already via "+parent+")")
+				}
+			}
+		}
+	}
+	if len(redundantParents) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "redundant_parent",
+			Category: pitfallLogical,
+			Severity: "warning",
+			Message:  "class(es) declaring a parent and its ancestor, so one edge is redundant: " + strings.Join(sortedUnique(redundantParents), ", "),
+			Subjects: sortedUnique(redundantParents),
+		})
+	}
+
+	// A parent with exactly one child. It is not wrong, it is a level of the
+	// hierarchy that exists only to hold one class — usually a sign the split
+	// wants another sibling or wants to be merged.
+	var singleChild []string
+	for _, parent := range d.classOrder {
+		if len(children[parent]) == 1 {
+			singleChild = append(singleChild, parent+" (only "+children[parent][0]+")")
+		}
+	}
+	if len(singleChild) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "single_child_parent",
+			Category: pitfallStructural,
+			Severity: "warning",
+			Message:  "parent class(es) with a single subclass: " + strings.Join(singleChild, ", "),
+			Subjects: singleChild,
+		})
+	}
+
+	// More than one root among the classes that actually take part in the
+	// hierarchy: the inheritance forest is disconnected, so no single class is
+	// above the others. A class with neither parent nor child is NOT a root here
+	// — it is standalone, which is a legitimate shape.
+	var roots []string
+	for _, class := range d.classOrder {
+		if len(children[class]) > 0 && len(d.classes[class].parents) == 0 {
+			roots = append(roots, class)
+		}
+	}
+	if len(roots) > 1 {
+		out = append(out, OntologyPitfall{
+			Code:     "disconnected_hierarchy",
+			Category: pitfallStructural,
+			Severity: "warning",
+			Message:  "the hierarchy has more than one root, so it is split into separate trees: " + strings.Join(roots, ", "),
+			Subjects: roots,
+		})
+	}
+
+	// A property that declares both a class and one of its ancestors as an
+	// endpoint. The ancestor already covers the descendant, so the pair adds a
+	// duplicate edge to the graph and a duplicate option to the extraction
+	// prompt.
+	var expandedEndpoints []string
+	for _, name := range d.propOrder {
+		prop := d.props[name]
+		for _, endpoints := range [][]string{prop.domains, prop.ranges} {
+			for _, specific := range endpoints {
+				for _, broader := range endpoints {
+					if specific == broader || !containsStr(d.ancestorChain(specific), broader) {
+						continue
+					}
+					expandedEndpoints = append(expandedEndpoints, name+" declares "+specific+" and its ancestor "+broader)
+				}
+			}
+		}
+	}
+	if len(expandedEndpoints) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "endpoint_ancestor_expansion",
+			Category: pitfallStructural,
+			Severity: "warning",
+			Message:  "property/ies naming an endpoint and one of its ancestors, which the ancestor already covers: " + strings.Join(sortedUnique(expandedEndpoints), ", "),
+			Subjects: sortedUnique(expandedEndpoints),
+		})
+	}
+
+	// One property's name containing another's, running between the same (or
+	// nested) classes. That is a sub-property in everything but declaration, and
+	// leaving it implicit is how "has_part" and "has_team_part" end up unrelated
+	// in the model while every reader assumes otherwise.
+	var impliedSubProperties []string
+	for _, outer := range d.propOrder {
+		for _, inner := range d.propOrder {
+			if outer == inner || !strings.HasSuffix(strings.ToLower(outer), strings.ToLower(inner)) {
+				continue
+			}
+			if !d.sameOrNarrowerEndpoints(d.props[outer].domains, d.props[inner].domains) {
+				continue
+			}
+			impliedSubProperties = append(impliedSubProperties, outer+" looks like a sub-property of "+inner)
+		}
+	}
+	if len(impliedSubProperties) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "property_name_hierarchy",
+			Category: pitfallStructural,
+			Severity: "warning",
+			Message:  "property/ies whose name nests inside another property's and whose domain is the same or narrower: " + strings.Join(sortedUnique(impliedSubProperties), ", "),
+			Subjects: sortedUnique(impliedSubProperties),
+		})
+	}
+
+	// Names that duplicate vocabulary the ontology already has. A property called
+	// `label` competes with rdfs:label everywhere downstream, and the engine has
+	// no reasoner to reconcile them.
+	var standardProps []string
+	for _, name := range d.propOrder {
+		if standardVocabulary[strings.ToLower(name)] {
+			standardProps = append(standardProps, name)
+		}
+	}
+	if len(standardProps) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "standard_vocabulary_property",
+			Category: pitfallNaming,
+			Severity: "warning",
+			Message:  "property/ies named after standard RDF/OWL vocabulary: " + strings.Join(standardProps, ", "),
+			Subjects: standardProps,
+		})
+	}
+
+	// The endpoint named INSIDE the property's name. It reads well until the
+	// class is renamed or the range is widened, at which point the name is a
+	// statement the model no longer makes.
+	var rangeInName, domainInName []string
+	for _, name := range d.propOrder {
+		prop := d.props[name]
+		tokens := nameTokens(name)
+		for _, class := range prop.ranges {
+			if containsStr(tokens, strings.ToLower(class)) {
+				rangeInName = append(rangeInName, name+" -> "+class)
+			}
+		}
+		for _, class := range prop.domains {
+			if containsStr(tokens, strings.ToLower(class)) {
+				domainInName = append(domainInName, name+" -> "+class)
+			}
+		}
+	}
+	if len(rangeInName) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "range_in_property_name",
+			Category: pitfallNaming,
+			Severity: "warning",
+			Message:  "property/ies whose name repeats the range class it points at: " + strings.Join(sortedUnique(rangeInName), ", "),
+			Subjects: sortedUnique(rangeInName),
+		})
+	}
+	if len(domainInName) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "domain_in_property_name",
+			Category: pitfallNaming,
+			Severity: "warning",
+			Message:  "property/ies whose name repeats the domain class they start from: " + strings.Join(sortedUnique(domainInName), ", "),
+			Subjects: sortedUnique(domainInName),
+		})
+	}
+
+	// A class whose name says nothing: the extraction prompt sends the class list
+	// to the model, so `thing` invites it to file anything under it.
+	var genericClasses []string
+	for _, class := range d.classOrder {
+		if genericClassNames[strings.ToLower(class)] {
+			genericClasses = append(genericClasses, class)
+		}
+	}
+	if len(genericClasses) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "overly_generic_class",
+			Category: pitfallSemantic,
+			Severity: "warning",
+			Message:  "class(es) named so generally that the model can file anything under them: " + strings.Join(genericClasses, ", "),
+			Subjects: genericClasses,
+		})
+	}
+
+	// A class and a property sharing a name. The two vocabularies are separate,
+	// so this is legal — and every reader, every filter and every downstream
+	// mapping will have to say which one it means.
+	var collidingNames []string
+	for _, name := range d.propOrder {
+		if _, ok := d.classes[name]; ok {
+			collidingNames = append(collidingNames, name)
+		}
+	}
+	if len(collidingNames) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "class_property_name_collision",
+			Category: pitfallSemantic,
+			Severity: "warning",
+			Message:  "name(s) used by both a class and a property: " + strings.Join(collidingNames, ", "),
+			Subjects: collidingNames,
+		})
+	}
+
+	// A datatype property whose declared datatype IS a class of this ontology.
+	// The author meant an object property: the values are entities, and stored as
+	// literals they will never join the graph. This is the one check a pure
+	// ontology configuration cannot make — it needs the declarations to line up,
+	// which is exactly what the template is.
+	var datatypeIsClass []string
+	for _, name := range d.propOrder {
+		prop := d.props[name]
+		if !prop.isDatatype() || prop.datatype == "" {
+			continue
+		}
+		if _, ok := d.classes[prop.datatype]; ok {
+			datatypeIsClass = append(datatypeIsClass, name+" declares datatype "+prop.datatype+", which is a class")
+		}
+	}
+	if len(datatypeIsClass) > 0 {
+		out = append(out, OntologyPitfall{
+			Code:     "datatype_is_class",
+			Category: pitfallSemantic,
+			Severity: "warning",
+			Message:  "datatype property/ies whose datatype is one of the declared classes, so they were meant to be object properties: " + strings.Join(datatypeIsClass, ", "),
+			Subjects: datatypeIsClass,
 		})
 	}
 
@@ -466,6 +730,7 @@ func buildOntologyPitfalls(d declaredOntology, classCounts map[string]int) []Ont
 	if len(noProperty) > 0 {
 		out = append(out, OntologyPitfall{
 			Code:     "class_without_property",
+			Category: pitfallStructural,
 			Severity: "warning",
 			Message:  "declared class(es) that no property touches, own or inherited: " + strings.Join(noProperty, ", "),
 			Subjects: noProperty,
@@ -474,12 +739,85 @@ func buildOntologyPitfalls(d declaredOntology, classCounts map[string]int) []Ont
 	if len(orphans) > 0 {
 		out = append(out, OntologyPitfall{
 			Code:     "orphan_class",
+			Category: pitfallStructural,
 			Severity: "warning",
 			Message:  "declared class(es) with neither a property nor a single compiled instance: " + strings.Join(orphans, ", "),
 			Subjects: orphans,
 		})
 	}
 	return out
+}
+
+// sameOrNarrowerEndpoints reports whether every domain in `specific` is the same
+// as, or a descendant of, one in `broader` — the "runs between the same classes"
+// half of the implied-sub-property check.
+func (d declaredOntology) sameOrNarrowerEndpoints(specific, broader []string) bool {
+	if len(specific) == 0 || len(broader) == 0 {
+		return false
+	}
+	for _, narrow := range specific {
+		found := false
+		for _, wide := range broader {
+			if narrow == wide || containsStr(d.ancestorChain(narrow), wide) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// nameTokens splits a property name on separators and camelCase boundaries, so
+// `hasPerson`, `has_person` and `has-person` all yield the token `person`. Whole
+// tokens are what make the range/domain-in-name checks safe: a substring match
+// would flag `born_in` against a class called `in`.
+func nameTokens(name string) []string {
+	var tokens []string
+	var current []rune
+	flush := func() {
+		if len(current) > 0 {
+			tokens = append(tokens, strings.ToLower(string(current)))
+			current = nil
+		}
+	}
+	for _, r := range name {
+		switch {
+		case r == '_' || r == '-' || r == '.' || r == ' ':
+			flush()
+		case r >= 'A' && r <= 'Z':
+			// A capital starts a new token, but only after a lower-case run:
+			// `HTTPServer` stays one token's worth of noise either way.
+			flush()
+			current = append(current, r)
+		default:
+			current = append(current, r)
+		}
+	}
+	flush()
+	return tokens
+}
+
+// standardVocabulary are the names an ontology should not re-declare: RDF, RDFS
+// and OWL already own them, and every downstream tool resolves them first.
+var standardVocabulary = map[string]bool{
+	"type": true, "label": true, "comment": true, "seealso": true,
+	"sameas": true, "subclassof": true, "subpropertyof": true,
+	"domain": true, "range": true, "equivalentclass": true,
+	"disjointwith": true, "instanceof": true, "identifier": true,
+	"depiction": true, "value": true, "member": true, "first": true,
+	"rest": true, "isdefinedby": true, "versioninfo": true,
+}
+
+// genericClassNames are the names that carry no distinction, so an extraction
+// model has nothing to steer by when it has to choose between them and the
+// classes that do.
+var genericClassNames = map[string]bool{
+	"thing": true, "entity": true, "object": true, "item": true,
+	"element": true, "resource": true, "data": true, "value": true,
+	"node": true, "class": true, "property": true, "attribute": true,
 }
 
 // splitTypeList splits a "|"-separated class list. A property that is

@@ -31,6 +31,11 @@ import {
   type OntologyGraphLink,
   type OntologyGraphNode,
 } from './graph-data';
+import {
+  PitfallCategoryOrder,
+  pitfallCategoryLabel,
+  pitfallLabel,
+} from './pitfall-labels';
 
 const ClassColor = '#4CACFF';
 const UndeclaredClassColor = '#F0A020';
@@ -928,6 +933,11 @@ function OntologyModelGraph({
           : undefined,
       })),
       properties,
+      // The edge that was clicked, so the panel can point at the rows that edge
+      // stands for: the panel is class-scoped, and without this a click on a
+      // bundle opens a list of the class's properties with nothing to say which
+      // of them the reader just asked about.
+      focusedProperties: selectedLink?.types,
       datasetId,
       documentId,
       templateId,
@@ -936,6 +946,7 @@ function OntologyModelGraph({
     });
   }, [
     onClassDetailChange,
+    selectedLink,
     selectedNode,
     graph,
     selectedParents,
@@ -1110,20 +1121,50 @@ function OntologyModelGraph({
         </div>
 
         {(graph?.pitfalls?.length ?? 0) > 0 && (
-          <div className="absolute bottom-2 right-2 z-10 flex max-w-[calc(100%-1rem)] flex-col gap-1 text-xs">
-            {graph?.pitfalls?.map((pitfall) => (
-              <div
-                key={pitfall.code}
-                className={cn(
-                  'rounded-md border bg-bg-card px-2 py-1',
-                  pitfall.severity === 'error'
-                    ? 'border-red-400 text-red-500'
-                    : 'border-border-button text-text-secondary',
-                )}
-              >
-                {pitfall.message}
-              </div>
-            ))}
+          // Grouped by category and capped, the way the reference detector
+          // reports: fifteen flat sentences on a canvas overlay is a wall, while
+          // "Logical · 2" tells the reader what kind of problem they are looking
+          // at before they read a word of it.
+          <div className="absolute bottom-2 right-2 z-10 flex max-h-[calc(100%-1rem)] max-w-[calc(100%-1rem)] flex-col gap-1 overflow-auto text-xs">
+            {PitfallCategoryOrder.map((category) => {
+              const found = (graph?.pitfalls ?? []).filter(
+                (pitfall) => (pitfall.category ?? 'structural') === category,
+              );
+              if (found.length === 0) return null;
+              return (
+                <div key={category} className="flex flex-col gap-1">
+                  <span className="text-text-secondary">
+                    {pitfallCategoryLabel(category, t)} · {found.length}
+                  </span>
+                  {found.map((pitfall) => (
+                    <div
+                      key={pitfall.code}
+                      // The service's own sentence stays in the tooltip: it names
+                      // the classes and properties, so the panel stays readable
+                      // and nothing is lost.
+                      title={pitfall.message}
+                      className={cn(
+                        'rounded-md border bg-bg-card px-2 py-1',
+                        pitfall.severity === 'error'
+                          ? 'border-red-400 text-red-500'
+                          : 'border-border-button text-text-secondary',
+                      )}
+                    >
+                      {pitfallLabel(pitfall.code, t)}
+                      {pitfall.subjects?.length > 0 && (
+                        <span className="ml-1 opacity-70">
+                          ({pitfall.subjects.slice(0, 3).join(', ')}
+                          {pitfall.subjects.length > 3
+                            ? ` +${pitfall.subjects.length - 3}`
+                            : ''}
+                          )
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

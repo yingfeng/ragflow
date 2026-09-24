@@ -28,6 +28,11 @@ import { useNavigate } from 'react-router';
 import { BlueprintSection } from './components/blueprint-section';
 import { TemplateConfiguration } from './components/template-configuration';
 import { useEditNextCompilationTemplateGroup } from './hooks/use-edit-next-compilation-template-group';
+import {
+  draftFromSections,
+  validateDraft,
+  type OntologySection,
+} from './ontology/model';
 
 const SelectedTemplateIndex = 0;
 
@@ -53,6 +58,26 @@ export default function EditNextCompilationTemplate() {
   });
 
   const isArtifacts = selectedKind === CompilationTemplateKind.Artifacts;
+
+  // The service rejects an ontology template whose cross-references do not
+  // resolve, and that rejection arrives with nothing on screen (see the schema
+  // refinement). Computing the same findings here is what lets the footer say
+  // WHY the save is blocked instead of leaving a dead button.
+  const entitySection = useWatch({
+    control: form.control,
+    name: `templates.${SelectedTemplateIndex}.config.entity`,
+  }) as OntologySection | undefined;
+  const relationSection = useWatch({
+    control: form.control,
+    name: `templates.${SelectedTemplateIndex}.config.relation`,
+  }) as OntologySection | undefined;
+  const ontologyIssues = useMemo(
+    () =>
+      selectedKind === CompilationTemplateKind.Ontology
+        ? validateDraft(draftFromSections(entitySection, relationSection))
+        : [],
+    [entitySection, relationSection, selectedKind],
+  );
 
   const handleSave = useMemo(
     () => form.handleSubmit(onSubmit),
@@ -88,10 +113,23 @@ export default function EditNextCompilationTemplate() {
           </TemplateConfiguration>
 
           <footer className="shrink-0 px-5 py-4 border-t border-border-button flex items-center justify-end gap-5">
+            {ontologyIssues.length > 0 && (
+              <span className="mr-auto text-xs text-[#F0A020]">
+                {t('knowledgeCompilation.ontologySaveBlocked', {
+                  count: ontologyIssues.length,
+                  defaultValue:
+                    '{{count}} ontology problem(s) must be fixed first — the canvas lists them.',
+                })}
+              </span>
+            )}
             <Button type="button" variant="outline" onClick={navigateToAgents}>
               {t('common.back')}
             </Button>
-            <Button type="submit" loading={isLoading}>
+            <Button
+              type="submit"
+              loading={isLoading}
+              disabled={ontologyIssues.length > 0}
+            >
               {t('common.save')}
             </Button>
           </footer>

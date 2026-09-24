@@ -79,6 +79,11 @@ export interface OntologyDetailSelection {
  * dataset under a count that came from one document.
  */
 export interface OntologyDetailPanelState extends OntologyDetailSelection {
+  /**
+   * The properties of the edge that was clicked (a bundle holds several). The
+   * rows they name are marked, so "what is this edge?" has an answer on screen.
+   */
+  focusedProperties?: string[];
   datasetId?: string;
   documentId?: string;
   templateId?: string;
@@ -151,6 +156,7 @@ export function OntologyDetailPanel({
   children,
   attributes,
   properties,
+  focusedProperties,
   datasetId,
   documentId,
   templateId,
@@ -533,6 +539,10 @@ export function OntologyDetailPanel({
               className={cn(
                 'flex flex-col gap-0.5 rounded border px-2 py-1',
                 property.declared ? 'border-border-button' : 'border-[#F0A020]',
+                // The bundle the reader clicked, marked: this is the answer to
+                // "what is this edge?" on a panel that lists a whole class.
+                focusedProperties?.includes(property.type) &&
+                  'ring-1 ring-[#4CACFF]',
               )}
             >
               <div className="flex items-center gap-1">

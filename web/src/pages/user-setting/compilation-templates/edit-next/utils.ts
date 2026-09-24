@@ -57,15 +57,15 @@ export const isConfigMetaKey = (key: string) =>
   ].includes(key);
 
 /**
- * Config keys whose value is a structured object the section editor does not
- * model: `guideline` carries the extraction instructions (target /
- * rules_for_entities / rules_for_relations) for the structure variants.
+ * Config keys the section editor does not model: `guideline` carries the
+ * extraction instructions (target / rules_for_entities / rules_for_relations)
+ * for the structure variants, and `base_uri` is the ontology's IRI prefix.
  *
- * They are carried through the form verbatim. Treating one as a section would
- * reset it to `{description: '', fields: []}` on the way in and write that back
- * on save, silently dropping the instructions from the stored template.
+ * They are carried through the form verbatim. Anything not listed here is read
+ * as a section and rewritten as `{description: '', fields: []}` — which silently
+ * drops the value from the stored template on the next save.
  */
-export const ConfigPassthroughKeys: string[] = ['guideline'];
+export const ConfigPassthroughKeys: string[] = ['guideline', 'base_uri'];
 
 export const isConfigPassthroughKey = (key: string) =>
   ConfigPassthroughKeys.includes(key);
@@ -76,15 +76,21 @@ export const createEmptyField = (keys: string[]) =>
 export const normalizeSection = (
   section?: ICompilationTemplateSection,
 ): ICompilationTemplateSection => {
-  const fields = section?.fields ?? [];
+  // Unknown keys of the SECTION itself travel through. A section is not only
+  // `{description, fields}`: the builtin ontology template also declares
+  // `entity.output_fields`, and rebuilding the section from the two modelled
+  // keys would drop it — the editor would then save a template without it.
+  const { description, fields, ...rest } = (section ?? {}) as
+    ICompilationTemplateSection & Record<string, unknown>;
   return {
-    description: section?.description ?? '',
-    fields: fields.map((field) =>
+    ...rest,
+    description: description ?? '',
+    fields: (fields ?? []).map((field) =>
       Object.fromEntries(
         Object.entries(field).map(([key, value]) => [key, value ?? '']),
       ),
     ),
-  };
+  } as ICompilationTemplateSection;
 };
 
 export const buildConfigFromBuiltin = (

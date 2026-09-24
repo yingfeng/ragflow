@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -186,6 +187,78 @@ func TestBuildOntologyPitfallsClean(t *testing.T) {
 	if got := buildOntologyPitfalls(declared, map[string]int{"person": 1, "place": 1}); len(got) != 0 {
 		t.Fatalf("pitfalls = %+v, want none", got)
 	}
+}
+
+// The checks added for parity with OntoBricks' detector. One template trips one
+// of each kind, so a check that stops firing is visible here rather than in a
+// panel nobody has open.
+func TestBuildOntologyPitfallsStructureNamingAndSemantics(t *testing.T) {
+	declared := parseDeclaredOntology(ontologyTestConfig(
+		[]map[string]interface{}{
+			{"type": "agent"},
+			{"type": "person", "parent": "agent"},          // single child of agent
+			{"type": "employee", "parent": "person|agent"}, // agent is redundant
+			{"type": "thing"},                              // too generic to steer by
+			{"type": "place"},
+		},
+		[]map[string]interface{}{
+			// endpoint and its ancestor declared together
+			{"type": "born_in", "kind": "object", "domain": "person|agent", "range": "place"},
+			// name repeats its range class
+			{"type": "has_place", "kind": "object", "domain": "person", "range": "place"},
+			// name repeats its domain class
+			{"type": "person_alias", "kind": "datatype", "datatype": "string", "domain": "person"},
+			// standard vocabulary
+			{"type": "label", "kind": "datatype", "datatype": "string", "domain": "place"},
+			// datatype that names a declared class: meant to be an object property
+			{"type": "area", "kind": "datatype", "datatype": "place", "domain": "agent"},
+			// name used by a class as well
+			{"type": "place", "kind": "datatype", "datatype": "string", "domain": "agent"},
+			// nested name + nested domain: born_in is a narrower has_born_in
+			{"type": "has_born_place", "kind": "object", "domain": "person", "range": "place"},
+		},
+	))
+	found := map[string]OntologyPitfall{}
+	for _, p := range buildOntologyPitfalls(declared, map[string]int{"person": 1, "place": 1}) {
+		found[p.Code] = p
+	}
+
+	for code, category := range map[string]string{
+		"redundant_parent":              pitfallLogical,
+		"single_child_parent":           pitfallStructural,
+		"endpoint_ancestor_expansion":   pitfallStructural,
+		"property_name_hierarchy":       pitfallStructural,
+		"standard_vocabulary_property":  pitfallNaming,
+		"range_in_property_name":        pitfallNaming,
+		"domain_in_property_name":       pitfallNaming,
+		"overly_generic_class":          pitfallSemantic,
+		"class_property_name_collision": pitfallSemantic,
+		"datatype_is_class":             pitfallSemantic,
+	} {
+		p, ok := found[code]
+		if !ok {
+			t.Errorf("missing %s (all: %v)", code, keysOfPitfalls(found))
+			continue
+		}
+		if p.Category != category {
+			t.Errorf("%s category = %q, want %q", code, p.Category, category)
+		}
+		if len(p.Subjects) == 0 || p.Message == "" {
+			t.Errorf("%s carries no message/subjects: %+v", code, p)
+		}
+	}
+	if p := found["datatype_is_class"]; !containsStr(p.Subjects, "area declares datatype place, which is a class") {
+		t.Errorf("datatype_is_class should name the property and the class: %v", p.Subjects)
+	}
+}
+
+func keysOfPitfalls(found map[string]OntologyPitfall) []string {
+	out := make([]string, 0, len(found))
+	for code := range found {
+		out = append(out, code)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Datatype properties must not become edges: an edge needs a class as its range,

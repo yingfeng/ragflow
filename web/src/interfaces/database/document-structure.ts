@@ -112,7 +112,14 @@ export interface IOntologyInheritance {
 /** One declaration-level finding, the equivalent of a pitfalls panel. */
 export interface IOntologyPitfall {
   code: string;
+  /**
+   * The group the finding belongs to (logical / structural / naming / semantic),
+   * the way the reference detector reports. Optional: a finding from an older
+   * backend has none, and the panel then files it under `structural`.
+   */
+  category?: string;
   severity: 'error' | 'warning';
+  /** The service's own sentence, kept as the tooltip next to the translated one. */
   message: string;
   subjects: string[];
 }
