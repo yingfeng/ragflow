@@ -1048,6 +1048,8 @@ func startServer(ctx context.Context, serverName string, arguments *serverArgs) 
 	tenantHandler := handler.NewTenantHandler(tenantService, userService, datasetsService)
 	documentHandler := handler.NewDocumentHandler(documentService, datasetsService, fileService)
 	datasetsHandler := handler.NewDatasetsHandler(datasetsService, metadataService)
+	ontologyABoxRetrievalHandler := handler.NewOntologyABoxRetrievalHandler(
+		service.NewOntologyABoxRetrievalService(docEngine, dao.NewDocumentDAO()))
 	systemHandler := handler.NewSystemHandler(systemService)
 	statsHandler := handler.NewStatsHandler(statsService)
 	chunkHandler := handler.NewChunkHandler(chunkService, userService)
@@ -1186,7 +1188,8 @@ func startServer(ctx context.Context, serverName string, arguments *serverArgs) 
 		pipelineHandler,
 		compilationTemplateHandler,
 		compilationTemplateGroupHandler,
-		datasetArtifactHandler)
+		datasetArtifactHandler,
+		ontologyABoxRetrievalHandler)
 
 	// Create Gin engine
 	ginEngine := gin.New()

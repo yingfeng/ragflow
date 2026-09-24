@@ -59,6 +59,7 @@ type Router struct {
 	compilationTemplateHandler      *handler.CompilationTemplateHandler
 	compilationTemplateGroupHandler *handler.CompilationTemplateGroupHandler
 	datasetArtifactHandler          *handler.DatasetArtifactHandler
+	ontologyABoxRetrievalHandler    *handler.OntologyABoxRetrievalHandler
 }
 
 // NewRouter create router
@@ -97,6 +98,7 @@ func NewRouter(
 	compilationTemplateHandler *handler.CompilationTemplateHandler,
 	compilationTemplateGroupHandler *handler.CompilationTemplateGroupHandler,
 	datasetArtifactHandler *handler.DatasetArtifactHandler,
+	ontologyABoxRetrievalHandler *handler.OntologyABoxRetrievalHandler,
 ) *Router {
 	return &Router{
 		authHandler:          authHandler,
@@ -134,6 +136,7 @@ func NewRouter(
 		compilationTemplateHandler:      compilationTemplateHandler,
 		compilationTemplateGroupHandler: compilationTemplateGroupHandler,
 		datasetArtifactHandler:          datasetArtifactHandler,
+		ontologyABoxRetrievalHandler:    ontologyABoxRetrievalHandler,
 	}
 }
 
@@ -341,6 +344,9 @@ func (r *Router) Setup(engine *gin.Engine) {
 			}
 			v1.POST("/openai/:chat_id/chat/completions", r.openaiChatHandler.OpenAIChatCompletions)
 			v1.POST("/retrieval", r.datasetsHandler.SearchDatasets)
+			// Compiled-rows (ABox) retrieval with an explicitly stated structure, kept
+			// out of the main pipeline on purpose (ontology.md §6.6 B).
+			v1.POST("/retrieval/ontology", r.ontologyABoxRetrievalHandler.Retrieve)
 
 			// Dataset routes
 			datasets := v1.Group("/datasets")
