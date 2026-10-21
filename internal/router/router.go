@@ -58,6 +58,16 @@ type Router struct {
 	compilationTemplateHandler      *handler.CompilationTemplateHandler
 	compilationTemplateGroupHandler *handler.CompilationTemplateGroupHandler
 	datasetArtifactHandler          *handler.DatasetArtifactHandler
+
+	// registerHarness mounts the agent-harness API under /api/v1/harness. It is
+	// a setter rather than a NewRouter parameter because the runtime is optional
+	// and depends on the process owning a model and a filesystem.
+	registerHarness func(group *gin.RouterGroup)
+}
+
+// SetHarness attaches the agent-harness API. It must be called before Setup.
+func (r *Router) SetHarness(register func(group *gin.RouterGroup)) {
+	r.registerHarness = register
 }
 
 // NewRouter create router
@@ -242,6 +252,11 @@ func (r *Router) Setup(engine *gin.Engine) {
 		// API v1 route group
 		v1 := authorized.Group("/api/v1")
 		{
+			// Agent harness runs live beside the canvas agents: the canvas owns
+			// /agents, the harness owns /harness/agents and /harness/runs.
+			if r.registerHarness != nil {
+				r.registerHarness(v1.Group("/harness"))
+			}
 			// Auth routes
 			auth := v1.Group("/auth")
 			{

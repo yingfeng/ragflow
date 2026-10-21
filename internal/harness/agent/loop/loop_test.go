@@ -7,13 +7,13 @@ import (
 
 	"ragflow/internal/harness/agent/definition"
 	"ragflow/internal/harness/agent/model"
-	"ragflow/internal/harness/caps"
 	"ragflow/internal/harness/policy"
+	"ragflow/internal/harness/toolkit"
 )
 
 type fakeCap struct {
 	tool     string
-	result   caps.Result
+	result   toolkit.Result
 	err      error
 	invoked  int
 	failOnce bool
@@ -24,21 +24,21 @@ func (f *fakeCap) Name() string { return "fake" }
 func (f *fakeCap) Tools() []model.ToolSpec {
 	return []model.ToolSpec{{
 		Name:       f.tool,
-		Parameters: caps.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}}),
+		Parameters: toolkit.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}}),
 	}}
 }
 
-func (f *fakeCap) Invoke(context.Context, caps.Call) (caps.Result, error) {
+func (f *fakeCap) Invoke(context.Context, toolkit.Call) (toolkit.Result, error) {
 	f.invoked++
 	if f.err != nil {
-		return caps.Result{}, f.err
+		return toolkit.Result{}, f.err
 	}
 	return f.result, nil
 }
 
-func buildRunner(t *testing.T, mdl model.Model, capability caps.Capability, cfg Config) *Runner {
+func buildRunner(t *testing.T, mdl model.Model, capability toolkit.Capability, cfg Config) *Runner {
 	t.Helper()
-	registry := caps.NewRegistry()
+	registry := toolkit.NewRegistry()
 	if capability != nil {
 		if err := registry.Register(capability); err != nil {
 			t.Fatalf("register: %v", err)
@@ -79,9 +79,9 @@ func TestLoop_FinalAnswerStops(t *testing.T) {
 func TestLoop_ToolRoundTrip(t *testing.T) {
 	capability := &fakeCap{
 		tool: "rag_search",
-		result: caps.Result{
+		result: toolkit.Result{
 			Content:  "[1] chunk-a\ncontent",
-			Evidence: []caps.Evidence{{Source: "rag", Ref: "chunk-a"}},
+			Evidence: []toolkit.Evidence{{Source: "rag", Ref: "chunk-a"}},
 		},
 	}
 	mdl := model.NewFake(
@@ -109,7 +109,7 @@ func TestLoop_ToolRoundTrip(t *testing.T) {
 }
 
 func TestLoop_RoundBudgetStops(t *testing.T) {
-	capability := &fakeCap{tool: "rag_search", result: caps.Result{Content: "nothing"}}
+	capability := &fakeCap{tool: "rag_search", result: toolkit.Result{Content: "nothing"}}
 	mdl := model.NewFake(
 		model.CallTool("c1", "rag_search", `{"query":"a"}`),
 		model.CallTool("c2", "rag_search", `{"query":"b"}`),
@@ -162,7 +162,7 @@ func TestLoop_UnknownToolIsRecoverable(t *testing.T) {
 		model.CallTool("c1", "nope", `{}`),
 		model.Reply("recovered"),
 	)
-	runner := buildRunner(t, mdl, &fakeCap{tool: "rag_search", result: caps.Result{Content: "ok"}}, Config{})
+	runner := buildRunner(t, mdl, &fakeCap{tool: "rag_search", result: toolkit.Result{Content: "ok"}}, Config{})
 
 	outcome, err := runner.Invoke(context.Background(), &Input{RunID: "run-5", UserMessage: "q"}, nil)
 	if err != nil {

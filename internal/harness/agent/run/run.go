@@ -12,9 +12,11 @@ import (
 
 	"ragflow/internal/entity"
 	"ragflow/internal/harness/agent/loop"
-	"ragflow/internal/harness/caps"
+	"ragflow/internal/harness/events"
 	"ragflow/internal/harness/graph/types"
 	"ragflow/internal/harness/store"
+	"ragflow/internal/harness/toolkit"
+	"ragflow/internal/harness/toolkit/spill"
 )
 
 // DefaultLeaseTTL is how long a worker owns a run before another may take it.
@@ -29,7 +31,7 @@ type Request struct {
 	AgentName      string
 	UserMessage    string
 	Trigger        string
-	Scope          caps.Scope
+	Scope          toolkit.Scope
 }
 
 // EventType enumerates the streamed events.
@@ -59,17 +61,34 @@ type Config struct {
 	LeaseTTL time.Duration
 	// Owner identifies this worker in the lease. Zero value uses a random id.
 	Owner string
+	// Approvals settles pending tool approvals. Nil means this worker serves no
+	// approval requests, and the gate (if any) denies on its own.
+	Approvals *toolkit.ApprovalBroker
+	// Grants records "allow always" answers so the same call does not ask again.
+	// Nil serves approvals without remembering them.
+	Grants toolkit.GrantStore
+	// Events receives the fine-grained audit log (model rounds, tool calls,
+	// approvals, verdicts). Nil leaves only the step records in the store.
+	Events events.EventLog
+	// EventLayers selects which data classes reach Events. Nil drops
+	// diagnostics, which is the production default.
+	EventLayers events.LayerFilter
 }
 
 // Service executes runs.
 type Service struct {
-	runner   *loop.Runner
-	store    *store.RunStore
-	leaseTTL time.Duration
-	owner    string
+	runner      *loop.Runner
+	store       *store.RunStore
+	leaseTTL    time.Duration
+	owner       string
+	approvals   *toolkit.ApprovalBroker
+	grants      toolkit.GrantStore
+	events      events.EventLog
+	eventLayers events.LayerFilter
 
 	mu          sync.Mutex
 	cancels     map[string]context.CancelFunc
+	inboxes     map[string]*loop.Inbox
 	subscribers map[string][]chan Event
 	seqs        map[string]int
 }
@@ -85,11 +104,21 @@ func New(cfg Config) (*Service, error) {
 		owner = "worker-" + uuid.NewString()
 	}
 
+	eventLayers := cfg.EventLayers
+	if eventLayers == nil {
+		eventLayers = events.DefaultLayerFilter
+	}
+
 	service := &Service{
 		store:       cfg.Store,
 		leaseTTL:    leaseTTL,
 		owner:       owner,
+		approvals:   cfg.Approvals,
+		grants:      cfg.Grants,
+		events:      cfg.Events,
+		eventLayers: eventLayers,
 		cancels:     make(map[string]context.CancelFunc),
+		inboxes:     make(map[string]*loop.Inbox),
 		subscribers: make(map[string][]chan Event),
 		seqs:        make(map[string]int),
 	}
@@ -127,15 +156,26 @@ func (s *Service) Invoke(ctx context.Context, req Request) (loop.Outcome, error)
 	s.broadcast(req.RunID, Event{Type: EventRunStarted, RunID: req.RunID})
 
 	runCtx, cancel := context.WithCancel(ctx)
-	s.registerCancel(req.RunID, cancel)
+	inbox := loop.NewInbox()
+	s.registerRun(req.RunID, cancel, inbox)
 	defer func() {
-		s.unregisterCancel(req.RunID)
+		s.unregisterRun(req.RunID)
 		cancel()
 	}()
+	// The spill store is per run: a handle from one run must never resolve in
+	// another.
+	runCtx = spill.WithStore(runCtx, spill.New(32))
+	runCtx = loop.WithInbox(runCtx, inbox)
+	runCtx = s.withAudit(runCtx, req.RunID)
 
 	// Keep the lease alive for long runs; the heartbeat stops with the run.
 	stopHeartbeat := s.startHeartbeat(runCtx, req.RunID)
 	defer stopHeartbeat()
+
+	audit := events.RecorderFromContext(runCtx)
+	if audit != nil {
+		audit.OnRunStart(runCtx, req.AgentName, req.RunID)
+	}
 
 	outcome, err := s.runner.Invoke(runCtx, &loop.Input{
 		RunID:       req.RunID,
@@ -145,6 +185,9 @@ func (s *Service) Invoke(ctx context.Context, req Request) (loop.Outcome, error)
 	}, configFor(req.RunID))
 
 	s.closeRun(ctx, req.RunID, outcome, err)
+	if audit != nil {
+		audit.OnRunEnd(runCtx, req.AgentName, req.RunID, err)
+	}
 	return outcome, err
 }
 
@@ -161,15 +204,80 @@ func (s *Service) Resume(ctx context.Context, req Request) (loop.Outcome, error)
 	defer s.releaseLease(ctx, req.RunID)
 
 	runCtx, cancel := context.WithCancel(ctx)
-	s.registerCancel(req.RunID, cancel)
+	inbox := loop.NewInbox()
+	s.registerRun(req.RunID, cancel, inbox)
 	defer func() {
-		s.unregisterCancel(req.RunID)
+		s.unregisterRun(req.RunID)
 		cancel()
 	}()
+	runCtx = spill.WithStore(runCtx, spill.New(32))
+	runCtx = loop.WithInbox(runCtx, inbox)
+	runCtx = s.withAudit(runCtx, req.RunID)
+
+	audit := events.RecorderFromContext(runCtx)
+	if audit != nil {
+		audit.OnRunStart(runCtx, req.AgentName, req.RunID)
+	}
 
 	outcome, err := s.runner.Resume(runCtx, req.RunID)
 	s.closeRun(ctx, req.RunID, outcome, err)
+	if audit != nil {
+		audit.OnRunEnd(runCtx, req.AgentName, req.RunID, err)
+	}
 	return outcome, err
+}
+
+// withAudit attaches a per-run recorder to the context. The run id doubles as
+// the trace id: one run is one auditable unit, and a child run inherits the
+// parent's recorder through the context it is spawned with.
+func (s *Service) withAudit(ctx context.Context, runID string) context.Context {
+	if s.events == nil {
+		return ctx
+	}
+	recorder := events.NewEventRecorder(s.events,
+		events.WithTraceID(runID),
+		events.WithThreadID(runID),
+		events.WithLayers(s.eventLayers),
+	)
+	return events.ContextWithRecorder(ctx, recorder)
+}
+
+// Recover resumes the runs a dead worker left behind and reports how many were
+// picked up. A run whose checkpoint cannot be resumed is closed as failed:
+// leaving it "running" hides the crash from every operator view and keeps the
+// lease row alive forever.
+//
+// Runs created within the last two lease periods are skipped — they may belong
+// to a worker that is still starting, and stealing them would double-execute a
+// healthy run.
+func (s *Service) Recover(ctx context.Context) (int, error) {
+	if s.store == nil {
+		return 0, fmt.Errorf("run: persistence is not configured")
+	}
+	runs, err := s.store.ListRecoverable(ctx, 50)
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Now().Add(-2 * s.leaseTTL)
+	recovered := 0
+	for _, item := range runs {
+		if item.CreateTime.After(cutoff) {
+			continue
+		}
+		if err := s.store.ReclaimLease(ctx, item.ID); err != nil {
+			continue
+		}
+		if _, err := s.Resume(ctx, Request{
+			RunID:    item.ID,
+			TenantID: item.TenantID,
+			AgentID:  item.AgentID,
+		}); err != nil {
+			_ = s.store.MarkFailed(ctx, item.ID, "recovery failed: "+err.Error())
+			continue
+		}
+		recovered++
+	}
+	return recovered, nil
 }
 
 // Cancel stops a running run. It reports whether the run was owned here.
@@ -206,6 +314,24 @@ func (s *Service) Unsubscribe(runID string, channel chan Event) {
 			return
 		}
 	}
+}
+
+// ResolveApproval settles one pending tool approval. It reports whether the
+// request was still waiting on this worker. When remember is set and the call is
+// allowed, the exact tool-and-arguments pair becomes a standing grant, so the
+// next identical call runs without a human.
+func (s *Service) ResolveApproval(runID, requestID string, allow bool, reason string, remember bool) bool {
+	if s.approvals == nil {
+		return false
+	}
+	pending, hasPending := s.approvals.Pending(runID, requestID)
+	if !s.approvals.Resolve(runID, requestID, allow, reason) {
+		return false
+	}
+	if remember && allow && s.grants != nil && hasPending && pending.TenantID != "" {
+		_ = s.grants.Remember(context.Background(), toolkit.GrantFor(pending.TenantID, pending.Call))
+	}
+	return true
 }
 
 // Steps returns the persisted audit trail of a run.
@@ -256,7 +382,7 @@ func (s *Service) closeRun(ctx context.Context, runID string, outcome loop.Outco
 	}
 
 	if s.store != nil {
-		_ = s.store.FinishRun(ctx, runID, status, outcome.Text, message, outcome.TokensIn, outcome.TokensOut)
+		_ = s.store.FinishRun(ctx, runID, status, outcome.Text, message, outcome.TokensIn, outcome.TokensOut, outcome.CostUSD)
 	}
 
 	event := Event{Type: EventRunFinished, RunID: runID, Outcome: &outcome}
@@ -303,15 +429,26 @@ func (s *Service) startHeartbeat(ctx context.Context, runID string) func() {
 	return func() { close(done) }
 }
 
-func (s *Service) registerCancel(runID string, cancel context.CancelFunc) {
+// Steer injects a message into a running run. The run keeps its state and
+// budget; the message joins the transcript at the next round.
+func (s *Service) Steer(runID, message string) bool {
+	s.mu.Lock()
+	inbox := s.inboxes[runID]
+	s.mu.Unlock()
+	return inbox.Push(message)
+}
+
+func (s *Service) registerRun(runID string, cancel context.CancelFunc, inbox *loop.Inbox) {
 	s.mu.Lock()
 	s.cancels[runID] = cancel
+	s.inboxes[runID] = inbox
 	s.mu.Unlock()
 }
 
-func (s *Service) unregisterCancel(runID string) {
+func (s *Service) unregisterRun(runID string) {
 	s.mu.Lock()
 	delete(s.cancels, runID)
+	delete(s.inboxes, runID)
 	s.mu.Unlock()
 }
 

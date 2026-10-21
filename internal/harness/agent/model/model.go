@@ -1,6 +1,10 @@
-// Package model is the thin model wire used by the harness loop. It is
-// deliberately independent of any agent framework: one request in, one response
-// out, with tool calls carried verbatim.
+// Package model is the thin model wire used by the harness loop: one request
+// in, one response out, with tool calls carried verbatim.
+//
+// It holds no provider implementation. Provider talks to the RAGFlow model
+// provider (internal/entity/models) through ChatCompleter, so tenant
+// resolution, endpoints, API keys and provider quirks stay in one place; Fake
+// is the scripted stand-in used by tests.
 package model
 
 import "context"
@@ -51,6 +55,10 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// CachedPromptTokens is the part of the prompt a provider served from its
+	// prefix cache. Zero means either no cache or a cache miss; the audit log
+	// keeps both cases distinguishable by also recording the prefix hash.
+	CachedPromptTokens int `json:"cached_prompt_tokens,omitempty"`
 }
 
 // Response is one completion result.

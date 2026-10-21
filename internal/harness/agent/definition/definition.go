@@ -1,6 +1,6 @@
 // Package definition holds the prompt-first agent definition and its immutable
 // versions. A definition never carries a dataset scope: data reach is injected
-// per run (see caps.Scope).
+// per run (see toolkit.Scope).
 package definition
 
 import (
@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"ragflow/internal/harness/toolkit"
 )
 
 // ApprovalMode controls whether high-risk tools pause the loop for approval.
@@ -52,6 +54,9 @@ type PolicyConfig struct {
 	MaxWallSec   int          `json:"max_wall_sec,omitempty"`
 	MaxCostUSD   float64      `json:"max_cost_usd,omitempty"`
 	Approval     ApprovalMode `json:"approval,omitempty"`
+	// Permissions are operator-authored tool-call rules. They are part of the
+	// definition so what an agent may run is reviewable with its prompt.
+	Permissions []toolkit.PermissionRule `json:"permissions,omitempty"`
 }
 
 // RSIConfig opts an agent into self-improvement and bounds it.
@@ -106,6 +111,9 @@ func (d *Definition) Validate() error {
 	if d.Policy.MaxRounds < 0 || d.Policy.MaxTokens < 0 || d.Policy.MaxToolCalls < 0 ||
 		d.Policy.MaxWallSec < 0 || d.Policy.MaxCostUSD < 0 {
 		return errors.New("definition: policy limits must not be negative")
+	}
+	if _, err := toolkit.NewRuleSet(d.Policy.Permissions); err != nil {
+		return fmt.Errorf("definition: %w", err)
 	}
 	if d.RSI.MinConfidence < 0 || d.RSI.MinConfidence > 1 {
 		return errors.New("definition: rsi min_confidence must be within [0,1]")

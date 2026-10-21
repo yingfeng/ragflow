@@ -6,11 +6,11 @@ import (
 
 	"ragflow/internal/harness/agent/definition"
 	"ragflow/internal/harness/agent/model"
-	"ragflow/internal/harness/caps"
+	"ragflow/internal/harness/toolkit"
 )
 
 func TestDebugRounds(t *testing.T) {
-	capability := &fakeCap{tool: "rag_search", result: caps.Result{Content: "nothing"}}
+	capability := &fakeCap{tool: "rag_search", result: toolkit.Result{Content: "nothing"}}
 	mdl := model.NewFake(
 		model.CallTool("c1", "rag_search", `{"query":"a"}`),
 		model.CallTool("c2", "rag_search", `{"query":"b"}`),

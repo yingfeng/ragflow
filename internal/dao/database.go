@@ -217,6 +217,8 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 		&entity.HarnessAgentVersion{},
 		&entity.HarnessAgentRun{},
 		&entity.HarnessAgentStep{},
+		&entity.HarnessAgentEvent{},
+		&entity.HarnessAgentPermissionGrant{},
 		&entity.HarnessAgentFeedback{},
 		&entity.HarnessAgentLesson{},
 	}
@@ -366,6 +368,17 @@ func autoMigrateRuntimeModels(ctx context.Context, db *gorm.DB) error {
 		&entity.ConversationReference{},
 		&entity.API4ConversationMessage{},
 		&entity.API4ConversationReference{},
+		// The agent harness is served by the API process, which starts with
+		// migrateDB=false; leaving these tables to the migrate action would make
+		// the first run fail with "table doesn't exist".
+		&entity.HarnessAgent{},
+		&entity.HarnessAgentVersion{},
+		&entity.HarnessAgentRun{},
+		&entity.HarnessAgentStep{},
+		&entity.HarnessAgentEvent{},
+		&entity.HarnessAgentPermissionGrant{},
+		&entity.HarnessAgentFeedback{},
+		&entity.HarnessAgentLesson{},
 	}
 	for _, m := range goRuntimeModels {
 		if err := autoMigrateSafely(ctx, db, m); err != nil {

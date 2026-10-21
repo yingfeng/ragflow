@@ -65,6 +65,9 @@ const (
 	EventError EventType = "error"
 	EventRetry EventType = "retry"
 
+	// Verdict is one termination decision taken by the policy engine.
+	EventVerdict EventType = "verdict"
+
 	// Fork — branch from an existing event.
 	EventFork EventType = "fork"
 
@@ -83,6 +86,8 @@ type Event struct {
 	ID EventID `json:"id"`
 	// Type describes what happened.
 	Type EventType `json:"type"`
+	// Layer is the data class of this event (see LayerOf).
+	Layer Layer `json:"layer,omitempty"`
 	// Timestamp is the wall-clock time when this event was recorded.
 	Timestamp time.Time `json:"timestamp"`
 	// Clock is the monotonic logical clock value (global total order).
@@ -167,6 +172,11 @@ type LLMCallPayload struct {
 	Chunks     int        `json:"chunks,omitempty"`
 	DurationMs int64      `json:"duration_ms,omitempty"`
 	Cost       float64    `json:"cost,omitempty"`
+	// PrefixHash identifies the stable prompt prefix. A changed hash between two
+	// rounds means the provider's prefix cache had to be rebuilt.
+	PrefixHash string `json:"prefix_hash,omitempty"`
+	// CachedPromptTokens is what the provider served from that cache.
+	CachedPromptTokens int `json:"cached_prompt_tokens,omitempty"`
 }
 
 // TokenUsage tracks token consumption for an LLM call.
@@ -210,6 +220,14 @@ type SubAgentCallPayload struct {
 	Depth        int    `json:"depth,omitempty"`
 	DurationMs   int64  `json:"duration_ms,omitempty"`
 	Error        string `json:"error,omitempty"`
+}
+
+// VerdictPayload is the payload for policy verdict events.
+type VerdictPayload struct {
+	Action   string `json:"action"`
+	Reason   string `json:"reason,omitempty"`
+	Round    int    `json:"round"`
+	Evidence int    `json:"evidence,omitempty"`
 }
 
 // SessionValuePayload is the payload for session value events.

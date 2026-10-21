@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"sync"
@@ -20,12 +21,15 @@ import (
 
 	"ragflow/internal/harness/agent/definition"
 	"ragflow/internal/harness/agent/model"
-	"ragflow/internal/harness/caps"
 	agentctx "ragflow/internal/harness/context"
+	"ragflow/internal/harness/events"
 	"ragflow/internal/harness/graph/channels"
 	"ragflow/internal/harness/graph/checkpoint"
 	"ragflow/internal/harness/graph/constants"
 	"ragflow/internal/harness/graph/graph"
+	"ragflow/internal/harness/toolkit"
+	"ragflow/internal/harness/toolkit/spill"
+	"ragflow/internal/harness/toolkit/toolsearch"
 	// Blank import installs the Pregel engine into the graph package.
 	_ "ragflow/internal/harness/graph/pregel"
 	"ragflow/internal/harness/graph/types"
@@ -49,22 +53,38 @@ type StepRecord struct {
 // Deps are the runtime dependencies captured by node closures. They are never
 // stored in State so the state stays serializable.
 type Deps struct {
-	Model        model.Model
-	Registry     *caps.Registry
-	Policy       *policy.Engine
-	Builder      *agentctx.Builder
+	Model    model.Model
+	Registry *toolkit.Registry
+	Policy   *policy.Engine
+	Builder  *agentctx.Builder
+	// ModelName and Provider label model-call audit events. They are labels
+	// only: the model handle decides where the call goes.
+	ModelName    string
+	Provider     string
 	SystemPrompt string
+	// Breaker protects other runs from a provider that is down. Nil disables the
+	// check, which is what a single-run test wants.
+	Breaker *model.Breaker
 	// Lessons returns experience entries injected into the system prompt (RSI P0).
 	Lessons func(ctx context.Context) []string
 	// Sink receives trace records; nil disables tracing.
 	Sink func(StepRecord)
 	// Concurrency bounds parallel tool execution.
 	Concurrency int
+	// MaxOutputTokens caps one completion. Zero leaves the provider default,
+	// which is how a turn silently overruns the context window.
+	MaxOutputTokens int
 	// Scope is the fallback scope when the context carries none.
-	Scope caps.Scope
+	Scope toolkit.Scope
 	// PromptCostPerToken / CompletionCostPerToken enable cost accounting.
 	PromptCostPerToken     float64
 	CompletionCostPerToken float64
+	// Approver gates tool calls before execution. Nil runs everything the
+	// registry offers; a non-nil gate is where approvals attach.
+	Approver toolkit.Approver
+	// ToolSchemaBudget caps the schemas sent with each request. Zero uses
+	// toolkit.SchemaBudgetTokens.
+	ToolSchemaBudget int
 }
 
 // Config builds a runner.
@@ -92,7 +112,7 @@ type Input struct {
 	RunID       string
 	AgentName   string
 	UserMessage string
-	Scope       caps.Scope
+	Scope       toolkit.Scope
 }
 
 const defaultMaxRounds = 40
@@ -104,7 +124,7 @@ func Build(cfg Config) (*Runner, error) {
 		return nil, fmt.Errorf("loop: model is required")
 	}
 	if deps.Registry == nil {
-		deps.Registry = caps.NewRegistry()
+		deps.Registry = toolkit.NewRegistry()
 	}
 	if deps.Builder == nil {
 		deps.Builder = agentctx.New(agentctx.DefaultConfig())
@@ -117,6 +137,7 @@ func Build(cfg Config) (*Runner, error) {
 		engine = policy.New(policy.Budget{}, policy.Progress{}, policy.Completion{RequireCitations: cfg.RequireCitations}, policy.Safety{})
 	}
 	deps.Policy = engine
+	registerRuntimeCapabilities(deps.Registry)
 
 	maxRounds := cfg.MaxRounds
 	if maxRounds <= 0 {
@@ -148,16 +169,26 @@ func Build(cfg Config) (*Runner, error) {
 		}
 		state.Entry.Round++
 		state.Budget.ElapsedMS = start.UnixMilli() - state.StartedMS
+		state.RetryPrepare = false
 		state.Pending = nil
 		state.NewEvidence = 0
 		state.ThinkTerminal = false
 		state.EvidenceBefore = len(state.Evidence)
 
+		// Messages injected while the run was executing join the transcript
+		// before the prompt is assembled, so the model sees them this round.
+		if inbox := InboxFrom(ctx); inbox != nil {
+			for _, message := range inbox.Drain() {
+				state.History = append(state.History, model.Message{Role: model.RoleUser, Content: message})
+				state.Steers++
+			}
+		}
+
 		var lessons []string
 		if deps.Lessons != nil {
 			lessons = deps.Lessons(ctx)
 		}
-		state.Prompt = deps.Builder.Build(deps.SystemPrompt, lessons, state.History)
+		state.Prompt = deps.Builder.BuildWithTier(deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost))
 		record(deps, StepRecord{
 			RunID:      state.RunID,
 			Phase:      "prepare",
@@ -174,13 +205,43 @@ func Build(cfg Config) (*Runner, error) {
 			return nil, err
 		}
 		start := time.Now()
-		response, err := deps.Model.Complete(ctx, model.Request{
-			Messages: state.Prompt,
-			Tools:    deps.Registry.ToolSpecs(),
-		})
+		tools := toolkit.RestrictSpecs(deps.Registry.ToolSpecsWithinBudget(deps.ToolSchemaBudget), toolkit.AllowlistFrom(ctx))
+		// The stable prefix is what a provider caches. Counting rebuilds tells an
+		// operator whether the expensive part of the prompt is actually reused.
+		prefix := prefixFingerprint(deps.SystemPrompt, tools)
+		if state.PrefixHash != "" && state.PrefixHash != prefix {
+			state.PrefixRebuilds++
+		}
+		state.PrefixHash = prefix
+		response, err := callModel(ctx, deps.Model, model.Request{
+			Messages:  state.Prompt,
+			Tools:     tools,
+			MaxTokens: deps.MaxOutputTokens,
+		}, deps.Breaker)
 		if err != nil {
+			// A prompt-too-long rejection means the estimate was wrong. Shrink
+			// the prompt and try again instead of failing the run; after
+			// ptlAttempts recoveries the run genuinely cannot fit.
+			if isPromptTooLongError(err) && state.PtLErrors < ptlAttempts {
+				state.PtLErrors++
+				state.CompactionBoost++
+				state.RetryPrepare = true
+				record(deps, StepRecord{
+					RunID:      state.RunID,
+					Phase:      "prepare",
+					Round:      state.Entry.Round,
+					Decision:   "recompact",
+					Reason:     "prompt too long",
+					DurationMS: time.Since(start).Milliseconds(),
+				})
+				return state, nil
+			}
+			if recorder := events.RecorderFromContext(ctx); recorder != nil {
+				recorder.RecordError(ctx, err.Error())
+			}
 			return nil, fmt.Errorf("loop: model call failed: %w", err)
 		}
+		recordModelCall(ctx, deps, response, prefix, time.Since(start))
 
 		state.Budget.TokensIn += response.Usage.PromptTokens
 		state.Budget.TokensOut += response.Usage.CompletionTokens
@@ -236,43 +297,142 @@ func Build(cfg Config) (*Runner, error) {
 		if len(state.Pending) == 0 {
 			return state, nil
 		}
-		if !caps.HasScope(ctx) {
-			ctx = caps.WithScope(ctx, deps.Scope)
+		if !toolkit.HasScope(ctx) {
+			ctx = toolkit.WithScope(ctx, deps.Scope)
+		}
+		// Bind the run id: approval requests and child runs are addressed by it.
+		ctx = toolkit.WithRunID(ctx, state.RunID)
+		// Publish the remaining budget so a spawned child cannot outlive this
+		// run and leave it without turns to converge.
+		if remaining := maxRounds - state.Entry.Round; remaining > 0 {
+			ctx = toolkit.WithRemainingRounds(ctx, remaining)
 		}
 		start := time.Now()
 
 		calls := state.Pending
-		results := make([]caps.Result, len(calls))
+		results := make([]toolkit.Result, len(calls))
 		failures := make([]error, len(calls))
-		semaphore := make(chan struct{}, deps.Concurrency)
-		var wait sync.WaitGroup
-		for index, call := range calls {
-			wait.Add(1)
-			go func(index int, call PendingCall) {
-				defer wait.Done()
-				semaphore <- struct{}{}
-				defer func() { <-semaphore }()
-				result, err := deps.Registry.Invoke(ctx, caps.Call{
-					ID:        call.ID,
-					Tool:      call.Tool,
-					Arguments: call.Arguments,
-				})
-				results[index] = result
-				failures[index] = err
-			}(index, call)
+
+		// A graded breaker on repetition. The first repeats are allowed — a model
+		// retrying after a transient failure is doing the right thing — but past
+		// maxRepeatedToolCalls the same call is refused with an explanation, so a
+		// loop costs a sentence instead of the rest of the budget. Counting runs
+		// before the parallel batch so the map needs no lock.
+		if state.CallRepeats == nil {
+			state.CallRepeats = make(map[string]int)
 		}
-		wait.Wait()
+		blocked := make([]bool, len(calls))
+		for index, call := range calls {
+			key := call.IdempotencyKey
+			if key == "" {
+				key = idempotencyKey(call.Tool, call.Arguments)
+			}
+			state.CallRepeats[key]++
+			if state.CallRepeats[key] > maxRepeatedToolCalls {
+				blocked[index] = true
+				state.BlockedCalls++
+			}
+		}
+		if state.BlockedCalls > 0 {
+			if recorder := events.RecorderFromContext(ctx); recorder != nil {
+				recorder.RecordRetry(ctx, fmt.Sprintf("%d repeated tool call(s) blocked", state.BlockedCalls))
+			}
+		}
+
+		invoke := func(index int) {
+			call := calls[index]
+			if blocked[index] {
+				results[index] = toolkit.ErrorResult(fmt.Errorf(
+					"identical call to %q has already run %d times; change the arguments or answer with what you have",
+					call.Tool, maxRepeatedToolCalls))
+				return
+			}
+			approvalCall := toolkit.Call{ID: call.ID, Tool: call.Tool, Arguments: call.Arguments}
+			recorder := events.RecorderFromContext(ctx)
+			if deps.Approver != nil {
+				risk := deps.Registry.RiskOf(call.Tool)
+				approvalStart := time.Now()
+				decision := deps.Approver.Approve(ctx, approvalCall, risk)
+				if recorder != nil {
+					// The audit trail needs the verdict even when the call is
+					// allowed: "who let this run" is the question asked later.
+					verdict := "granted"
+					if !decision.Allow {
+						verdict = "denied"
+					}
+					recorder.RecordApproval(ctx, call.ID, call.Tool, map[string]any{
+						"risk":   risk.String(),
+						"reason": decision.Reason,
+					}, verdict, time.Since(approvalStart).Milliseconds())
+				}
+				if !decision.Allow {
+					// A rejection is a tool-level failure: the model sees why and
+					// can choose another path instead of the run dying here.
+					reason := decision.Reason
+					if reason == "" {
+						reason = "rejected"
+					}
+					failures[index] = fmt.Errorf("tool %q was not approved: %s", call.Tool, reason)
+					return
+				}
+			}
+			toolStart := time.Now()
+			result, err := deps.Registry.Invoke(ctx, approvalCall)
+			results[index] = result
+			failures[index] = err
+			if recorder != nil {
+				recorder.RecordToolCall(ctx, call.Tool, decodeArguments(call.Arguments),
+					clip(result.Content, auditResultLimit), time.Since(toolStart).Milliseconds(), 0, errorText(err))
+			}
+		}
+
+		// Read-only calls may overlap; anything that changes state runs alone,
+		// after the concurrent buffer ahead of it has drained. Batch order stays
+		// the model's order, so a write still follows the reads it asked for.
+		for index := 0; index < len(calls); {
+			if !deps.Registry.Parallelizable(calls[index].Tool) {
+				invoke(index)
+				index++
+				continue
+			}
+			batchStart := index
+			for index < len(calls) && deps.Registry.Parallelizable(calls[index].Tool) {
+				index++
+			}
+			semaphore := make(chan struct{}, deps.Concurrency)
+			var wait sync.WaitGroup
+			for position := batchStart; position < index; position++ {
+				wait.Add(1)
+				go func(position int) {
+					defer wait.Done()
+					select {
+					case semaphore <- struct{}{}:
+						defer func() { <-semaphore }()
+					case <-ctx.Done():
+						failures[position] = ctx.Err()
+						return
+					}
+					invoke(position)
+				}(position)
+			}
+			wait.Wait()
+		}
+
+		inlineBudget := aggregateInlineBudget(results, spill.DefaultInlineBytes)
 
 		for index, call := range calls {
 			result := results[index]
 			if failures[index] != nil {
-				result = caps.ErrorResult(failures[index])
+				result = toolkit.ErrorResult(failures[index])
 			}
 			state.Budget.ToolCalls++
 			content := result.Content
 			if strings.TrimSpace(content) == "" {
 				content = "(no output)"
 			}
+			// Oversized output leaves the context window here; the model gets a
+			// preview and a handle instead of paying for the whole payload.
+			content = spill.MaybeSpill(ctx, call.Tool, content, inlineBudget)
 			state.History = append(state.History, model.Message{
 				Role:       model.RoleTool,
 				ToolCallID: call.ID,
@@ -314,7 +474,7 @@ func Build(cfg Config) (*Runner, error) {
 			return nil, err
 		}
 		seen := make(map[string]struct{}, len(state.Evidence))
-		unique := make([]caps.Evidence, 0, len(state.Evidence))
+		unique := make([]toolkit.Evidence, 0, len(state.Evidence))
 		for _, item := range state.Evidence {
 			key := item.Source + "|" + item.Ref
 			if _, ok := seen[key]; ok {
@@ -344,6 +504,9 @@ func Build(cfg Config) (*Runner, error) {
 			return nil, err
 		}
 		state.Verdict = deps.Policy.Decide(snapshotOf(state))
+		if recorder := events.RecorderFromContext(ctx); recorder != nil {
+			recorder.RecordVerdict(ctx, string(state.Verdict.Action), state.Verdict.Reason, state.Entry.Round, len(state.Evidence))
+		}
 		record(deps, StepRecord{
 			RunID:    state.RunID,
 			Phase:    "verify",
@@ -398,11 +561,14 @@ func Build(cfg Config) (*Runner, error) {
 		if err != nil {
 			return nil, err
 		}
+		if state.RetryPrepare {
+			return "prepare", nil
+		}
 		if len(state.Pending) > 0 {
 			return "act", nil
 		}
 		return "verify", nil
-	}, map[string]string{"act": "act", "verify": "verify"}); err != nil {
+	}, map[string]string{"prepare": "prepare", "act": "act", "verify": "verify"}); err != nil {
 		return nil, fmt.Errorf("loop: think branch: %w", err)
 	}
 	if err := sg.AddEdge("act", "observe"); err != nil {
@@ -453,8 +619,12 @@ func (r *Runner) Invoke(ctx context.Context, input *Input, config *types.Runnabl
 	if input != nil {
 		state = newState(*input, r.policyConfig, r.maxRounds)
 		runID = input.RunID
-		ctx = caps.WithScope(ctx, input.Scope)
+		ctx = toolkit.WithScope(ctx, input.Scope)
 	}
+	// One allowlist per run: a skill that narrows the tools during round three
+	// must still narrow them in round four, and the holder is shared through the
+	// context every node receives.
+	ctx = toolkit.WithAllowlist(ctx)
 	if config == nil {
 		config = types.NewRunnableConfig()
 	}
@@ -485,6 +655,21 @@ func (r *Runner) Resume(ctx context.Context, runID string) (Outcome, error) {
 	return r.Invoke(ctx, nil, config)
 }
 
+// registerRuntimeCapabilities installs the capabilities the loop itself depends
+// on. A host-provided tool_search wins, so a deployment can replace the search
+// strategy without forking the loop.
+func registerRuntimeCapabilities(registry *toolkit.Registry) {
+	if registry == nil {
+		return
+	}
+	if !registry.Has(toolsearch.ToolName) {
+		_ = registry.Register(toolsearch.New(registry))
+	}
+	if !registry.Has("read_spill") {
+		_ = registry.Register(spill.NewCapability())
+	}
+}
+
 func newState(input Input, policyConfig definition.PolicyConfig, maxRounds int) *State {
 	state := &State{
 		RunID:     input.RunID,
@@ -494,7 +679,8 @@ func newState(input Input, policyConfig definition.PolicyConfig, maxRounds int) 
 			Role:    model.RoleUser,
 			Content: input.UserMessage,
 		}},
-		SeenCalls: make(map[string]struct{}),
+		SeenCalls:   make(map[string]struct{}),
+		CallRepeats: make(map[string]int),
 		Budget: Budget{
 			MaxRounds:    maxRounds,
 			MaxTokens:    policyConfig.MaxTokens,
@@ -533,19 +719,22 @@ func snapshotOf(state *State) policy.Snapshot {
 
 func outcomeOf(state *State) Outcome {
 	return Outcome{
-		RunID:       state.RunID,
-		Text:        state.FinalText,
-		Rounds:      state.Entry.Round,
-		TokensIn:    state.Budget.TokensIn,
-		TokensOut:   state.Budget.TokensOut,
-		ToolCalls:   state.Budget.ToolCalls,
-		Evidence:    state.Evidence,
-		Errors:      state.Errors,
-		Citations:   state.Citations,
-		Verdict:     state.Verdict,
-		Stopped:     state.Stopped,
-		Interrupted: state.Verdict.Action == policy.ActionPause,
-		FinalState:  state,
+		RunID:          state.RunID,
+		Text:           state.FinalText,
+		Rounds:         state.Entry.Round,
+		TokensIn:       state.Budget.TokensIn,
+		TokensOut:      state.Budget.TokensOut,
+		CostUSD:        state.Budget.CostUSD,
+		ToolCalls:      state.Budget.ToolCalls,
+		Evidence:       state.Evidence,
+		Errors:         state.Errors,
+		Citations:      state.Citations,
+		PrefixRebuilds: state.PrefixRebuilds,
+		BlockedCalls:   state.BlockedCalls,
+		Verdict:        state.Verdict,
+		Stopped:        state.Stopped,
+		Interrupted:    state.Verdict.Action == policy.ActionPause,
+		FinalState:     state,
 	}
 }
 
@@ -585,6 +774,19 @@ func asState(raw interface{}) (*State, error) {
 	}
 }
 
+// compactionTierFor maps the prompt-too-long recovery count onto a forced
+// compaction tier: one retry compacts history, a second keeps only the tail.
+func compactionTierFor(boost int) agentctx.Tier {
+	switch boostTier(boost) {
+	case 0:
+		return agentctx.TierNormal
+	case 1:
+		return agentctx.TierCompactHistory
+	default:
+		return agentctx.TierAggressivePrune
+	}
+}
+
 func idempotencyKey(tool, arguments string) string {
 	sum := sha256.Sum256([]byte(tool + "\x00" + arguments))
 	return hex.EncodeToString(sum[:8])
@@ -601,6 +803,37 @@ func toolNames(calls []model.ToolCall) string {
 	return strings.Join(names, ",")
 }
 
+// Aggregate tool-output budget for one batch, borrowed from Astra's
+// AGGREGATE_OUTPUT_BUDGET: a batch that returns many large results costs the
+// same context as one huge result, so the per-result inline allowance shrinks as
+// the batch total grows. Below the soft limit nothing changes.
+const (
+	aggregateSoftLimitBytes = 64 << 10
+	aggregateFloorBytes     = 1 << 10
+)
+
+func aggregateInlineBudget(results []toolkit.Result, perCall int) int {
+	if perCall <= 0 {
+		perCall = spill.DefaultInlineBytes
+	}
+	total := 0
+	for _, result := range results {
+		total += len(result.Content)
+	}
+	if total <= aggregateSoftLimitBytes {
+		return perCall
+	}
+	over := float64(total-aggregateSoftLimitBytes) / float64(aggregateSoftLimitBytes)
+	if over > 1 {
+		over = 1
+	}
+	scaled := int(float64(perCall) * (1 - 0.75*over))
+	if scaled < aggregateFloorBytes {
+		return aggregateFloorBytes
+	}
+	return scaled
+}
+
 func clip(value string, limit int) string {
 	runes := []rune(value)
 	if len(runes) <= limit {
@@ -613,6 +846,72 @@ func record(deps Deps, item StepRecord) {
 	if deps.Sink != nil {
 		deps.Sink(item)
 	}
+}
+
+// auditResultLimit bounds the tool output copied into the audit log. The full
+// result is already in the transcript, and the audit trail must stay a fact log
+// rather than a second copy of every payload.
+const auditResultLimit = 4 << 10
+
+// recordModelCall writes one model round to the event log. The prompt is left
+// out on purpose: it is reconstructible from the transcript, and copying it here
+// would double the size of the log for every round.
+func recordModelCall(ctx context.Context, deps Deps, response model.Response, prefix string, elapsed time.Duration) {
+	recorder := events.RecorderFromContext(ctx)
+	if recorder == nil {
+		return
+	}
+	cost := float64(response.Usage.PromptTokens)*deps.PromptCostPerToken +
+		float64(response.Usage.CompletionTokens)*deps.CompletionCostPerToken
+	recorder.RecordModelCall(ctx, events.ModelCall{
+		Model:      deps.ModelName,
+		Provider:   deps.Provider,
+		Content:    response.Message.Content,
+		PrefixHash: prefix,
+		Tokens: events.TokenUsage{
+			PromptTokens:     response.Usage.PromptTokens,
+			CompletionTokens: response.Usage.CompletionTokens,
+			TotalTokens:      response.Usage.PromptTokens + response.Usage.CompletionTokens,
+		},
+		DurationMs:         elapsed.Milliseconds(),
+		Cost:               cost,
+		CachedPromptTokens: response.Usage.CachedPromptTokens,
+	})
+}
+
+// prefixFingerprint identifies the part of the prompt a provider can cache: the
+// system prompt and the tool schemas. Conversation content is deliberately left
+// out — it changes every round, and including it would make every round look like
+// a cache rebuild.
+func prefixFingerprint(systemPrompt string, tools []model.ToolSpec) string {
+	digest := sha256.New()
+	io.WriteString(digest, systemPrompt)
+	for _, spec := range tools {
+		io.WriteString(digest, "\x00")
+		io.WriteString(digest, spec.Name)
+	}
+	return hex.EncodeToString(digest.Sum(nil))[:16]
+}
+
+// decodeArguments turns the model's raw JSON arguments into the map the audit
+// payload expects. Malformed JSON is preserved as a single raw field so the
+// record still shows what the model actually sent.
+func decodeArguments(raw string) map[string]any {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	decoded := make(map[string]any)
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return map[string]any{"_raw": raw}
+	}
+	return decoded
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func ternary(condition bool, whenTrue, whenFalse string) string {

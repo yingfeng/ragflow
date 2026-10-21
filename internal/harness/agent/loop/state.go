@@ -2,8 +2,8 @@ package loop
 
 import (
 	"ragflow/internal/harness/agent/model"
-	"ragflow/internal/harness/caps"
 	"ragflow/internal/harness/policy"
+	"ragflow/internal/harness/toolkit"
 )
 
 // PendingCall is a tool call the model requested and act has not executed yet.
@@ -53,9 +53,9 @@ type State struct {
 	History []model.Message `json:"history"`
 	Prompt  []model.Message `json:"prompt"`
 
-	Pending  []PendingCall   `json:"pending"`
-	Evidence []caps.Evidence `json:"evidence"`
-	Errors   []StepError     `json:"errors"`
+	Pending  []PendingCall      `json:"pending"`
+	Evidence []toolkit.Evidence `json:"evidence"`
+	Errors   []StepError        `json:"errors"`
 
 	FinalText string `json:"final_text"`
 
@@ -72,6 +72,16 @@ type State struct {
 	UnresolvedCalls int `json:"unresolved_calls"`
 
 	SeenCalls map[string]struct{} `json:"seen_calls"`
+	// CallRepeats counts each identical call so act can refuse the ones that are
+	// clearly a loop rather than progress.
+	CallRepeats  map[string]int `json:"call_repeats"`
+	BlockedCalls int            `json:"blocked_calls"`
+
+	// PrefixHash identifies the stable prompt prefix of the last round. A change
+	// means the provider's prefix cache was rebuilt, which is a cost event worth
+	// counting rather than guessing at.
+	PrefixHash     string `json:"prefix_hash,omitempty"`
+	PrefixRebuilds int    `json:"prefix_rebuilds"`
 
 	Done    bool   `json:"done"`
 	Stopped string `json:"stopped,omitempty"`
@@ -79,21 +89,40 @@ type State struct {
 	// ThinkTerminal records that think ended the turn without tool calls, which
 	// distinguishes an empty completion from a mid-flight round.
 	ThinkTerminal bool `json:"think_terminal"`
+
+	// Steers counts messages injected into the run while it was executing.
+	Steers int `json:"steers"`
+
+	// CompactionBoost is how many prompt-too-long recoveries this run has
+	// already spent; prepare uses it to force a harder compaction tier.
+	CompactionBoost int `json:"compaction_boost"`
+	// PtLErrors counts prompt-too-long rejections, bounded by ptlAttempts.
+	PtLErrors int `json:"ptl_errors"`
+	// RetryPrepare asks the graph to rebuild the prompt before calling the model
+	// again. It is set by think after a prompt-too-long rejection.
+	RetryPrepare bool `json:"retry_prepare"`
 }
 
 // Outcome is what a finished run reports.
 type Outcome struct {
-	RunID       string
-	Text        string
-	Rounds      int
-	TokensIn    int
-	TokensOut   int
+	RunID     string
+	Text      string
+	Rounds    int
+	TokensIn  int
+	TokensOut int
+	// CostUSD is the priced total of this run, zero when the deployment does
+	// not configure per-token prices.
+	CostUSD     float64
 	ToolCalls   int
-	Evidence    []caps.Evidence
+	Evidence    []toolkit.Evidence
 	Errors      []StepError
 	Citations   int
 	Verdict     policy.Verdict
 	Stopped     string
 	Interrupted bool
-	FinalState  *State
+	// PrefixRebuilds counts how often the stable prompt prefix changed, and
+	// BlockedCalls how many repeated calls the breaker refused.
+	PrefixRebuilds int
+	BlockedCalls   int
+	FinalState     *State
 }

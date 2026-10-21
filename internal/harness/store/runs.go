@@ -29,6 +29,35 @@ func (s *RunStore) CreateRun(ctx context.Context, run *entity.HarnessAgentRun) e
 	return nil
 }
 
+// GetRun returns one run row, or nil when it does not exist.
+func (s *RunStore) GetRun(ctx context.Context, runID string) (*entity.HarnessAgentRun, error) {
+	var record entity.HarnessAgentRun
+	if err := s.db.WithContext(ctx).Where("id = ?", runID).Take(&record).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("store: get run %s: %w", runID, err)
+	}
+	return &record, nil
+}
+
+// ListChildren returns the child runs one parent spawned, oldest first, so a
+// delegating run can inspect what it started.
+func (s *RunStore) ListChildren(ctx context.Context, parentRunID string) ([]entity.HarnessAgentRun, error) {
+	if parentRunID == "" {
+		return nil, nil
+	}
+	var records []entity.HarnessAgentRun
+	if err := s.db.WithContext(ctx).
+		Where("parent_run_id = ?", parentRunID).
+		Order("create_time").
+		Limit(200).
+		Find(&records).Error; err != nil {
+		return nil, fmt.Errorf("store: list children of %s: %w", parentRunID, err)
+	}
+	return records, nil
+}
+
 // AcquireLease takes the run's lease when it is free, expired or already held by
 // the same owner.
 func (s *RunStore) AcquireLease(ctx context.Context, runID, owner string, until time.Time) (bool, error) {
@@ -69,7 +98,7 @@ func (s *RunStore) StartRun(ctx context.Context, runID string) error {
 }
 
 // FinishRun closes a run with its terminal status and accounting.
-func (s *RunStore) FinishRun(ctx context.Context, runID, status, output, errMessage string, tokensIn, tokensOut int) error {
+func (s *RunStore) FinishRun(ctx context.Context, runID, status, output, errMessage string, tokensIn, tokensOut int, cost float64) error {
 	now := time.Now()
 	updates := map[string]any{
 		"status":      status,
@@ -78,6 +107,7 @@ func (s *RunStore) FinishRun(ctx context.Context, runID, status, output, errMess
 		"ended_at":    &now,
 		"tokens_in":   tokensIn,
 		"tokens_out":  tokensOut,
+		"cost":        cost,
 		"lease_owner": "",
 		"lease_until": nil,
 	}
@@ -193,6 +223,58 @@ func (s *RunStore) ListLessons(ctx context.Context, tenantID, agentID string, li
 		return nil, fmt.Errorf("store: list lessons: %w", err)
 	}
 	return out, nil
+}
+
+// ListRecoverable returns runs a dead worker left behind: still pending or
+// running, and holding no live lease. Recovery resumes them from their last
+// checkpoint instead of letting them sit in "running" forever.
+func (s *RunStore) ListRecoverable(ctx context.Context, limit int) ([]entity.HarnessAgentRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	runs := make([]entity.HarnessAgentRun, 0, limit)
+	err := s.db.WithContext(ctx).
+		Where("status IN ?", []string{"pending", "running"}).
+		Where("lease_until IS NULL OR lease_until < ?", time.Now()).
+		Order("create_time ASC").
+		Limit(limit).
+		Find(&runs).Error
+	if err != nil {
+		return nil, fmt.Errorf("store: list recoverable runs: %w", err)
+	}
+	return runs, nil
+}
+
+// ReclaimLease clears a stale lease so the recovering worker can claim the run.
+func (s *RunStore) ReclaimLease(ctx context.Context, runID string) error {
+	result := s.db.WithContext(ctx).
+		Model(&entity.HarnessAgentRun{}).
+		Where("id = ?", runID).
+		Updates(map[string]any{"lease_owner": "", "lease_until": nil})
+	if result.Error != nil {
+		return fmt.Errorf("store: reclaim lease %s: %w", runID, result.Error)
+	}
+	return nil
+}
+
+// MarkFailed closes a run that cannot be resumed (no checkpoint, corrupted
+// state). Leaving it "running" hides the failure from every operator view.
+func (s *RunStore) MarkFailed(ctx context.Context, runID, message string) error {
+	now := time.Now()
+	result := s.db.WithContext(ctx).
+		Model(&entity.HarnessAgentRun{}).
+		Where("id = ?", runID).
+		Updates(map[string]any{
+			"status":      "failed",
+			"error":       message,
+			"ended_at":    &now,
+			"lease_owner": "",
+			"lease_until": nil,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("store: mark run %s failed: %w", runID, result.Error)
+	}
+	return nil
 }
 
 // PromoteLesson flips a proposed lesson to active after the RSI gate passed.

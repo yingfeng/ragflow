@@ -38,6 +38,8 @@ type EventFilter struct {
 	ThreadID string
 	// Types restricts to specific event types. Empty means all types.
 	Types []EventType
+	// Layers restricts to specific data classes. Empty means all layers.
+	Layers []Layer
 	// Node restricts to a specific graph node.
 	Node string
 	// FromClock is the minimum logical clock (inclusive).
@@ -62,6 +64,15 @@ func (f EventFilter) Matches(e *Event) bool {
 	}
 	if len(f.Types) > 0 {
 		if !slices.Contains(f.Types, e.Type) {
+			return false
+		}
+	}
+	if len(f.Layers) > 0 {
+		layer := e.Layer
+		if layer == "" {
+			layer = LayerOf(e.Type)
+		}
+		if !slices.Contains(f.Layers, layer) {
 			return false
 		}
 	}

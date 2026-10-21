@@ -411,8 +411,8 @@ func TestEventRecorder_ModelAndToolCalls(t *testing.T) {
 	store := NewMemoryEventStore()
 	r := NewEventRecorder(store, WithTraceID("mt-trace"))
 
-	r.RecordModelCall(ctx, "gpt-4", "openai", []any{"hello"}, "world", TokenUsage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30}, 500, 0.002)
-	r.RecordModelCall(ctx, "gpt-4", "openai", []any{"hello2"}, "world2", TokenUsage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30}, 500, 0.002)
+	r.RecordModelCall(ctx, ModelCall{Model: "gpt-4", Provider: "openai", Messages: []any{"hello"}, Content: "world", Tokens: TokenUsage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30}, DurationMs: 500, Cost: 0.002})
+	r.RecordModelCall(ctx, ModelCall{Model: "gpt-4", Provider: "openai", Messages: []any{"hello2"}, Content: "world2", Tokens: TokenUsage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30}, DurationMs: 500, Cost: 0.002})
 	r.RecordLLMChunk(ctx, "gpt-4", "wor")
 	r.RecordLLMChunk(ctx, "gpt-4", "ld")
 	r.RecordToolCall(ctx, "get_weather", map[string]any{"city": "NYC"}, "sunny", 200, 0, "")
@@ -457,7 +457,7 @@ func TestEventRecorder_FineGrained(t *testing.T) {
 		}
 		count++
 	}
-	expected := 6 + 4 // original 6 + sub-start/sub-end + session-value + session-transfer
+	expected := 7 + 4 // 6 single events + approval request/decision pair + sub-start/sub-end + session-value + session-transfer
 	if count != expected {
 		t.Fatalf("expected %d events, got %d", expected, count)
 	}

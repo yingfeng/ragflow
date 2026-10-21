@@ -339,6 +339,9 @@ func startServer(ctx context.Context, serverName string, arguments *bootstrap.Se
 		compilationTemplateGroupHandler,
 		datasetArtifactHandler)
 
+	// Agent harness: optional, and disabled unless a model is configured.
+	registerHarness(r)
+
 	// Create Gin engine
 	ginEngine := gin.New()
 	// Mirror Quart's merge_slashes: collapse duplicate slashes before routing.

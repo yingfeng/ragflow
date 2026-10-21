@@ -11,7 +11,7 @@ import (
 	"context"
 	"sync/atomic"
 
-	"ragflow/internal/harness/caps"
+	"ragflow/internal/harness/toolkit"
 )
 
 // StoreExtension replaces the run/step persistence backend.
@@ -22,7 +22,7 @@ type StoreExtension interface {
 
 // AuthExtension resolves the principal behind a run.
 type AuthExtension interface {
-	Principal(ctx context.Context, tenantID, userID string) (caps.Scope, error)
+	Principal(ctx context.Context, tenantID, userID string) (toolkit.Scope, error)
 }
 
 // PIIExtension redacts sensitive spans before text leaves the process.
