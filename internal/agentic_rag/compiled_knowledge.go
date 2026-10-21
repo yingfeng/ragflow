@@ -58,12 +58,12 @@ func compiledKnowledgeTools(tenantID string, datasetIDs []string) []tool.BaseToo
 	return out
 }
 
-// datasetsHaveCompiledKnowledge reports whether any bound dataset carries a
+// DatasetsHaveCompiledKnowledge reports whether any bound dataset carries a
 // knowledge-compilation product. Compiled products are exactly the rows that
 // carry compile_kwd; ordinary chunks do not (that is what the default retriever
 // excludes with must_not/exists compile_kwd), so a single existence read answers
 // it. A missing engine or an empty scope is false, leaving the tools undeclared.
-func datasetsHaveCompiledKnowledge(ctx context.Context, tenantID string, datasetIDs []string) bool {
+func DatasetsHaveCompiledKnowledge(ctx context.Context, tenantID string, datasetIDs []string) bool {
 	if len(datasetIDs) == 0 {
 		return false
 	}

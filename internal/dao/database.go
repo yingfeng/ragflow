@@ -212,6 +212,13 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 		// from these tables at runtime, so the Go side must guarantee they exist.
 		&entity.CompilationTemplate{},
 		&entity.CompilationTemplateGroup{},
+		// Agent harness: definitions, runs, audit trail, feedback and lessons.
+		&entity.HarnessAgent{},
+		&entity.HarnessAgentVersion{},
+		&entity.HarnessAgentRun{},
+		&entity.HarnessAgentStep{},
+		&entity.HarnessAgentFeedback{},
+		&entity.HarnessAgentLesson{},
 	}
 	dataModels = append(dataModels, permissionDataModelsEE()...)
 

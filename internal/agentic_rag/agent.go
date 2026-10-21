@@ -361,7 +361,7 @@ func Run(ctx context.Context, in Input) (string, error) {
 		common.InfoCtx(ctx, "agentic_rag: compiled-knowledge tools skipped",
 			zap.Strings("datasets", in.DatasetIDs),
 			zap.String("reason", "caller supplied an explicit tool list"))
-	} else if datasetsHaveCompiledKnowledge(ctx, in.TenantID, in.DatasetIDs) {
+	} else if DatasetsHaveCompiledKnowledge(ctx, in.TenantID, in.DatasetIDs) {
 		compiled := compiledKnowledgeTools(in.TenantID, in.DatasetIDs)
 		tools = append(tools, compiled...)
 		compiledInjected = true

@@ -72,16 +72,9 @@ func TestEngine_TaskConstructionPreservesNodeRetryPolicy(t *testing.T) {
 	}, types.NodeOptions{RetryPolicy: policy})
 	engine := NewEngine(sg)
 
-	tests := map[string]*Task{
-		"execution":  engine.createTask(node, nil, nil, nil),
-		"inspection": engine.createTaskInfo(node, nil, nil, nil),
-	}
-	for name, task := range tests {
-		t.Run(name, func(t *testing.T) {
-			if task.RetryPolicy != policy {
-				t.Fatalf("RetryPolicy = %p, want %p", task.RetryPolicy, policy)
-			}
-		})
+	task := engine.createTask(node, nil, nil, nil)
+	if task.RetryPolicy != policy {
+		t.Fatalf("RetryPolicy = %p, want %p", task.RetryPolicy, policy)
 	}
 }
 

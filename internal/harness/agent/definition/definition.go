@@ -1,0 +1,158 @@
+// Package definition holds the prompt-first agent definition and its immutable
+// versions. A definition never carries a dataset scope: data reach is injected
+// per run (see caps.Scope).
+package definition
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ApprovalMode controls whether high-risk tools pause the loop for approval.
+type ApprovalMode string
+
+const (
+	ApprovalAuto ApprovalMode = "auto"
+	ApprovalAsk  ApprovalMode = "ask"
+)
+
+// Writable surfaces for RSI. Anything outside this list is rejected.
+const (
+	SurfacePromptAddendum = "prompt.addendum"
+	SurfaceToolPolicy     = "tool.policy"
+	SurfaceSkillSelection = "skill.selection"
+	SurfaceRAGParams      = "rag.params"
+)
+
+// WritableSurfaces is the closed set RSI may edit.
+var WritableSurfaces = []string{
+	SurfacePromptAddendum,
+	SurfaceToolPolicy,
+	SurfaceSkillSelection,
+	SurfaceRAGParams,
+}
+
+// CapRef introduces a capability. Introducing it makes its tools available; it
+// is not an orchestration instruction.
+type CapRef struct {
+	Kind   string         `json:"kind"`
+	Name   string         `json:"name"`
+	Config map[string]any `json:"config,omitempty"`
+}
+
+// PolicyConfig bounds one run.
+type PolicyConfig struct {
+	MaxRounds    int          `json:"max_rounds,omitempty"`
+	MaxTokens    int          `json:"max_tokens,omitempty"`
+	MaxToolCalls int          `json:"max_tool_calls,omitempty"`
+	MaxWallSec   int          `json:"max_wall_sec,omitempty"`
+	MaxCostUSD   float64      `json:"max_cost_usd,omitempty"`
+	Approval     ApprovalMode `json:"approval,omitempty"`
+}
+
+// RSIConfig opts an agent into self-improvement and bounds it.
+type RSIConfig struct {
+	Enabled       bool     `json:"enabled"`
+	Surfaces      []string `json:"surfaces,omitempty"`
+	UseFeedback   bool     `json:"use_feedback,omitempty"`
+	MinConfidence float64  `json:"min_confidence,omitempty"`
+	MaxLessons    int      `json:"max_lessons,omitempty"`
+}
+
+// Definition is what a user writes.
+type Definition struct {
+	ID     string       `json:"id"`
+	Name   string       `json:"name"`
+	Prompt string       `json:"prompt"`
+	Caps   []CapRef     `json:"caps,omitempty"`
+	Policy PolicyConfig `json:"policy,omitempty"`
+	RSI    RSIConfig    `json:"rsi,omitempty"`
+
+	// Addendum is written only by RSI (prompt.addendum surface).
+	Addendum string `json:"addendum,omitempty"`
+}
+
+var (
+	// ErrEmptyPrompt rejects a definition without instructions.
+	ErrEmptyPrompt = errors.New("definition: prompt is required")
+	// ErrEmptyName rejects a definition without a name.
+	ErrEmptyName = errors.New("definition: name is required")
+	// ErrUnknownSurface rejects an RSI surface outside the writable set.
+	ErrUnknownSurface = errors.New("definition: unknown rsi surface")
+)
+
+// Validate checks the definition before a version is created.
+func (d *Definition) Validate() error {
+	if strings.TrimSpace(d.Name) == "" {
+		return ErrEmptyName
+	}
+	if strings.TrimSpace(d.Prompt) == "" {
+		return ErrEmptyPrompt
+	}
+	switch d.Policy.Approval {
+	case "", ApprovalAuto, ApprovalAsk:
+	default:
+		return fmt.Errorf("definition: unknown approval mode %q", d.Policy.Approval)
+	}
+	for _, surface := range d.RSI.Surfaces {
+		if !IsWritableSurface(surface) {
+			return fmt.Errorf("%w: %s", ErrUnknownSurface, surface)
+		}
+	}
+	if d.Policy.MaxRounds < 0 || d.Policy.MaxTokens < 0 || d.Policy.MaxToolCalls < 0 ||
+		d.Policy.MaxWallSec < 0 || d.Policy.MaxCostUSD < 0 {
+		return errors.New("definition: policy limits must not be negative")
+	}
+	if d.RSI.MinConfidence < 0 || d.RSI.MinConfidence > 1 {
+		return errors.New("definition: rsi min_confidence must be within [0,1]")
+	}
+	return nil
+}
+
+// IsWritableSurface reports whether RSI may edit the surface.
+func IsWritableSurface(surface string) bool {
+	for _, allowed := range WritableSurfaces {
+		if allowed == surface {
+			return true
+		}
+	}
+	return false
+}
+
+// EffectivePrompt joins the user prompt and the RSI addendum.
+func (d *Definition) EffectivePrompt() string {
+	if strings.TrimSpace(d.Addendum) == "" {
+		return d.Prompt
+	}
+	return d.Prompt + "\n\n" + d.Addendum
+}
+
+// Version is an immutable snapshot. Runs bind to one version.
+type Version struct {
+	ID         string     `json:"id"`
+	AgentID    string     `json:"agent_id"`
+	ParentID   string     `json:"parent_id,omitempty"`
+	Definition Definition `json:"definition"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// NewVersion validates and freezes a definition.
+func NewVersion(agentID, parentID string, def Definition) (*Version, error) {
+	if err := def.Validate(); err != nil {
+		return nil, err
+	}
+	if def.ID == "" {
+		def.ID = uuid.NewString()
+	}
+	return &Version{
+		ID:         uuid.NewString(),
+		AgentID:    agentID,
+		ParentID:   parentID,
+		Definition: def,
+		CreatedAt:  time.Now().UTC(),
+	}, nil
+}

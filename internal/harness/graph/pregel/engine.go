@@ -45,7 +45,6 @@ type Engine struct {
 	retryPolicy         *types.RetryPolicy
 	currentCheckpoint   *checkpoint.Checkpoint
 	channelVersions     map[string]int
-	versionsSeen        map[string]map[string]int
 	cache               Cache
 	backgroundExec      *BackgroundExecutor
 	callbacks           *CallbackManager     // lifecycle callbacks (event recording, metrics)
@@ -76,7 +75,6 @@ func NewEngine(g types.StateGraph, opts ...EngineOption) *Engine {
 		maxConcurrency:  10,
 		retryPolicy:     nil,
 		channelVersions: make(map[string]int),
-		versionsSeen:    make(map[string]map[string]int),
 		cache:           &NoopCache{},
 	}
 
@@ -279,7 +277,6 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 		// leading to unbounded memory growth (soak tests exposed this).
 		e.currentCheckpoint = nil
 		e.channelVersions = make(map[string]int)
-		e.versionsSeen = make(map[string]map[string]int)
 		e.deferredCheckpoints = nil
 
 		// Initialize channels
@@ -287,12 +284,6 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 		graphChannels := e.getGraphChannels()
 		for name, ch := range graphChannels {
 			channelRegistry.Register(name, ch.Copy())
-		}
-
-		// Apply input to channels
-		if err := e.applyInput(channelRegistry, input); err != nil {
-			errCh <- fmt.Errorf("failed to apply input: %w", err)
-			return
 		}
 
 		// Get thread ID for checkpointing
@@ -308,10 +299,11 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 		// channel values from the checkpoint already contain the
 		// state at the point of interruption.
 		var (
-			didLoadCheckpoint   bool
-			cpCompletedTasks    map[string]bool
-			cpLastCompletedNode string
-			cpData              map[string]any
+			didLoadCheckpoint    bool
+			cpCompletedTasks     map[string]bool
+			cpLastCompletedNodes []string
+			cpStep               int
+			cpData               map[string]any
 		)
 		if e.checkpointer != nil {
 			var cpErr error
@@ -360,9 +352,27 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 						cpCompletedTasks = deserializeStringSet(str)
 					}
 				}
-				if raw, ok := cpData["__last_completed_node__"]; ok {
-					if str, ok := raw.(string); ok {
-						cpLastCompletedNode = str
+				// Restore the scheduling frontier. A checkpoint written before the
+				// frontier became a set carries only the scalar form.
+				if str, ok := cpData["__last_completed_nodes__"].(string); ok {
+					if err := json.Unmarshal([]byte(str), &cpLastCompletedNodes); err != nil {
+						cpLastCompletedNodes = nil
+					}
+				}
+				if len(cpLastCompletedNodes) == 0 {
+					if str, ok := cpData["__last_completed_node__"].(string); ok && str != "" {
+						cpLastCompletedNodes = []string{str}
+					}
+				}
+				// Restore the superstep counter so recursion_limit spans resumes.
+				switch v := cpData["__step__"].(type) {
+				case float64:
+					cpStep = int(v)
+				case int:
+					cpStep = v
+				case json.Number:
+					if n, err := v.Int64(); err == nil {
+						cpStep = int(n)
 					}
 				}
 				// Only restore keys that correspond to registered channels.
@@ -412,9 +422,9 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 		e.backgroundExec = backgroundExec
 
 		// Execute Pregel loop
-		step := 0
+		step := cpStep
 		var completedTasks map[string]bool
-		lastCompletedNode := cpLastCompletedNode
+		lastCompletedNodes := cpLastCompletedNodes
 		if didLoadCheckpoint && cpCompletedTasks != nil {
 			completedTasks = cpCompletedTasks
 		} else {
@@ -477,7 +487,7 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 			streamManager.EmitCheckpoint(step, channelRegistry.CreateCheckpoint())
 
 			// Determine next tasks
-			tasks, triggers, err := e.prepareNextTasks(ctx, channelRegistry, completedTasks, lastCompletedNode, lastState)
+			tasks, err := e.prepareNextTasks(ctx, channelRegistry, completedTasks, lastCompletedNodes, lastState)
 			if err != nil {
 				errCh <- fmt.Errorf("failed to prepare next tasks: %w", err)
 				return
@@ -494,14 +504,16 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 			}
 
 			// Check for interrupts
-			interruptedTasks := e.shouldInterrupt(channelRegistry, tasks, triggers)
+			interruptedTasks := e.shouldInterrupt(tasks)
 			if len(interruptedTasks) > 0 {
-				// Save checkpoint
+				// Save the same scheduling state the after-execution interrupt
+				// path writes, so a resume re-enters this step instead of
+				// restarting from the entry point.
 				if e.checkpointer != nil {
-					checkpoint := channelRegistry.CreateCheckpoint()
+					payload := interruptCheckpointPayload(channelRegistry, completedTasks, lastCompletedNodes, step, lastState)
 					if err := e.checkpointer.Put(ctx, map[string]any{
 						constants.ConfigKeyThreadID: threadID,
-					}, checkpoint); err != nil {
+					}, payload); err != nil {
 						errCh <- fmt.Errorf("failed to save checkpoint: %w", err)
 						return
 					}
@@ -533,6 +545,7 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 			// Mark tasks as completed and track last state
 			allFailed := len(results) > 0
 			var interruptTaskNames []string
+			stepCompleted := make([]string, 0, len(results))
 			for _, result := range results {
 				if errors.IsGraphInterrupt(result.Err) {
 					interruptTaskNames = append(interruptTaskNames, result.Name)
@@ -541,10 +554,17 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 				if result.Err == nil {
 					allFailed = false
 					completedTasks[result.Name] = true
-					lastCompletedNode = result.Name
+					stepCompleted = append(stepCompleted, result.Name)
 					// Merge result into lastState
 					lastState = e.mergeStates(lastState, result.Output)
 				}
+			}
+			// The next step dispatches from every node that completed in this
+			// one. Keeping only a single node silently drops the other
+			// successors of a parallel fan-out.
+			if len(stepCompleted) > 0 {
+				sort.Strings(stepCompleted)
+				lastCompletedNodes = stepCompleted
 			}
 			// If any task was interrupted, handle the interrupt.
 			if len(interruptTaskNames) > 0 {
@@ -554,28 +574,13 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 					zap.Bool("allFailed", allFailed))
 				// Save checkpoint with completed_tasks and sub_state.
 				if e.checkpointer != nil {
-					checkpointData := channelRegistry.CreateCheckpoint()
-					cpPayload := make(map[string]any, len(checkpointData)+4)
-					for key, val := range checkpointData {
-						cpPayload[key] = val
-					}
-					cpPayload["__completed_tasks__"] = serializeStringSet(completedTasks)
-					cpPayload["__last_completed_node__"] = lastCompletedNode
-					cpPayload["__step__"] = float64(step)
-					// Persist lastState as string (not []byte) to avoid
-					// JSON double-base64-encoding when the checkpointer
-					// adapter serializes the whole payload.
-					if lastState != nil {
-						if ls, err := json.Marshal(lastState); err == nil {
-							cpPayload["__last_state__"] = string(ls)
-						}
-					}
+					payload := interruptCheckpointPayload(channelRegistry, completedTasks, lastCompletedNodes, step, lastState)
 					// Extract sub-state from GraphInterrupt value.
 					for _, r := range results {
 						if gi, ok := r.Err.(*errors.GraphInterrupt); ok && len(gi.Interrupts) > 0 {
 							if intr, ok := gi.Interrupts[0].(*types.Interrupt); ok && intr.Value != nil {
 								if b, e := json.Marshal(intr.Value); e == nil {
-									cpPayload["__sub_state__"] = b
+									payload["__sub_state__"] = b
 								}
 							}
 							break
@@ -583,7 +588,7 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 					}
 					if err := e.checkpointer.Put(ctx, map[string]any{
 						constants.ConfigKeyThreadID: threadID,
-					}, cpPayload); err != nil {
+					}, payload); err != nil {
 						errCh <- fmt.Errorf("failed to save checkpoint on interrupt: %w", err)
 						return
 					}
@@ -622,7 +627,7 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 			}
 
 			// Apply writes to channels
-			_, err = e.applyWrites(channelRegistry, results, triggers)
+			err = e.applyWrites(channelRegistry, results)
 			if err != nil {
 				errCh <- fmt.Errorf("failed to apply writes: %w", err)
 				return
@@ -715,50 +720,37 @@ func (e *Engine) Run(ctx context.Context, input any, mode types.StreamMode) (<-c
 }
 
 // prepareNextTasks determines which tasks to execute next.
-// This is the standard version that prepares tasks for execution.
+// lastCompletedNodes is the scheduling frontier: every node that completed in
+// the previous superstep.
+//
+// In AllPredecessor (DAG) mode, a node is triggered only when ALL of its incoming
+// edges' source nodes have completed. In AnyPredecessor (Pregel/BSP) mode (default),
+// a node is triggered when any predecessor completes. AllPredecessor does not
+// support cycles.
 func (e *Engine) prepareNextTasks(
 	ctx context.Context,
 	registry *channels.Registry,
 	completedTasks map[string]bool,
-	lastCompletedNode string,
+	lastCompletedNodes []string,
 	currentState any,
-) ([]*Task, map[string]struct{}, error) {
-	return e.prepareNextTasksWithMode(ctx, registry, completedTasks, lastCompletedNode, currentState, true)
-}
-
-// prepareNextTasksWithMode determines which tasks to execute next with for_execution mode.
-// When forExecution is true, tasks are prepared for actual execution.
-// When forExecution is false, only task information is prepared (for inspection/planning).
-//
-// In AllPredecessor (DAG) mode, a node is triggered only when ALL of its incoming edges'
-// source nodes have completed. In AnyPredecessor (Pregel/BSP) mode (default), a node is
-// triggered when any predecessor completes. AllPredecessor does not support cycles.
-func (e *Engine) prepareNextTasksWithMode(
-	ctx context.Context,
-	registry *channels.Registry,
-	completedTasks map[string]bool,
-	lastCompletedNode string,
-	currentState any,
-	forExecution bool,
-) ([]*Task, map[string]struct{}, error) {
+) ([]*Task, error) {
 	tasks := make([]*Task, 0)
-	triggerToNodes := make(map[string]struct{})
 
 	// If this is the first step
 	if len(completedTasks) == 0 {
 		entryPoint := e.getEntryPoint()
 		if entryPoint == "" {
-			return nil, nil, fmt.Errorf("no entry point set")
+			return nil, fmt.Errorf("no entry point set")
 		}
 
 		// Handle direct edge Start → End (empty/trivial graph)
 		if entryPoint == constants.End {
-			return tasks, triggerToNodes, nil
+			return tasks, nil
 		}
 
 		node := e.getNode(entryPoint)
 		if node == nil {
-			return nil, nil, &errors.NodeNotFoundError{NodeName: entryPoint}
+			return nil, &errors.NodeNotFoundError{NodeName: entryPoint}
 		}
 
 		// Pass node Triggers as task Channels so the first task reads from
@@ -772,23 +764,39 @@ func (e *Engine) prepareNextTasksWithMode(
 		if len(triggers) == 0 {
 			triggers = registry.Names()
 		}
-		task := e.createTask(node, currentState, triggers, []string{})
-		tasks = append(tasks, task)
-		triggerToNodes["__start__"] = struct{}{}
-		return tasks, triggerToNodes, nil
+		tasks = append(tasks, e.createTask(node, currentState, triggers, []string{}))
+		return tasks, nil
 	}
 
 	// AllPredecessor (DAG) mode: scan all uncompleted nodes and check if
 	// ALL of their incoming-edge source nodes have completed.
 	if e.graph.GetNodeTriggerMode() == types.NodeTriggerAllPredecessor {
-		return e.prepareNextTasksDAG(completedTasks, currentState, forExecution)
+		return e.prepareNextTasksDAG(completedTasks, currentState)
 	}
 
-	// AnyPredecessor (Pregel/BSP) mode: determine next nodes from the
-	// last completed node's outgoing edges.
-	nextNodes := e.getNextNodes(ctx, lastCompletedNode, currentState)
+	// AnyPredecessor (Pregel/BSP) mode: union the outgoing edges of every node
+	// that completed in the previous superstep. Deduplicating through a set
+	// keeps a join reached from several predecessors to a single task.
+	nextNodes := make(map[string]bool)
+	for _, completed := range lastCompletedNodes {
+		targets, err := e.getNextNodes(ctx, completed, currentState)
+		if err != nil {
+			return nil, err
+		}
+		for target := range targets {
+			nextNodes[target] = true
+		}
+	}
 
+	// Sorted so that task order — and therefore the order of write merging and
+	// of results — does not depend on map iteration.
+	nodeNames := make([]string, 0, len(nextNodes))
 	for nodeName := range nextNodes {
+		nodeNames = append(nodeNames, nodeName)
+	}
+	sort.Strings(nodeNames)
+
+	for _, nodeName := range nodeNames {
 		node := e.getNode(nodeName)
 		if node == nil {
 			continue
@@ -801,21 +809,10 @@ func (e *Engine) prepareNextTasksWithMode(
 		}
 
 		// BSP mode: always schedule, even if previously completed (supports loops).
-		var task *Task
-		if forExecution {
-			task = e.createTask(node, currentState, triggers, []string{})
-		} else {
-			task = e.createTaskInfo(node, currentState, triggers, []string{})
-		}
-		tasks = append(tasks, task)
-
-		// Build trigger to nodes mapping
-		for _, trigger := range triggers {
-			triggerToNodes[trigger] = struct{}{}
-		}
+		tasks = append(tasks, e.createTask(node, currentState, triggers, []string{}))
 	}
 
-	return tasks, triggerToNodes, nil
+	return tasks, nil
 }
 
 // prepareNextTasksDAG prepares tasks in DAG (AllPredecessor) mode.
@@ -824,10 +821,8 @@ func (e *Engine) prepareNextTasksWithMode(
 func (e *Engine) prepareNextTasksDAG(
 	completedTasks map[string]bool,
 	currentState any,
-	forExecution bool,
-) ([]*Task, map[string]struct{}, error) {
+) ([]*Task, error) {
 	tasks := make([]*Task, 0)
-	triggerToNodes := make(map[string]struct{})
 
 	// Build reverse adjacency: for each node, which nodes have edges TO it.
 	incomingEdges := e.buildIncomingEdges()
@@ -867,20 +862,11 @@ func (e *Engine) prepareNextTasksDAG(
 				triggers = append(triggers, name)
 			}
 		}
-		var task *Task
-		if forExecution {
-			task = e.createTask(n, currentState, triggers, []string{})
-		} else {
-			task = e.createTaskInfo(n, currentState, triggers, []string{})
-		}
-		tasks = append(tasks, task)
-		for _, trigger := range triggers {
-			triggerToNodes[trigger] = struct{}{}
-		}
+		tasks = append(tasks, e.createTask(n, currentState, triggers, []string{}))
 	}
 
 	// No tasks means all reachable nodes are done.
-	return tasks, triggerToNodes, nil
+	return tasks, nil
 }
 
 // buildIncomingEdges builds a reverse-adjacency map: node → list of nodes with edges TO it.
@@ -893,11 +879,7 @@ func (e *Engine) buildIncomingEdges() map[string][]string {
 }
 
 // shouldInterrupt checks if graph should be interrupted.
-func (e *Engine) shouldInterrupt(
-	registry *channels.Registry,
-	tasks []*Task,
-	triggerToNodes map[string]struct{},
-) []*Task {
+func (e *Engine) shouldInterrupt(tasks []*Task) []*Task {
 	interrupted := make([]*Task, 0)
 
 	if len(e.interrupts) == 0 {
@@ -938,8 +920,7 @@ func (e *Engine) shouldInterruptAfter(results []*TaskResult) bool {
 func (e *Engine) applyWrites(
 	registry *channels.Registry,
 	results []*TaskResult,
-	triggerToNodes map[string]struct{},
-) (map[string]struct{}, error) {
+) error {
 	updatedChannels := make(map[string]struct{})
 
 	// Sort results for deterministic order
@@ -963,7 +944,7 @@ func (e *Engine) applyWrites(
 		// Convert output to map of writes
 		outputMap, err := toMap(result.Output)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert output to map: %w", err)
+			return fmt.Errorf("failed to convert output to map: %w", err)
 		}
 
 		// Apply FieldMapping if the node has field-level routing configured.
@@ -1033,7 +1014,7 @@ func (e *Engine) applyWrites(
 		// Update channel
 		updated, err := ch.Update(filtered)
 		if err != nil {
-			return nil, fmt.Errorf("failed to update channel %s: %w", channelName, err)
+			return fmt.Errorf("failed to update channel %s: %w", channelName, err)
 		}
 
 		if updated && ch.IsAvailable() {
@@ -1061,38 +1042,41 @@ func (e *Engine) applyWrites(
 		}
 	}
 
-	// Mark channels as seen by nodes
-	for resultName := range writesByChannel {
-		if _, ok := triggerToNodes[resultName]; ok {
-			for channelName := range updatedChannels {
-				e.markSeen(resultName, channelName)
-			}
-		}
-	}
-
-	return updatedChannels, nil
+	return nil
 }
 
-// markSeen marks that a node has seen a channel's version.
-func (e *Engine) markSeen(node, channel string) {
-	if e.versionsSeen[node] == nil {
-		e.versionsSeen[node] = make(map[string]int)
+// interruptCheckpointPayload builds the checkpoint payload written whenever a
+// run stops on an interrupt. It carries everything a resume needs to re-enter
+// the interrupted superstep instead of restarting from the entry point.
+func interruptCheckpointPayload(
+	registry *channels.Registry,
+	completedTasks map[string]bool,
+	lastCompletedNodes []string,
+	step int,
+	lastState any,
+) map[string]any {
+	values := registry.CreateCheckpoint()
+	payload := make(map[string]any, len(values)+5)
+	for key, val := range values {
+		payload[key] = val
 	}
-	e.versionsSeen[node][channel] = e.channelVersions[channel]
 
-	if e.currentCheckpoint != nil {
-		e.currentCheckpoint.MarkSeen(node, channel)
+	payload["__completed_tasks__"] = serializeStringSet(completedTasks)
+	if frontier, err := json.Marshal(lastCompletedNodes); err == nil {
+		payload["__last_completed_nodes__"] = string(frontier)
 	}
-}
-
-// hasSeen checks if a node has seen a channel's current version.
-func (e *Engine) hasSeen(node, channel string) bool {
-	if versions, ok := e.versionsSeen[node]; ok {
-		if version, ok := versions[channel]; ok {
-			return version == e.channelVersions[channel]
+	if n := len(lastCompletedNodes); n > 0 {
+		payload["__last_completed_node__"] = lastCompletedNodes[n-1]
+	}
+	payload["__step__"] = float64(step)
+	// Persist as string (not []byte) to avoid JSON double-base64-encoding when
+	// the checkpointer adapter serializes the whole payload.
+	if lastState != nil {
+		if ls, err := json.Marshal(lastState); err == nil {
+			payload["__last_state__"] = string(ls)
 		}
 	}
-	return false
+	return payload
 }
 
 // executeTasks executes the given tasks concurrently.
@@ -1439,7 +1423,12 @@ func (e *Engine) getNode(name string) *types.Node {
 	return node
 }
 
-func (e *Engine) getNextNodes(ctx context.Context, node string, state any) map[string]bool {
+// getNextNodes resolves the outgoing targets of a node.
+//
+// A conditional edge that fails or returns a value missing from its mapping is
+// an error: silently skipping it would drop the branch and let the run finish
+// as if the graph had completed.
+func (e *Engine) getNextNodes(ctx context.Context, node string, state any) (map[string]bool, error) {
 	common.Debug("getNextNodes",
 		zap.String("node", node),
 		zap.Any("state", state))
@@ -1457,15 +1446,15 @@ func (e *Engine) getNextNodes(ctx context.Context, node string, state any) map[s
 		hasConditional = true
 		conditionResult, err := condEdge.Condition(ctx, state)
 		if err != nil {
-			common.Debug("conditional edge failed", zap.String("from", node), zap.Error(err))
+			return nil, fmt.Errorf("conditional edge from %s: %w", node, err)
 		}
 		conditionKey := fmt.Sprintf("%v", conditionResult)
 		targetNode, ok := condEdge.Mapping[conditionKey]
 		if !ok {
-			continue
+			return nil, fmt.Errorf("conditional edge from %s returned %q, which has no mapped target", node, conditionKey)
 		}
 		if targetNode == constants.End {
-			return nextNodes
+			return nextNodes, nil
 		}
 		nextNodes[targetNode] = true
 	}
@@ -1475,7 +1464,7 @@ func (e *Engine) getNextNodes(ctx context.Context, node string, state any) map[s
 		for _, edge := range e.graph.GetEdges() {
 			if edge.From == node {
 				if edge.To == constants.End {
-					return nextNodes
+					return nextNodes, nil
 				}
 				nextNodes[edge.To] = true
 			}
@@ -1513,7 +1502,7 @@ func (e *Engine) getNextNodes(ctx context.Context, node string, state any) map[s
 		if branch.From == node {
 			branchResult, err := branch.Condition(ctx, state)
 			if err != nil {
-				continue
+				return nil, fmt.Errorf("branch from %s: %w", node, err)
 			}
 			targets := branch.Then(branchResult)
 			for _, target := range targets {
@@ -1525,7 +1514,7 @@ func (e *Engine) getNextNodes(ctx context.Context, node string, state any) map[s
 		}
 	}
 
-	return nextNodes
+	return nextNodes, nil
 }
 
 func (e *Engine) getTriggers(node *types.Node) []string {
@@ -1561,35 +1550,6 @@ func (e *Engine) createTask(node *types.Node, state any, channels []string, trig
 		task.Triggers[trigger] = struct{}{}
 	}
 	return task
-}
-
-// createTaskInfo creates a task info object for inspection/planning (for_execution=false mode).
-// This is similar to Python's prepare_next_tasks with for_execution=False.
-func (e *Engine) createTaskInfo(node *types.Node, state any, channels []string, triggers []string) *Task {
-	task := &Task{
-		ID:          uuid.New().String(),
-		Name:        node.Name,
-		Channels:    channels,
-		Triggers:    make(map[string]struct{}),
-		RetryPolicy: node.RetryPolicy,
-		Func:        nil,
-	}
-	for _, trigger := range triggers {
-		task.Triggers[trigger] = struct{}{}
-	}
-	return task
-}
-
-// PrepareNextTasksForInspection prepares tasks for inspection/planning only (for_execution=false).
-// This corresponds to Python's prepare_next_tasks with for_execution=False.
-func (e *Engine) PrepareNextTasksForInspection(
-	ctx context.Context,
-	registry *channels.Registry,
-	completedTasks map[string]bool,
-	lastCompletedNode string,
-	currentState any,
-) ([]*Task, map[string]struct{}, error) {
-	return e.prepareNextTasksWithMode(ctx, registry, completedTasks, lastCompletedNode, currentState, false)
 }
 
 func (e *Engine) applyInput(registry *channels.Registry, input any) error {
@@ -1661,6 +1621,15 @@ func (e *Engine) getThreadID() string {
 }
 
 func (e *Engine) buildOutput(registry *channels.Registry, lastState any) (any, error) {
+	// A typed state (struct or pointer-to-struct) is the graph's contract with
+	// its nodes: callers assert on that type. The aggregated channel values
+	// below are a map of field names and would break that assertion.
+	if lastState != nil {
+		if _, isMap := lastState.(map[string]any); !isMap {
+			return lastState, nil
+		}
+	}
+
 	values, err := registry.GetValues()
 	if err != nil {
 		return lastState, nil
