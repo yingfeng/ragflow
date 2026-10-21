@@ -1,8 +1,9 @@
 import { useSetModalState } from '@/hooks/common-hooks';
 import { useCreateChat } from '@/hooks/use-chat-request';
 import { useFetchDefaultModelDictionary } from '@/hooks/use-llm-request';
-import { useCallback, useMemo } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { AgentDraft, DefaultAgentDraft } from '../create-chat-dialog';
 
 export const useCreateChatDialog = () => {
   const {
@@ -14,6 +15,9 @@ export const useCreateChatDialog = () => {
   const { t } = useTranslation();
   const defaultModelDictionary =
     useFetchDefaultModelDictionary(createChatVisible);
+  // The agent the new thread runs with. Disabled means a plain chat: the
+  // request carries no `agent` at all, which is how the backend reads intent.
+  const [agentDraft, setAgentDraft] = useState<AgentDraft>(DefaultAgentDraft);
 
   const InitialData = useMemo(
     () => ({
@@ -51,12 +55,26 @@ export const useCreateChatDialog = () => {
 
   const onCreateChatOk = useCallback(
     async (name: string) => {
-      const ret = await createChat({ ...InitialData, name });
+      const ret = await createChat({
+        ...InitialData,
+        name,
+        ...(agentDraft.enabled
+          ? {
+              agent: {
+                policy: {
+                  max_rounds: agentDraft.maxRounds,
+                  approval: agentDraft.approval,
+                },
+              },
+            }
+          : {}),
+      });
       if (ret === 0) {
         hideCreateChatModal();
+        setAgentDraft(DefaultAgentDraft);
       }
     },
-    [InitialData, createChat, hideCreateChatModal],
+    [InitialData, createChat, hideCreateChatModal, agentDraft],
   );
 
   return {
@@ -65,5 +83,7 @@ export const useCreateChatDialog = () => {
     createChatVisible,
     hideCreateChatModal,
     showCreateChatModal,
+    agentDraft,
+    setAgentDraft,
   };
 };

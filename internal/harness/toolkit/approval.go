@@ -3,6 +3,7 @@ package toolkit
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -84,12 +85,23 @@ type pendingApproval struct {
 	decision chan ApprovalDecision
 	call     Call
 	tenantID string
+	risk     Risk
 }
 
 // PendingApproval is what an operator needs to answer a request.
 type PendingApproval struct {
 	Call     Call
 	TenantID string
+	// Risk is how the registry classified the call, so a client can ask for
+	// confirmation on the calls that leave the process instead of all of them.
+	Risk Risk
+}
+
+// PendingRef identifies one waiting request. Key is the only handle a client
+// needs: it addresses the request without knowing which worker owns the run.
+type PendingRef struct {
+	Key string
+	PendingApproval
 }
 
 // DefaultApprovalTimeout bounds how long a batch waits for a human.
@@ -131,6 +143,7 @@ func (b *ApprovalBroker) Approve(ctx context.Context, call Call, risk Risk) Appr
 		decision: decision,
 		call:     call,
 		tenantID: ScopeFrom(ctx).TenantID,
+		risk:     risk,
 	}
 	b.mu.Unlock()
 	defer func() {
@@ -177,5 +190,43 @@ func (b *ApprovalBroker) Pending(runID, requestID string) (PendingApproval, bool
 	if !ok {
 		return PendingApproval{}, false
 	}
-	return PendingApproval{Call: entry.call, TenantID: entry.tenantID}, true
+	return PendingApproval{Call: entry.call, TenantID: entry.tenantID, Risk: entry.risk}, true
+}
+
+// List returns every waiting request, ordered by key so a client sees a stable
+// page instead of map order. An operator console needs the enumeration: a
+// browser that reloaded has lost the event stream that announced the request.
+func (b *ApprovalBroker) List() []PendingRef {
+	b.mu.Lock()
+	refs := make([]PendingRef, 0, len(b.pending))
+	for key, entry := range b.pending {
+		refs = append(refs, PendingRef{
+			Key: key,
+			PendingApproval: PendingApproval{
+				Call:     entry.call,
+				TenantID: entry.tenantID,
+				Risk:     entry.risk,
+			},
+		})
+	}
+	b.mu.Unlock()
+	sort.Slice(refs, func(i, j int) bool { return refs[i].Key < refs[j].Key })
+	return refs
+}
+
+// ResolveKey settles one request by the key List handed out. Returning false
+// means it already timed out, was answered elsewhere, or never existed.
+func (b *ApprovalBroker) ResolveKey(key string, allow bool, reason string) bool {
+	b.mu.Lock()
+	entry, ok := b.pending[key]
+	b.mu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case entry.decision <- ApprovalDecision{Allow: allow, Reason: reason}:
+		return true
+	default:
+		return false
+	}
 }

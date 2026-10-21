@@ -24,6 +24,7 @@ import {
   IConversation,
   IDialog,
   IExternalChatInfo,
+  IHarnessApproval,
 } from '@/interfaces/database/chat';
 import {
   IAskRequestBody,
@@ -67,6 +68,8 @@ export const enum ChatApiAction {
   FetchExternalChatInfo = 'fetchExternalChatInfo',
   Feedback = 'feedback',
   CreateSharedConversation = 'createSharedConversation',
+  ListPendingApprovals = 'listPendingApprovals',
+  ResolveApproval = 'resolveApproval',
 }
 
 export const useGetChatSearchParams = () => {
@@ -635,4 +638,72 @@ export const useFetchRelatedQuestions = () => {
 
   return { data, loading, fetchRelatedQuestions: mutateAsync };
 };
+//#endregion
+
+//#region Harness approvals
+
+/**
+ * Lists the tool approvals still waiting in the backend process.
+ *
+ * The stream announces each request as it appears, but a page that reloaded
+ * mid-turn has lost that announcement while the run is still blocked, so the
+ * list is what turns "nothing happens" into an answerable card.
+ */
+export const useListPendingApprovals = (enabled: boolean) => {
+  const { data, isFetching, refetch } = useQuery<IHarnessApproval[]>({
+    queryKey: [ChatApiAction.ListPendingApprovals],
+    initialData: [],
+    gcTime: 0,
+    refetchOnWindowFocus: false,
+    enabled,
+    queryFn: async () => {
+      const { data } = await chatService.listHarnessApprovals();
+      return data?.data ?? [];
+    },
+  });
+
+  return { data, loading: isFetching, refetch };
+};
+
+export type IResolveApprovalParams = {
+  requestId: string;
+  allow: boolean;
+  reason?: string;
+  remember?: boolean;
+};
+
+/** Settles one pending approval. The verdict also arrives on the stream. */
+export const useResolveApproval = () => {
+  const queryClient = useQueryClient();
+
+  const {
+    data,
+    isPending: loading,
+    mutateAsync,
+  } = useMutation({
+    mutationKey: [ChatApiAction.ResolveApproval],
+    mutationFn: async (params: IResolveApprovalParams) => {
+      const { data } = await chatService.resolveHarnessApproval(
+        {
+          url: api.resolveHarnessApproval(params.requestId),
+          data: {
+            allow: params.allow,
+            reason: params.reason ?? '',
+            remember: params.remember ?? false,
+          },
+        },
+        true,
+      );
+      if (data.code === 0) {
+        queryClient.invalidateQueries({
+          queryKey: [ChatApiAction.ListPendingApprovals],
+        });
+      }
+      return data.code;
+    },
+  });
+
+  return { data, loading, resolveApproval: mutateAsync };
+};
+
 //#endregion

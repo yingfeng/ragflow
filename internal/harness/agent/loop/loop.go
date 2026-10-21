@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -109,13 +110,31 @@ type Runner struct {
 
 // Input starts a run.
 type Input struct {
-	RunID       string
-	AgentName   string
+	RunID     string
+	AgentName string
+	// Messages is the conversation the run continues: earlier user and assistant
+	// turns plus the question being asked. UserMessage is the convenience form
+	// for a single-turn run and is appended when Messages does not already end
+	// with it. Tool messages from earlier turns are never replayed — a tool
+	// result out of its turn is misleading context.
+	Messages    []model.Message
 	UserMessage string
 	Scope       toolkit.Scope
 }
 
-const defaultMaxRounds = 40
+// defaultMaxRounds is a runaway guard, not a budget. The context window plus
+// compaction is what ends a long turn — the same bound codex uses — so this
+// number only has to be large enough that no legitimate investigation reaches
+// it. A caller that wants a tighter loop sets policy.max_rounds explicitly.
+const defaultMaxRounds = 1000
+
+// answerInstruction closes a run that stopped collecting evidence without
+// producing an answer. Without it the run ends with whatever the last think
+// emitted, which for a tool-calling round is nothing at all: the user paid for
+// the retrieval and got an empty message.
+const answerInstruction = `Stop searching and answer the user's question now, in the question's own language.
+Use only the conversation above, including the tool results already collected. Reply with the final answer text directly: no tool calls, no plan, no description of what you searched, and no mention of this instruction.
+If the collected evidence genuinely cannot answer the question, say what is missing and state the best-supported partial answer instead of leaving the reply empty.`
 
 // Build compiles the loop graph.
 func Build(cfg Config) (*Runner, error) {
@@ -172,6 +191,7 @@ func Build(cfg Config) (*Runner, error) {
 		state.RetryPrepare = false
 		state.Pending = nil
 		state.NewEvidence = 0
+		state.NewOutputs = 0
 		state.ThinkTerminal = false
 		state.EvidenceBefore = len(state.Evidence)
 
@@ -189,6 +209,11 @@ func Build(cfg Config) (*Runner, error) {
 			lessons = deps.Lessons(ctx)
 		}
 		state.Prompt = deps.Builder.BuildWithTier(deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost))
+		// The plan rides after the transcript: the cacheable system prefix stays
+		// byte-identical across rounds while the model still sees what is left.
+		if plan := renderPlan(state.Plan, false); plan != "" {
+			state.Prompt = append(state.Prompt, model.Message{Role: model.RoleUser, Content: plan})
+		}
 		record(deps, StepRecord{
 			RunID:      state.RunID,
 			Phase:      "prepare",
@@ -213,11 +238,17 @@ func Build(cfg Config) (*Runner, error) {
 			state.PrefixRebuilds++
 		}
 		state.PrefixHash = prefix
-		response, err := callModel(ctx, deps.Model, model.Request{
+		request := model.Request{
 			Messages:  state.Prompt,
 			Tools:     tools,
 			MaxTokens: deps.MaxOutputTokens,
-		}, deps.Breaker)
+		}
+		var response model.Response
+		if streamer, ok := deps.Model.(model.Streamer); ok && DeltaSinkFromContext(ctx) != nil {
+			response, err = callModelStreaming(ctx, streamer, request, deps.Breaker, DeltaSinkFromContext(ctx))
+		} else {
+			response, err = callModel(ctx, deps.Model, request, deps.Breaker)
+		}
 		if err != nil {
 			// A prompt-too-long rejection means the estimate was wrong. Shrink
 			// the prompt and try again instead of failing the run; after
@@ -347,6 +378,9 @@ func Build(cfg Config) (*Runner, error) {
 					call.Tool, maxRepeatedToolCalls))
 				return
 			}
+			finish := trackTool(ctx, toolCallView{tool: call.Tool, arguments: call.Arguments})
+			defer func() { finish(failures[index]) }()
+
 			approvalCall := toolkit.Call{ID: call.ID, Tool: call.Tool, Arguments: call.Arguments}
 			recorder := events.RecorderFromContext(ctx)
 			if deps.Approver != nil {
@@ -426,13 +460,27 @@ func Build(cfg Config) (*Runner, error) {
 				result = toolkit.ErrorResult(failures[index])
 			}
 			state.Budget.ToolCalls++
+			// Progress is measured on what the tool returned, not on what one
+			// policy happens to call evidence: fresh content from a read-only tool
+			// is progress even when it carries no citation, and a run that keeps
+			// finding new material must not be mistaken for a stuck one.
+			fingerprint := outputFingerprint(call.Tool, result.Content)
+			if state.SeenOutputs == nil {
+				state.SeenOutputs = make(map[string]struct{})
+			}
+			if _, seen := state.SeenOutputs[fingerprint]; !seen {
+				state.SeenOutputs[fingerprint] = struct{}{}
+				state.NewOutputs++
+			}
 			content := result.Content
 			if strings.TrimSpace(content) == "" {
 				content = "(no output)"
 			}
-			// Oversized output leaves the context window here; the model gets a
-			// preview and a handle instead of paying for the whole payload.
-			content = spill.MaybeSpill(ctx, call.Tool, content, inlineBudget)
+			if !result.Inline {
+				// Oversized output leaves the context window here; the model gets
+				// a preview and a handle instead of paying for the whole payload.
+				content = spill.MaybeSpill(ctx, content, inlineBudget)
+			}
 			state.History = append(state.History, model.Message{
 				Role:       model.RoleTool,
 				ToolCallID: call.ID,
@@ -446,6 +494,9 @@ func Build(cfg Config) (*Runner, error) {
 				}
 			}
 			state.Evidence = append(state.Evidence, result.Evidence...)
+			if plan, ok := result.Meta[toolkit.MetaPlan].([]toolkit.PlanStep); ok && len(plan) > 0 {
+				state.Plan = plan
+			}
 			record(deps, StepRecord{
 				RunID:    state.RunID,
 				Phase:    "act",
@@ -489,7 +540,11 @@ func Build(cfg Config) (*Runner, error) {
 		if state.NewEvidence < 0 {
 			state.NewEvidence = 0
 		}
-		if state.NewEvidence == 0 {
+		// A round made progress when it either cited something new or produced
+		// new tool output. Both halves matter: evidence alone would call a
+		// productive read-only round stagnant, and output alone would let a tool
+		// that keeps re-reading the same payload look productive.
+		if state.NewEvidence == 0 && state.NewOutputs == 0 {
 			state.StagnantRounds++
 		} else {
 			state.StagnantRounds = 0
@@ -517,20 +572,93 @@ func Build(cfg Config) (*Runner, error) {
 		return state, nil
 	})
 
+	// ── answer: turn collected evidence into the final answer ──
+	//
+	// Policies decide when to stop; they cannot know that stopping mid-search
+	// leaves nothing to show. This node is the one place that spends a model call
+	// after the loop, and only when the run would otherwise end with no text.
+	sg.AddNode("answer", func(ctx context.Context, raw interface{}) (interface{}, error) {
+		state, err := asState(raw)
+		if err != nil {
+			return nil, err
+		}
+		// A pause is a hand-off to a human, not an ending: the run resumes and
+		// answering now would spend a call the resumed round repeats.
+		if strings.TrimSpace(state.FinalText) != "" || state.Verdict.Action == policy.ActionPause {
+			return state, nil
+		}
+		start := time.Now()
+		// Prompt is the view prepare built before the last round's tool results
+		// existed. Rebuilding from History is what puts the evidence the loop just
+		// paid for in front of the model.
+		var lessons []string
+		if deps.Lessons != nil {
+			lessons = deps.Lessons(ctx)
+		}
+		messages := deps.Builder.BuildWithTier(deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost))
+		if plan := renderPlan(state.Plan, true); plan != "" {
+			messages = append(messages, model.Message{Role: model.RoleUser, Content: plan})
+		}
+		messages = append(messages, model.Message{Role: model.RoleUser, Content: answerInstruction})
+		request := model.Request{
+			Messages:  messages,
+			MaxTokens: deps.MaxOutputTokens,
+		}
+		var response model.Response
+		if streamer, ok := deps.Model.(model.Streamer); ok && DeltaSinkFromContext(ctx) != nil {
+			response, err = callModelStreaming(ctx, streamer, request, deps.Breaker, DeltaSinkFromContext(ctx))
+		} else {
+			response, err = callModel(ctx, deps.Model, request, deps.Breaker)
+		}
+		if err != nil {
+			// The evidence is already paid for; failing the run here would throw
+			// it away. Record the failure and let finish report what it has.
+			state.Errors = append(state.Errors, StepError{Tool: "answer", Message: clip(err.Error(), 256)})
+			if recorder := events.RecorderFromContext(ctx); recorder != nil {
+				recorder.RecordError(ctx, err.Error())
+			}
+			record(deps, StepRecord{
+				RunID:      state.RunID,
+				Phase:      "answer",
+				Round:      state.Entry.Round,
+				Decision:   "error",
+				Reason:     clip(err.Error(), 200),
+				DurationMS: time.Since(start).Milliseconds(),
+			})
+			return state, nil
+		}
+		recordModelCall(ctx, deps, response, state.PrefixHash, time.Since(start))
+
+		state.Budget.TokensIn += response.Usage.PromptTokens
+		state.Budget.TokensOut += response.Usage.CompletionTokens
+		if deps.PromptCostPerToken > 0 || deps.CompletionCostPerToken > 0 {
+			state.Budget.CostUSD += float64(response.Usage.PromptTokens)*deps.PromptCostPerToken +
+				float64(response.Usage.CompletionTokens)*deps.CompletionCostPerToken
+		}
+		assistant := response.Message
+		assistant.Role = model.RoleAssistant
+		state.History = append(state.History, assistant)
+		state.FinalText = strings.TrimSpace(assistant.Content)
+		if state.FinalText == "" {
+			state.Errors = append(state.Errors, StepError{Tool: "answer", Message: "answer model returned no text"})
+		}
+		record(deps, StepRecord{
+			RunID:      state.RunID,
+			Phase:      "answer",
+			Round:      state.Entry.Round,
+			Decision:   ternary(state.FinalText != "", "ok", "empty"),
+			DurationMS: time.Since(start).Milliseconds(),
+			TokensIn:   response.Usage.PromptTokens,
+			TokensOut:  response.Usage.CompletionTokens,
+		})
+		return state, nil
+	})
+
 	// ── finish: terminal ──
 	sg.AddNode("finish", func(ctx context.Context, raw interface{}) (interface{}, error) {
 		state, err := asState(raw)
 		if err != nil {
 			return nil, err
-		}
-		if strings.TrimSpace(state.FinalText) == "" {
-			for index := len(state.History) - 1; index >= 0; index-- {
-				message := state.History[index]
-				if message.Role == model.RoleAssistant && strings.TrimSpace(message.Content) != "" {
-					state.FinalText = strings.TrimSpace(message.Content)
-					break
-				}
-			}
 		}
 		state.Done = true
 		state.Budget.ElapsedMS = time.Now().UnixMilli() - state.StartedMS
@@ -587,12 +715,27 @@ func Build(cfg Config) (*Runner, error) {
 		if state.Verdict.Action == policy.ActionContinue {
 			return "prepare", nil
 		}
-		return "finish", nil
-	}, map[string]string{"prepare": "prepare", "finish": "finish"}); err != nil {
+		return "answer", nil
+	}, map[string]string{"prepare": "prepare", "answer": "answer"}); err != nil {
 		return nil, fmt.Errorf("loop: verify branch: %w", err)
+	}
+	if err := sg.AddEdge("answer", "finish"); err != nil {
+		return nil, fmt.Errorf("loop: answer→finish: %w", err)
 	}
 	if err := sg.AddEdge("finish", constants.End); err != nil {
 		return nil, fmt.Errorf("loop: finish→end: %w", err)
+	}
+
+	// The loop owns retries for the nodes that reach the outside world: think
+	// retries the model with a classified backoff (and knows whether text already
+	// reached the user), and act must never replay a tool. The engine's default
+	// policy retries every error, which would emit a streamed answer twice and run
+	// a write tool twice.
+	noRetry := &types.RetryPolicy{MaxAttempts: 1}
+	for _, name := range []string{"think", "act", "answer"} {
+		if node, ok := sg.GetNodes()[name]; ok {
+			node.RetryPolicy = noRetry
+		}
 	}
 
 	compileOptions := []interface{}{
@@ -670,16 +813,47 @@ func registerRuntimeCapabilities(registry *toolkit.Registry) {
 	}
 }
 
+// seedHistory builds the turn's conversation from the caller's history.
+//
+// Earlier tool calls and results are dropped: they were executed against a
+// corpus snapshot and a question that is already answered, so replaying them
+// only spends context. A trailing assistant message is kept as well — it is the
+// answer the user is following up on.
+func seedHistory(input Input) []model.Message {
+	history := make([]model.Message, 0, len(input.Messages)+1)
+	for _, message := range input.Messages {
+		switch message.Role {
+		case model.RoleUser, model.RoleAssistant:
+			content := strings.TrimSpace(message.Content)
+			if content == "" {
+				continue
+			}
+			if message.Role == model.RoleAssistant {
+				// A citation handle resolves against the turn that produced it.
+				// Replaying it would present an earlier, unverified answer as if
+				// this run had collected the evidence.
+				content = stripCitationHandles(content)
+			}
+			history = append(history, model.Message{Role: message.Role, Content: content})
+		}
+	}
+	if input.UserMessage != "" {
+		last := len(history) - 1
+		if last < 0 || history[last].Role != model.RoleUser || history[last].Content != input.UserMessage {
+			history = append(history, model.Message{Role: model.RoleUser, Content: input.UserMessage})
+		}
+	}
+	return history
+}
+
 func newState(input Input, policyConfig definition.PolicyConfig, maxRounds int) *State {
 	state := &State{
-		RunID:     input.RunID,
-		AgentName: input.AgentName,
-		StartedMS: time.Now().UnixMilli(),
-		History: []model.Message{{
-			Role:    model.RoleUser,
-			Content: input.UserMessage,
-		}},
+		RunID:       input.RunID,
+		AgentName:   input.AgentName,
+		StartedMS:   time.Now().UnixMilli(),
+		History:     seedHistory(input),
 		SeenCalls:   make(map[string]struct{}),
+		SeenOutputs: make(map[string]struct{}),
 		CallRepeats: make(map[string]int),
 		Budget: Budget{
 			MaxRounds:    maxRounds,
@@ -787,8 +961,72 @@ func compactionTierFor(boost int) agentctx.Tier {
 	}
 }
 
+// renderPlan turns the model's own step list into a prompt section.
+//
+// It is appended after the transcript rather than into the system prompt: the
+// system prefix stays byte-identical so the provider cache still hits, while
+// the plan stays current even when compaction dropped the tool call that
+// created it. concluding marks the forced final answer, where open steps must
+// be reported instead of worked on.
+func renderPlan(plan []toolkit.PlanStep, concluding bool) string {
+	if len(plan) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Plan state (from your plan tool, kept across rounds):\n")
+	open, written := 0, 0
+	for _, step := range plan {
+		description := strings.TrimSpace(step.Description)
+		if description == "" {
+			continue
+		}
+		status := strings.TrimSpace(step.Status)
+		if status == "" {
+			status = "pending"
+		}
+		if status != "completed" {
+			open++
+		}
+		written++
+		fmt.Fprintf(&b, "%d. [%s] %s\n", written, status, description)
+	}
+	if written == 0 {
+		return ""
+	}
+	switch {
+	case concluding && open > 0:
+		fmt.Fprintf(&b, "%d step(s) are still open: state which part of the answer they leave unresolved.\n", open)
+	case concluding:
+		b.WriteString("Every step is complete.\n")
+	case open > 0:
+		fmt.Fprintf(&b, "%d step(s) still open. Work them before concluding.\n", open)
+	default:
+		b.WriteString("Every step is complete: answer the question now.\n")
+	}
+	return b.String()
+}
+
 func idempotencyKey(tool, arguments string) string {
 	sum := sha256.Sum256([]byte(tool + "\x00" + arguments))
+	return hex.EncodeToString(sum[:8])
+}
+
+// citationHandlePattern matches the [ID:...] handle a tool prints for a passage.
+var citationHandlePattern = regexp.MustCompile(`\s*\[ID:[^\]\s]*\]`)
+
+// stripCitationHandles removes handles from replayed history.
+func stripCitationHandles(text string) string {
+	if !strings.Contains(text, "[ID:") {
+		return text
+	}
+	return strings.TrimSpace(citationHandlePattern.ReplaceAllString(text, ""))
+}
+
+// outputFingerprint identifies a tool result by content. It answers "has this
+// run already seen this exact answer", which is what separates a tool making
+// progress from one being asked the same thing again.
+func outputFingerprint(tool, content string) string {
+	sum := sha256.Sum256([]byte(tool + "\x00" + content))
 	return hex.EncodeToString(sum[:8])
 }
 

@@ -336,3 +336,61 @@ func TestAutoMigrateRuntimeModelsNamesFailingTable(t *testing.T) {
 		t.Fatalf("autoMigrateRuntimeModels error = %v, want failing table name", err)
 	}
 }
+
+// TestMigrateDialogAgentID covers a shared table gaining a Go-only column: an
+// upgraded deployment runs the server, not --migrate, so AutoMigrate never adds
+// it and every dialog query fails with agent_id in the unknown field list.
+func TestMigrateDialogAgentID(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+
+	// A dialog table from before threads could belong to an agent.
+	if err := db.Exec(`CREATE TABLE dialog (
+		id varchar(32) PRIMARY KEY,
+		tenant_id varchar(32) NOT NULL,
+		name varchar(255),
+		llm_id varchar(128) NOT NULL
+	)`).Error; err != nil {
+		t.Fatalf("create legacy dialog table: %v", err)
+	}
+	migrator := db.Migrator()
+	if migrator.HasColumn(&entity.Chat{}, "agent_id") {
+		t.Fatal("precondition failed: column already present")
+	}
+
+	if err := migrateDialogAgentID(ctx, db); err != nil {
+		t.Fatalf("migrateDialogAgentID: %v", err)
+	}
+	if !migrator.HasColumn(&entity.Chat{}, "agent_id") {
+		t.Fatal("expected dialog.agent_id to be added")
+	}
+
+	// Existing rows read as plain chats, so the chat list keeps working.
+	if err := db.Exec(`INSERT INTO dialog (id, tenant_id, name, llm_id) VALUES ('c1', 't1', 'legacy', 'm1')`).Error; err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	var agentID string
+	if err := db.Raw("SELECT agent_id FROM dialog WHERE id = 'c1'").Scan(&agentID).Error; err != nil {
+		t.Fatalf("read back agent_id: %v", err)
+	}
+	if agentID != "" {
+		t.Fatalf("legacy row agent_id = %q, want empty", agentID)
+	}
+
+	// Idempotent on a second startup.
+	if err := migrateDialogAgentID(ctx, db); err != nil {
+		t.Fatalf("second migrateDialogAgentID: %v", err)
+	}
+
+	// Missing table is a no-op, not an error.
+	fresh, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open second sqlite: %v", err)
+	}
+	if err := migrateDialogAgentID(ctx, fresh); err != nil {
+		t.Fatalf("migration on a table-less database should be a no-op: %v", err)
+	}
+}

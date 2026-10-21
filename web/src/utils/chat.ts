@@ -18,7 +18,7 @@ import {
   ChatVariableEnabledField,
   EmptyConversationId,
 } from '@/constants/chat';
-import { IMessage, Message } from '@/interfaces/database/chat';
+import { IMessage, IThinkEvent, Message } from '@/interfaces/database/chat';
 import type { CompletionChunk } from '@/services/chat-completion-stream';
 import { omit } from 'lodash';
 import { v4 as uuid } from 'uuid';
@@ -96,6 +96,39 @@ export function mergeAnswerChunk(
   }
 
   return nextAnswer;
+}
+
+/** Upper bound on retained steps: a long agent turn must not grow unbounded. */
+const MaxThinkEvents = 200;
+
+/**
+ * Folds one streamed step into the turn's step list.
+ *
+ * An approval wait and its verdict share a `request_id`; the verdict replaces
+ * the wait so a card updates in place instead of stacking a second card that
+ * asks the same question again.
+ */
+export function mergeThinkEvent(
+  events: IThinkEvent[] | undefined,
+  event: IThinkEvent,
+): IThinkEvent[] {
+  const list = events ? events.slice() : [];
+
+  if (event.request_id) {
+    const index = list.findIndex(
+      (item) =>
+        item.kind === event.kind && item.request_id === event.request_id,
+    );
+    if (index >= 0) {
+      list[index] = event;
+      return list;
+    }
+  }
+
+  list.push(event);
+  return list.length > MaxThinkEvents
+    ? list.slice(list.length - MaxThinkEvents)
+    : list;
 }
 
 // Preprocess LaTeX equations to be rendered by KaTeX

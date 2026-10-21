@@ -49,6 +49,22 @@ type Evidence struct {
 	Score   float64 `json:"score,omitempty"`
 }
 
+// MetaPlan is the Result.Meta key a tool uses to publish a structured plan.
+//
+// The runtime lifts a published plan out of the transcript and renders it into
+// every later prompt, so a plan keeps its shape when the conversation is
+// compacted and the model does not have to re-read its own tool output to know
+// what is left. Any tool may publish one; nothing here is specific to the
+// planning tool's name.
+const MetaPlan = "plan"
+
+// PlanStep is one step of a published plan.
+type PlanStep struct {
+	ID          string `json:"id,omitempty"`
+	Description string `json:"description"`
+	Status      string `json:"status,omitempty"`
+}
+
 // Call is one tool invocation.
 type Call struct {
 	ID        string
@@ -58,8 +74,13 @@ type Call struct {
 
 // Result is one tool outcome.
 type Result struct {
-	Content  string
-	IsError  bool
+	Content string
+	IsError bool
+	// Inline keeps the content verbatim in the transcript instead of letting the
+	// loop spill it behind a handle. A tool that already returns a bounded window
+	// of a larger payload sets this: spilling its output again would replace the
+	// window with a handle to itself and the model could never read the text.
+	Inline   bool
 	Evidence []Evidence
 	Meta     map[string]any
 }

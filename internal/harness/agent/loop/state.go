@@ -57,6 +57,11 @@ type State struct {
 	Evidence []toolkit.Evidence `json:"evidence"`
 	Errors   []StepError        `json:"errors"`
 
+	// Plan is the model's own step list, published by a tool through
+	// toolkit.MetaPlan and rendered into every later prompt. Keeping it out of
+	// History is what makes it survive compaction.
+	Plan []toolkit.PlanStep `json:"plan,omitempty"`
+
 	FinalText string `json:"final_text"`
 
 	Budget  Budget         `json:"budget"`
@@ -70,6 +75,13 @@ type State struct {
 	ScopeViolations int `json:"scope_violations"`
 	Citations       int `json:"citations"`
 	UnresolvedCalls int `json:"unresolved_calls"`
+
+	// SeenOutputs fingerprints every tool output this run has produced, and
+	// NewOutputs counts the results of the round that just ran whose content had
+	// not appeared before. Together they are the tool-agnostic progress signal:
+	// no policy has to know what a "citation" is to tell progress from a loop.
+	SeenOutputs map[string]struct{} `json:"seen_outputs"`
+	NewOutputs  int                 `json:"new_outputs"`
 
 	SeenCalls map[string]struct{} `json:"seen_calls"`
 	// CallRepeats counts each identical call so act can refuse the ones that are

@@ -56,15 +56,24 @@ func New(ctx context.Context) (*Capability, error) {
 		}
 		spec := model.ToolSpec{Name: name, Description: info.Desc}
 		if info.ParamsOneOf != nil {
-			raw, err := json.Marshal(info.ParamsOneOf)
+			// ParamsOneOf keeps its fields unexported, so marshalling it directly
+			// yields "{}" and the model would receive a tool with no arguments
+			// declared at all. ToJSONSchema is the only correct conversion.
+			declared, err := info.ParamsOneOf.ToJSONSchema()
 			if err != nil {
 				return nil, fmt.Errorf("caps/builtin: schema %s: %w", name, err)
 			}
-			params := map[string]any{}
-			if err := json.Unmarshal(raw, &params); err != nil {
-				return nil, fmt.Errorf("caps/builtin: decode schema %s: %w", name, err)
+			if declared != nil {
+				raw, err := json.Marshal(declared)
+				if err != nil {
+					return nil, fmt.Errorf("caps/builtin: schema %s: %w", name, err)
+				}
+				params := map[string]any{}
+				if err := json.Unmarshal(raw, &params); err != nil {
+					return nil, fmt.Errorf("caps/builtin: decode schema %s: %w", name, err)
+				}
+				spec.Parameters = params
 			}
-			spec.Parameters = params
 		}
 		specs = append(specs, spec)
 	}
@@ -95,5 +104,28 @@ func (c *Capability) Invoke(ctx context.Context, call toolkit.Call) (toolkit.Res
 	if err != nil {
 		return toolkit.Result{}, fmt.Errorf("%s: %w", call.Tool, err)
 	}
-	return toolkit.Result{Content: content}, nil
+	result := toolkit.Result{Content: content}
+	// A plan belongs in the run state, not only in this tool's echo: the loop
+	// renders it into every later prompt so compaction cannot take it away.
+	if call.Tool == todoWriteTool {
+		if plan, ok := planFromArguments(arguments); ok {
+			result.Meta = map[string]any{toolkit.MetaPlan: plan}
+		}
+	}
+	return result, nil
+}
+
+// todoWriteTool is the planning tool the generic tool set exposes. Its plan is
+// published through Result.Meta so the loop can carry it across rounds.
+const todoWriteTool = "todo_write"
+
+// planFromArguments decodes the step list a todo_write call declared.
+func planFromArguments(arguments string) ([]toolkit.PlanStep, bool) {
+	var decoded struct {
+		Steps []toolkit.PlanStep `json:"steps"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &decoded); err != nil || len(decoded.Steps) == 0 {
+		return nil, false
+	}
+	return decoded.Steps, true
 }

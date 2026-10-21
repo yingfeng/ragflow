@@ -126,6 +126,52 @@ func callModel(ctx context.Context, mdl model.Model, request model.Request, brea
 	return model.Response{}, lastErr
 }
 
+// callModelStreaming retries a streaming call.
+//
+// A retry replays the request, which means the user would see the answer text
+// twice. So a retry is only allowed before the first delta reached the sink; once
+// text was shown the error is final and the caller decides what to tell the user.
+func callModelStreaming(ctx context.Context, streamer model.Streamer, request model.Request, breaker *model.Breaker, sink func(string)) (model.Response, error) {
+	if remaining, ok := breaker.Allow(time.Now()); !ok {
+		return model.Response{}, &model.ErrProviderCoolingDown{Key: "provider", Remaining: remaining}
+	}
+
+	emitted := false
+	sender := func(answer, _ *string) error {
+		if answer == nil || *answer == "" || sink == nil {
+			return nil
+		}
+		emitted = true
+		sink(*answer)
+		return nil
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= modelAttempts; attempt++ {
+		response, err := streamer.Stream(ctx, request, sender)
+		if err == nil {
+			breaker.Success()
+			return response, nil
+		}
+		lastErr = err
+		retryable := isRetryableModelError(err) && !emitted
+		if !retryable || attempt == modelAttempts {
+			if isRetryableModelError(err) {
+				breaker.Failure(time.Now())
+			}
+			return model.Response{}, err
+		}
+		timer := time.NewTimer(modelBackoff(attempt))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return model.Response{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return model.Response{}, lastErr
+}
+
 // boostTier maps the number of prompt-too-long recoveries onto the compaction
 // tier the next prepare must use.
 func boostTier(boost int) int {

@@ -28,8 +28,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"gorm.io/gorm"
+
 	"ragflow/internal/dao"
 	"ragflow/internal/dao/transaction"
+	"ragflow/internal/harness/agent/definition"
 )
 
 var DefaultRerankModels = map[string]struct{}{
@@ -52,15 +55,17 @@ type ChatService struct {
 	chatDAO           *dao.ChatDAO
 	kbDAO             *dao.KnowledgebaseDAO
 	tenantDAO         *dao.TenantDAO
+	harnessAgents     *HarnessAgentService
 	permissionChecker resourceScopeChecker
 }
 
 // NewChatService create chat service
 func NewChatService() *ChatService {
 	return &ChatService{
-		chatDAO:   dao.NewChatDAO(),
-		kbDAO:     dao.NewKnowledgebaseDAO(),
-		tenantDAO: dao.NewTenantDAO(),
+		chatDAO:       dao.NewChatDAO(),
+		kbDAO:         dao.NewKnowledgebaseDAO(),
+		tenantDAO:     dao.NewTenantDAO(),
+		harnessAgents: NewHarnessAgentService(),
 	}
 }
 
@@ -169,6 +174,10 @@ type CreateChatRequest struct {
 	VectorSimilarityWeight *float64
 	Icon                   *string
 	TenantID               *string `json:"tenant_id"`
+	// Agent, when present, creates a harness agent and makes this chat its first
+	// thread. The value is a definition.Definition body (prompt, addendum, caps,
+	// policy, rsi); an absent or empty object keeps the chat a plain chat.
+	Agent map[string]interface{} `json:"agent,omitempty"`
 }
 
 func (s *ChatService) Create(ctx context.Context, userID string, req map[string]interface{}) (map[string]interface{}, common.ErrorCode, error) {
@@ -292,6 +301,10 @@ func (s *ChatService) Create(ctx context.Context, userID string, req map[string]
 		req["meta_data_filter"] = map[string]interface{}{}
 	}
 
+	// Keep the agent payload aside: the field whitelist below drops everything it
+	// does not persist, and the agent is stored in its own table.
+	agentPayload := req["agent"]
+
 	applyCreatePromptDefaults(req)
 	filterCreateChatPersistedFields(req)
 
@@ -303,8 +316,25 @@ func (s *ChatService) Create(ctx context.Context, userID string, req map[string]
 	}
 	req["name"] = name
 
+	agentDef, err := buildCreateAgentDefinition(name, agentPayload)
+	if err != nil {
+		return nil, common.CodeDataError, err
+	}
+
 	chat := buildCreateChatEntity(req, userID)
-	if err = s.chatDAO.Create(ctx, dao.DB, chat); err != nil {
+	// The thread and the agent that runs it are one unit: a thread pointing at a
+	// missing agent would be a chat that can never answer.
+	err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if agentDef != nil {
+			created, createErr := s.harnessAgents.CreateTx(ctx, tx, userID, userID, *agentDef)
+			if createErr != nil {
+				return createErr
+			}
+			chat.AgentID = created.AgentID
+		}
+		return s.chatDAO.Create(ctx, tx, chat)
+	})
+	if err != nil {
 		return nil, common.CodeDataError, fmt.Errorf("failed to create chat: %w", err)
 	}
 
@@ -318,6 +348,39 @@ func (s *ChatService) Create(ctx context.Context, userID string, req map[string]
 		return nil, common.CodeServerError, err
 	}
 	return response, common.CodeSuccess, nil
+}
+
+// buildCreateAgentDefinition turns the optional `agent` body into a definition.
+//
+// Presence is the intent: an absent (or null) `agent` keeps the chat plain and
+// creates no row; an empty object asks for an agent with every default, which is
+// what the UI sends when the user picks "Agent" and changes nothing.
+func buildCreateAgentDefinition(chatName string, raw interface{}) (*definition.Definition, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	values, ok := mapFromValue(raw)
+	if !ok {
+		return nil, errors.New("`agent` should be an object")
+	}
+	body, err := json.Marshal(values)
+	if err != nil {
+		return nil, fmt.Errorf("`agent` is not encodable: %w", err)
+	}
+	parsed := definition.Definition{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("`agent` is not a valid agent definition: %w", err)
+	}
+	if strings.TrimSpace(parsed.Name) == "" {
+		parsed.Name = chatName
+	}
+	if strings.TrimSpace(parsed.Prompt) == "" {
+		parsed.Prompt = definition.DefaultPrompt
+	}
+	if err := parsed.Validate(); err != nil {
+		return nil, err
+	}
+	return &parsed, nil
 }
 
 func validateCreateChatName(value interface{}) (string, error) {

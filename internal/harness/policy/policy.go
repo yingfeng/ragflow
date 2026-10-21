@@ -220,7 +220,10 @@ func (Progress) Name() string { return "progress" }
 func (p Progress) Check(snapshot Snapshot) []Verdict {
 	limit := p.StagnantRounds
 	if limit <= 0 {
-		limit = 2
+		// Three flat rounds, not two: one flat round is normal while a tool's
+		// output is being digested, and the budget policies already bound the
+		// total spend of a run that never converges.
+		limit = 3
 	}
 	repeats := p.RepeatedCalls
 	if repeats <= 0 {

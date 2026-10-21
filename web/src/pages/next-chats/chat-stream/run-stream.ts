@@ -3,14 +3,14 @@
  * keep writing into the store) after the chat page unmounts, so that navigating
  * away mid-answer and back shows the stream still in progress.
  */
-import { IMessage, Variable } from '@/interfaces/database/chat';
+import { IMessage, IThinkEvent, Variable } from '@/interfaces/database/chat';
 import {
   CompletionChunk,
   parseCompletionEventStream,
   readJsonSafely,
   requestChatCompletionStream,
 } from '@/services/chat-completion-stream';
-import { mergeAnswerChunk } from '@/utils/chat';
+import { mergeAnswerChunk, mergeThinkEvent } from '@/utils/chat';
 import { AnswerFlushIntervalMs } from './constants';
 import { useChatStreamStore } from './store';
 
@@ -50,6 +50,9 @@ export async function runChatCompletionStream({
   // `startsWith` / think-marker behaviour depends on the raw accumulated text
   // rather than on the rendered message content.
   let accumulatedAnswer = '';
+  // Agent steps travel beside the answer, not inside it: they are the turn's
+  // activity, and the answer text is what the user reads as the result.
+  let thinkEvents: IThinkEvent[] = [];
   let aborted = false;
   let ok = true;
 
@@ -67,6 +70,7 @@ export async function runChatCompletionStream({
       ...pendingChunk,
       answer: accumulatedAnswer,
       conversationId,
+      ...(thinkEvents.length ? { think_events: thinkEvents } : {}),
     });
     pendingChunk = undefined;
     lastFlushAt = Date.now();
@@ -93,6 +97,17 @@ export async function runChatCompletionStream({
 
     try {
       for await (const chunk of parseCompletionEventStream(response)) {
+        if (chunk.think_event) {
+          thinkEvents = mergeThinkEvent(thinkEvents, chunk.think_event);
+          // A step is a store write of its own: an approval has to appear while
+          // the turn is blocked, not on the next text flush.
+          applyAnswer(conversationId, {
+            ...pendingChunk,
+            answer: accumulatedAnswer,
+            conversationId,
+            think_events: thinkEvents,
+          });
+        }
         accumulatedAnswer = mergeAnswerChunk(accumulatedAnswer, chunk);
         pendingChunk = pendingChunk ? { ...pendingChunk, ...chunk } : chunk;
 

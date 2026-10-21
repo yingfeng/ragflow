@@ -161,15 +161,24 @@ func describe(ctx context.Context, factories map[string]toolFactory, tenantID st
 		}
 		spec := model.ToolSpec{Name: name, Description: info.Desc}
 		if info.ParamsOneOf != nil {
-			raw, err := json.Marshal(info.ParamsOneOf)
+			// ParamsOneOf keeps its fields unexported, so marshalling it directly
+			// yields "{}" and the model would receive a tool with no arguments
+			// declared at all. ToJSONSchema is the only correct conversion.
+			declared, err := info.ParamsOneOf.ToJSONSchema()
 			if err != nil {
 				return nil, fmt.Errorf("schema %s: %w", name, err)
 			}
-			params := map[string]any{}
-			if err := json.Unmarshal(raw, &params); err != nil {
-				return nil, fmt.Errorf("decode schema %s: %w", name, err)
+			if declared != nil {
+				raw, err := json.Marshal(declared)
+				if err != nil {
+					return nil, fmt.Errorf("schema %s: %w", name, err)
+				}
+				params := map[string]any{}
+				if err := json.Unmarshal(raw, &params); err != nil {
+					return nil, fmt.Errorf("decode schema %s: %w", name, err)
+				}
+				spec.Parameters = params
 			}
-			spec.Parameters = params
 		}
 		specs = append(specs, spec)
 	}

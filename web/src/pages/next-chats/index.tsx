@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router';
 import { ChatCard } from './chat-card';
+import { CreateChatDialog } from './create-chat-dialog';
 import { useCreateChatDialog } from './hooks/use-create-chat';
 import { useRenameChat } from './hooks/use-rename-chat';
 
@@ -49,6 +50,8 @@ export default function ChatList() {
     hideCreateChatModal,
     onCreateChatOk,
     createChatLoading,
+    agentDraft,
+    setAgentDraft,
   } = useCreateChatDialog();
 
   const handlePageChange = useCallback(
@@ -89,27 +92,13 @@ export default function ChatList() {
         title: initialChatName,
       };
     }
-    if (createChatVisible) {
-      return {
-        hideModal: hideCreateChatModal,
-        onOk: onCreateChatOk,
-        initialName: '',
-        loading: createChatLoading,
-        title: t('chat.createChat'),
-      };
-    }
     return null;
   }, [
     chatRenameVisible,
-    createChatVisible,
     hideChatRenameModal,
     onChatRenameOk,
     initialChatName,
     chatRenameLoading,
-    hideCreateChatModal,
-    onCreateChatOk,
-    createChatLoading,
-    t,
   ]);
 
   return (
@@ -194,6 +183,15 @@ export default function ChatList() {
 
       {renameDialogProps && (
         <RenameDialog {...renameDialogProps}></RenameDialog>
+      )}
+      {createChatVisible && (
+        <CreateChatDialog
+          hideModal={hideCreateChatModal}
+          loading={createChatLoading}
+          onOk={onCreateChatOk}
+          agent={agentDraft}
+          onAgentChange={setAgentDraft}
+        />
       )}
     </>
   );

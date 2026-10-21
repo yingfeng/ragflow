@@ -20,8 +20,12 @@ import "encoding/json"
 
 // Chat chat model (mapped to dialog table)
 type Chat struct {
-	ID             string   `gorm:"column:id;primaryKey;size:32" json:"id"`
-	TenantID       string   `gorm:"column:tenant_id;size:32;not null;index" json:"tenant_id"`
+	ID       string `gorm:"column:id;primaryKey;size:32" json:"id"`
+	TenantID string `gorm:"column:tenant_id;size:32;not null;index" json:"tenant_id"`
+	// AgentID links this thread to the harness agent that runs it. Empty means a
+	// plain chat: the pipeline owns the turn, and there is no agent record at
+	// all. An agent may own many threads; it is never a property of one thread.
+	AgentID        string   `gorm:"column:agent_id;size:64;not null;default:'';index" json:"agent_id"`
 	Name           *string  `gorm:"column:name;size:255;index" json:"name,omitempty"`
 	Description    *string  `gorm:"column:description;type:longtext" json:"description,omitempty"`
 	Icon           *string  `gorm:"column:icon;type:longtext" json:"icon,omitempty"`

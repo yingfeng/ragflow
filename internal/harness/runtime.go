@@ -25,12 +25,16 @@ import (
 	"ragflow/internal/harness/toolkit/subagent"
 )
 
-// ModelResolver resolves one tenant's chat model. The service layer implements
-// it over service.ModelFactory, which keeps tenant resolution and API keys out
-// of the harness while still making the RAGFlow model provider the only way a
-// harness run talks to a model.
+// ModelResolver resolves one tenant's chat model for one actor. The service
+// layer implements it over service.ModelFactory, which keeps tenant resolution
+// and API keys out of the harness while still making the RAGFlow model provider
+// the only way a harness run talks to a model.
+//
+// userID is the actor the run acts for, not a convenience: model access (which
+// provider, whose key) resolves per user, and a tenant-only lookup silently
+// falls back to a provider the tenant may have no credit on.
 type ModelResolver interface {
-	Resolve(ctx context.Context, tenantID, modelRef string) (model.ChatCompleter, error)
+	Resolve(ctx context.Context, tenantID, userID, modelRef string) (model.ChatCompleter, error)
 }
 
 // RuntimeConfig describes one run's wiring. Everything that varies per tenant or
@@ -46,8 +50,15 @@ type RuntimeConfig struct {
 	// Resolver and ModelRef select the chat model for this run.
 	Resolver ModelResolver
 	ModelRef string
+	// Model overrides Resolver when the host already holds the model to use —
+	// a failover chain, for instance, which the host can build from refs the
+	// harness never sees. Nil means resolve ModelRef through Resolver.
+	Model model.ChatCompleter
 	// Scope is the run's data reach (tenant + datasets).
 	Scope toolkit.Scope
+	// ActorUserID is the user the run acts for. Model access resolves per user,
+	// so leaving it empty can select a different provider than the caller's.
+	ActorUserID string
 	// Agent identity, written to the run record.
 	AgentID        string
 	AgentVersionID string
@@ -120,12 +131,16 @@ type Runtime struct {
 // missing model; every other capability degrades by omission and is reported in
 // the startup log by the caller.
 func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
-	if cfg.Resolver == nil {
-		return nil, fmt.Errorf("harness: a model resolver is required")
-	}
-	chat, err := cfg.Resolver.Resolve(ctx, cfg.Scope.TenantID, cfg.ModelRef)
-	if err != nil {
-		return nil, fmt.Errorf("harness: resolve model %q: %w", cfg.ModelRef, err)
+	chat := cfg.Model
+	if chat == nil {
+		if cfg.Resolver == nil {
+			return nil, fmt.Errorf("harness: a model resolver is required")
+		}
+		resolved, err := cfg.Resolver.Resolve(ctx, cfg.Scope.TenantID, cfg.ActorUserID, cfg.ModelRef)
+		if err != nil {
+			return nil, fmt.Errorf("harness: resolve model %q: %w", cfg.ModelRef, err)
+		}
+		chat = resolved
 	}
 	chatModel := NewModel(chat, ModelProviderConfig{})
 
@@ -165,7 +180,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		Builder:                builder,
 		ModelName:              cfg.ModelRef,
 		Breaker:                cfg.Breakers.For(cfg.ModelRef),
-		SystemPrompt:           cfg.SystemPrompt,
+		SystemPrompt:           definition.EffectiveSystemPrompt(cfg.SystemPrompt),
 		Lessons:                cfg.Lessons,
 		Concurrency:            cfg.Concurrency,
 		MaxOutputTokens:        cfg.MaxOutputTokens,

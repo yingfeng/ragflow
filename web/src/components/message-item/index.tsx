@@ -34,6 +34,7 @@ import { UploadedMessageFiles } from '../next-message-item/uploaded-message-file
 import { RAGFlowAvatar } from '../ragflow-avatar';
 import SvgIcon from '../svg-icon';
 import { useTheme } from '../theme-provider';
+import { AgentActivity } from './agent-activity';
 import { AssistantGroupButton, UserGroupButton } from './group-button';
 import styles from './index.module.less';
 
@@ -177,6 +178,7 @@ const MessageItem = ({
                 )}
               </div>
             )}
+            {isAssistant && <AgentActivity events={item.think_events} />}
             {isAssistant && (
               <ReferenceImageList
                 referenceChunks={reference.chunks}

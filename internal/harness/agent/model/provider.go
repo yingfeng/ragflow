@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"ragflow/internal/common"
 	providermodel "ragflow/internal/entity/models"
@@ -47,12 +48,90 @@ func (p *Provider) Complete(ctx context.Context, req Request) (Response, error) 
 	if p == nil || p.chat == nil {
 		return Response{}, fmt.Errorf("model provider: chat model is required")
 	}
+	messages, config := p.buildRequest(req)
+	usage := &common.ModelUsage{}
+	response, err := p.chat.ChatWithMessages(ctx, messages, config, usage)
+	if err != nil {
+		return Response{}, err
+	}
+	if response == nil {
+		return Response{}, fmt.Errorf("model provider: empty response")
+	}
+	return toHarnessResponse(response), nil
+}
 
+// streamSentinel is the terminal content delta internal/entity/models emits when
+// a provider stream ends. It is a transport marker, not assistant text: treating
+// it as an answer is how a run reports "[DONE]" as its final answer.
+const streamSentinel = "[DONE]"
+
+// chatStreamer is the streaming half of the provider port. It is asserted rather
+// than required: a model without it keeps working through Complete.
+type chatStreamer interface {
+	ChatStreamlyWithSender(ctx context.Context, messages []providermodel.Message, config *providermodel.ChatConfig, usage *common.ModelUsage, sender func(*string, *string) error) error
+}
+
+// Stream implements Streamer. Tool calls and usage are read back from the config
+// the driver writes through, which is how the streaming drivers report them
+// (there is no response object on that path).
+func (p *Provider) Stream(ctx context.Context, req Request, sender StreamSender) (Response, error) {
+	streamer, ok := p.chat.(chatStreamer)
+	if !ok || sender == nil {
+		return p.Complete(ctx, req)
+	}
+
+	messages, config := p.buildRequest(req)
+	stream := true
+	config.Stream = &stream
+
+	answer := &strings.Builder{}
+	usage := &common.ModelUsage{}
+	err := streamer.ChatStreamlyWithSender(ctx, messages, config, usage, func(delta, thought *string) error {
+		if delta != nil && *delta == streamSentinel {
+			// End of stream: the marker must reach neither the answer text nor
+			// the caller's sink, or it becomes part of the conversation the next
+			// round sees and part of what the user is shown.
+			return nil
+		}
+		if delta != nil && *delta != "" {
+			answer.WriteString(*delta)
+		}
+		return sender(delta, thought)
+	})
+	if err != nil {
+		return Response{}, err
+	}
+
+	out := Response{
+		Message:    Message{Role: RoleAssistant, Content: answer.String()},
+		StopReason: "stop",
+	}
+	if config.ToolCallsResult != nil {
+		for _, raw := range *config.ToolCallsResult {
+			if parsed, ok := toHarnessToolCall(raw); ok {
+				out.Message.ToolCalls = append(out.Message.ToolCalls, parsed)
+			}
+		}
+	}
+	if len(out.Message.ToolCalls) > 0 {
+		out.StopReason = "tool_calls"
+	}
+	if usage != nil {
+		out.Usage = Usage{
+			PromptTokens:     usage.InputTokens,
+			CompletionTokens: usage.OutputTokens,
+			TotalTokens:      usage.TotalTokens,
+		}
+	}
+	return out, nil
+}
+
+// buildRequest renders the harness request as provider messages and config.
+func (p *Provider) buildRequest(req Request) ([]providermodel.Message, *providermodel.ChatConfig) {
 	messages := make([]providermodel.Message, 0, len(req.Messages))
 	for _, message := range req.Messages {
 		messages = append(messages, toProviderMessage(message))
 	}
-
 	config := &providermodel.ChatConfig{
 		Temperature: firstFloat(p.config.Temperature, req.Temperature),
 		MaxTokens:   firstInt(p.config.MaxTokens, req.MaxTokens),
@@ -63,16 +142,7 @@ func (p *Provider) Complete(ctx context.Context, req Request) (Response, error) 
 		auto := "auto"
 		config.ToolChoice = &auto
 	}
-
-	usage := &common.ModelUsage{}
-	response, err := p.chat.ChatWithMessages(ctx, messages, config, usage)
-	if err != nil {
-		return Response{}, err
-	}
-	if response == nil {
-		return Response{}, fmt.Errorf("model provider: empty response")
-	}
-	return toHarnessResponse(response), nil
+	return messages, config
 }
 
 func toProviderMessage(message Message) providermodel.Message {

@@ -64,12 +64,30 @@ func (d *HarnessAgentDAO) GetVersion(ctx context.Context, agentID, versionID str
 	return &version, nil
 }
 
-// CreateWithVersion stores a new agent and its first version atomically.
-func (d *HarnessAgentDAO) CreateWithVersion(ctx context.Context, agent *entity.HarnessAgent, version *entity.HarnessAgentVersion) error {
+// ExistsByName reports whether the tenant already uses this agent name. The
+// unique index is (tenant_id, name); a chat thread names its agent after the
+// thread, so the caller needs to know before inserting.
+func (d *HarnessAgentDAO) ExistsByName(ctx context.Context, db *gorm.DB, tenantID, name string) (bool, error) {
+	var count int64
+	if err := db.WithContext(ctx).Model(&entity.HarnessAgent{}).
+		Where("tenant_id = ? AND name = ?", tenantID, name).
+		Count(&count).Error; err != nil {
+		return false, fmt.Errorf("dao: count harness agent %q: %w", name, err)
+	}
+	return count > 0, nil
+}
+
+// CreateWithVersion stores a new agent and its first version atomically. db may
+// be a transaction: a chat thread and its agent are created together, and a
+// failure in either must leave neither.
+func (d *HarnessAgentDAO) CreateWithVersion(ctx context.Context, db *gorm.DB, agent *entity.HarnessAgent, version *entity.HarnessAgentVersion) error {
 	if agent == nil || version == nil {
 		return fmt.Errorf("dao: agent and version are required")
 	}
-	return d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if db == nil {
+		db = d.db
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(agent).Error; err != nil {
 			return fmt.Errorf("dao: create harness agent: %w", err)
 		}

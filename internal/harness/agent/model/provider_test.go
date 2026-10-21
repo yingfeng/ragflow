@@ -200,3 +200,49 @@ func TestProviderRequiresChatModel(t *testing.T) {
 		t.Fatalf("error = %v, want chat model required", err)
 	}
 }
+
+// streamingCompleter emits scripted deltas the way internal/entity/models does:
+// answer text followed by its terminal "[DONE]" sentinel.
+type streamingCompleter struct {
+	deltas []string
+}
+
+func (s *streamingCompleter) ChatWithMessages(context.Context, []providermodel.Message, *providermodel.ChatConfig, *common.ModelUsage) (*providermodel.ChatResponse, error) {
+	return nil, errors.New("non-streaming path must not be used")
+}
+
+func (s *streamingCompleter) ChatStreamlyWithSender(_ context.Context, _ []providermodel.Message, _ *providermodel.ChatConfig, _ *common.ModelUsage, sender func(*string, *string) error) error {
+	for index := range s.deltas {
+		delta := s.deltas[index]
+		if err := sender(&delta, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// The end-of-stream sentinel is a transport marker. When it leaks into the
+// assistant message it becomes the run's final answer and the next round's
+// transcript.
+func TestProviderStreamDropsDoneSentinel(t *testing.T) {
+	provider := NewProvider(&streamingCompleter{deltas: []string{"你好", streamSentinel}}, ProviderConfig{})
+
+	var streamed strings.Builder
+	response, err := provider.Stream(context.Background(), Request{
+		Messages: []Message{{Role: RoleUser, Content: "hello"}},
+	}, func(delta, _ *string) error {
+		if delta != nil {
+			streamed.WriteString(*delta)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if response.Message.Content != "你好" {
+		t.Errorf("content = %q, want the answer only", response.Message.Content)
+	}
+	if streamed.String() != "你好" {
+		t.Errorf("streamed = %q, want the answer only", streamed.String())
+	}
+}

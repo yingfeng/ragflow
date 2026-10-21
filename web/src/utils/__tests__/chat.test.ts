@@ -2,6 +2,7 @@ import {
   decodeAngleBracketEntities,
   escapeUnmatchedAngleBrackets,
   mergeAnswerChunk,
+  mergeThinkEvent,
   preprocessLaTeX,
   replaceThinkToSection,
   unescapeAngleBrackets,
@@ -166,5 +167,54 @@ describe('replaceThinkToSection', () => {
 
   it('leaves text without think markers unchanged', () => {
     expect(replaceThinkToSection('plain answer')).toBe('plain answer');
+  });
+});
+
+describe('mergeThinkEvent', () => {
+  it('replaces the wait when its verdict arrives', () => {
+    const waiting = mergeThinkEvent(undefined, {
+      kind: 'approval',
+      tool: 'exec_shell',
+      status: 'pending',
+      summary: 'needs approval',
+      request_id: 'run-1:call-1',
+    });
+    const settled = mergeThinkEvent(waiting, {
+      kind: 'approval',
+      tool: 'exec_shell',
+      status: 'denied',
+      summary: 'denied',
+      request_id: 'run-1:call-1',
+    });
+
+    expect(settled).toHaveLength(1);
+    expect(settled[0].status).toBe('denied');
+  });
+
+  it('keeps unrelated steps as separate entries', () => {
+    const first = mergeThinkEvent(undefined, {
+      kind: 'tool_call',
+      tool: 'search',
+      summary: 'search(...)',
+    });
+    const second = mergeThinkEvent(first, {
+      kind: 'tool_call',
+      tool: 'fetch',
+      summary: 'fetch(...)',
+    });
+
+    expect(second.map((event) => event.tool)).toEqual(['search', 'fetch']);
+  });
+
+  it('does not mutate the list it was given', () => {
+    const original = [{ kind: 'tool_call', tool: 'search', summary: 'x' }];
+    const merged = mergeThinkEvent(original, {
+      kind: 'tool_call',
+      tool: 'fetch',
+      summary: 'y',
+    });
+
+    expect(original).toHaveLength(1);
+    expect(merged).toHaveLength(2);
   });
 });

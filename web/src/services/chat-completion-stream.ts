@@ -11,7 +11,7 @@
  */
 import { Authorization } from '@/constants/authorization';
 import { ResponseType } from '@/interfaces/database/base';
-import { IMessage, Variable } from '@/interfaces/database/chat';
+import { IMessage, IThinkEvent, Variable } from '@/interfaces/database/chat';
 import api from '@/utils/api';
 import { getAuthorization } from '@/utils/authorization-util';
 import { EventSourceParserStream } from 'eventsource-parser/stream';
@@ -31,6 +31,8 @@ export type CompletionChunk = {
   final?: boolean;
   start_to_think?: boolean;
   end_to_think?: boolean;
+  /** One structured agent step: a tool call, or a tool waiting for approval. */
+  think_event?: IThinkEvent;
   [key: string]: any;
 };
 

@@ -1739,10 +1739,11 @@ func TestThinkEventWireKeys(t *testing.T) {
 		Sources:    []string{"c1", "c2"},
 		DurationMS: 12,
 		Summary:    "The retrieve tool returned 3 results from 2 documents.",
+		RequestID:  "run-1:call-1",
 	}
 	want := []string{
 		"args", "cause", "documents", "duration_ms", "kind", "reason",
-		"results", "sources", "stage", "status", "summary", "tool",
+		"request_id", "results", "sources", "stage", "status", "summary", "tool",
 	}
 	if got := thinkEventWireKeys(t, full); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("wire keys = %v, want %v", got, want)

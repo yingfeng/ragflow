@@ -1061,6 +1061,25 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       delete: 'Delete',
     },
     chat: {
+      createChatPlaceholder: 'Name this chat',
+      agentEnabled: 'Run as agent',
+      agentEnabledTip:
+        'An agent owns the prompt, the tools and the round budget of this chat.',
+      agentMaxRounds: 'Max rounds',
+      agentMaxRoundsTip:
+        '0 = no cap. The turn ends when the context window is spent or the run stops making progress.',
+      agentApproval: 'Tool approval',
+      agentApprovalTip:
+        'Dangerous tools (shell, writes outside the process) wait for your approval when enabled.',
+      agentApprovalAsk: 'Ask me first',
+      agentApprovalAuto: 'Run without asking',
+      agentSteps: 'Agent steps ({{count}})',
+      approvalTitle: 'Tool approval required',
+      approvalPending: 'Waiting for your decision',
+      approvalAllow: 'Allow',
+      approvalDeny: 'Deny',
+      approvalGranted: 'Approved',
+      approvalDenied: 'Denied',
       chatSupport: 'Chat Support',
       replyInstantly: 'We typically reply instantly',
       typeYourMessage: 'Type your message...',

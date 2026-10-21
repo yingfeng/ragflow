@@ -318,6 +318,11 @@ export default {
   chatsMindmap: `${restAPIv1}/chat/mindmap`,
   chatsRelatedQuestions: `${restAPIv1}/chat/recommendation`,
 
+  // harness approvals (agent tool calls waiting for a human)
+  listHarnessApprovals: `${restAPIv1}/harness/approvals`,
+  resolveHarnessApproval: (requestId: string) =>
+    `${restAPIv1}/harness/approvals/${encodeURIComponent(requestId)}`,
+
   // next chat
   fetchExternalChatInfo: (id: string) => `${restAPIv1}/chatbots/${id}/info`,
 

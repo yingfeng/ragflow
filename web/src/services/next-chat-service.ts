@@ -37,6 +37,8 @@ const {
   chatsRelatedQuestions,
   documentInfoUpload,
   fetchExternalChatInfo,
+  listHarnessApprovals,
+  resolveHarnessApproval,
 } = api;
 
 const methods = {
@@ -115,6 +117,14 @@ const methods = {
   fetchExternalChatInfo: {
     url: fetchExternalChatInfo,
     method: 'get',
+  },
+  listHarnessApprovals: {
+    url: listHarnessApprovals,
+    method: 'get',
+  },
+  resolveHarnessApproval: {
+    url: resolveHarnessApproval,
+    method: 'post',
   },
 } as const;
 

@@ -12,6 +12,7 @@ import (
 
 	"ragflow/internal/entity"
 	"ragflow/internal/harness/agent/loop"
+	"ragflow/internal/harness/agent/model"
 	"ragflow/internal/harness/events"
 	"ragflow/internal/harness/graph/types"
 	"ragflow/internal/harness/store"
@@ -28,10 +29,22 @@ type Request struct {
 	AgentID        string
 	AgentVersionID string
 	TenantID       string
-	AgentName      string
-	UserMessage    string
-	Trigger        string
-	Scope          toolkit.Scope
+	// UserID is the actor the run acts for. Model access resolves per user, so a
+	// run without it may select a provider the caller does not own.
+	UserID    string
+	AgentName string
+	// SessionID is the conversation this turn belongs to, so a chat thread can
+	// list its runs and its audit trail.
+	SessionID string
+	// ModelRef selects the model this run builds its runtime with. Empty means
+	// the host's default (the tenant's configured model), so a caller that names
+	// no model still runs, and no process-wide default decides for everyone.
+	ModelRef string
+	// History is the conversation before this turn (user/assistant text only).
+	History     []model.Message
+	UserMessage string
+	Trigger     string
+	Scope       toolkit.Scope
 }
 
 // EventType enumerates the streamed events.
@@ -180,6 +193,7 @@ func (s *Service) Invoke(ctx context.Context, req Request) (loop.Outcome, error)
 	outcome, err := s.runner.Invoke(runCtx, &loop.Input{
 		RunID:       req.RunID,
 		AgentName:   req.AgentName,
+		Messages:    req.History,
 		UserMessage: req.UserMessage,
 		Scope:       req.Scope,
 	}, configFor(req.RunID))
@@ -350,7 +364,9 @@ func (s *Service) openRun(ctx context.Context, req Request) error {
 		ID:             req.RunID,
 		AgentID:        req.AgentID,
 		AgentVersionID: req.AgentVersionID,
+		SessionID:      req.SessionID,
 		TenantID:       req.TenantID,
+		UserID:         req.UserID,
 		Status:         "pending",
 		Trigger:        req.Trigger,
 		Input:          req.UserMessage,

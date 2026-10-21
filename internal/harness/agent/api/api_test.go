@@ -34,6 +34,9 @@ type fakeRuns struct {
 	approvalResolved   string
 	approvalPending    bool
 	approvalRemembered bool
+	approvalKeyPending bool
+	approvalItems      []ApprovalRef
+	approvalsForTenant string
 	eventQuery         EventQuery
 	eventItems         []*events.Event
 	eventErr           error
@@ -73,6 +76,18 @@ func (f *fakeRuns) ResolveApproval(runID, requestID string, allow bool, reason s
 	return f.approvalPending
 }
 
+func (f *fakeRuns) PendingApprovals(tenantID string) []ApprovalRef {
+	f.approvalsForTenant = tenantID
+	return f.approvalItems
+}
+
+func (f *fakeRuns) ResolveApprovalKey(requestID, tenantID string, allow bool, reason string, remember bool) bool {
+	f.approvalRemembered = remember
+	f.approvalResolved = requestID + ":" + reason
+	f.approvalsForTenant = tenantID
+	return f.approvalKeyPending
+}
+
 func (f *fakeRuns) Steps(context.Context, string) ([]entity.HarnessAgentStep, error) {
 	return []entity.HarnessAgentStep{{ID: "s1", RunID: "known", Seq: 1, Phase: "think"}}, nil
 }
@@ -81,6 +96,12 @@ func newTestServer(t *testing.T, runs Runs) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	// The real routes sit behind the auth middleware, which publishes the
+	// caller's tenant; approvals are scoped by it.
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "t1")
+		c.Next()
+	})
 	New(runs).Register(router.Group("/v1"))
 	return router
 }
@@ -265,5 +286,78 @@ func TestListSteps(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"phase":"think"`) {
 		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestCreateRunCarriesTheRequestedModel(t *testing.T) {
+	runs := newFakeRuns()
+	router := newTestServer(t, runs)
+
+	body := `{"tenant_id":"t1","model_ref":"qwen-max","user_message":"hi"}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/agents/a1/runs", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(httptest.NewRecorder(), request)
+
+	select {
+	case req := <-runs.invoked:
+		if req.ModelRef != "qwen-max" {
+			t.Fatalf("model ref = %q, want the requested model", req.ModelRef)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run was never started")
+	}
+}
+
+func TestListApprovalsScopesToTheCallerTenant(t *testing.T) {
+	runs := newFakeRuns()
+	runs.approvalItems = []ApprovalRef{{
+		RequestID: "run-1:call-1", RunID: "run-1", Tool: "exec_shell", Risk: "dangerous", TenantID: "t1",
+	}}
+	router := newTestServer(t, runs)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/approvals", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	if runs.approvalsForTenant != "t1" {
+		t.Fatalf("tenant filter = %q, want the caller's tenant", runs.approvalsForTenant)
+	}
+	if !strings.Contains(recorder.Body.String(), `"request_id":"run-1:call-1"`) {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestResolveApprovalKeySettlesByRequestID(t *testing.T) {
+	runs := newFakeRuns()
+	runs.approvalKeyPending = true
+	router := newTestServer(t, runs)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/approvals/run-1:call-1",
+		strings.NewReader(`{"allow":false,"reason":"nope","remember":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if runs.approvalResolved != "run-1:call-1:nope" || !runs.approvalRemembered {
+		t.Fatalf("resolved = %q, remembered = %v", runs.approvalResolved, runs.approvalRemembered)
+	}
+}
+
+func TestResolveApprovalKeyRejectsAnUnknownRequest(t *testing.T) {
+	router := newTestServer(t, newFakeRuns())
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/approvals/gone",
+		strings.NewReader(`{"allow":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
 	}
 }

@@ -293,6 +293,12 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 	if err = migrateIngestionTaskPipelineLogID(ctx, DB); err != nil {
 		return err
 	}
+	// dialog.agent_id has the same shape of problem: a shared table gaining a
+	// column that server mode never converges, and an unknown column in the field
+	// list breaks creating a chat long before any agent runs.
+	if err = migrateDialogAgentID(ctx, DB); err != nil {
+		return err
+	}
 	// Seed built-in agent templates so the Go backend can serve the
 	// "create agent from template" catalogue without relying on Python-side
 	// initialization.

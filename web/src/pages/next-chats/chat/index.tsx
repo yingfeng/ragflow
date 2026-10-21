@@ -16,6 +16,7 @@ import { useHandleClickConversationCard } from '../hooks/use-click-card';
 import { ChatSettings } from './app-settings/chat-settings';
 import { MultipleChatBox } from './chat-box/next-multiple-chat-box';
 import { SingleChatBox } from './chat-box/single-chat-box';
+import { PendingApprovalsBanner } from './pending-approvals';
 import { Sessions } from './sessions';
 import { useAddChatBox } from './use-add-box';
 import { useSwitchDebugMode } from './use-switch-debug-mode';
@@ -129,6 +130,7 @@ export default function Chat() {
                       {t('chat.multipleModels')}
                     </Button>
                   </CardTitle>
+                  <PendingApprovalsBanner />
                 </CardHeader>
                 <CardContent className="flex-1 p-0 min-h-0">
                   <SingleChatBox conversation={currentConversation} />

@@ -39,6 +39,37 @@ export interface Parameter {
   optional: boolean;
 }
 
+/**
+ * One structured step of an agent turn: a tool call, or a tool waiting for a
+ * human. `request_id` addresses a pending approval — the same id comes back on
+ * the verdict event, so a card is replaced rather than duplicated.
+ */
+export interface IThinkEvent {
+  kind: string;
+  stage?: string;
+  tool?: string;
+  args?: string;
+  status?: string;
+  reason?: string;
+  cause?: string;
+  results?: number;
+  documents?: number;
+  sources?: string[];
+  duration_ms?: number;
+  summary: string;
+  request_id?: string;
+}
+
+/** One pending tool approval as the harness reports it. */
+export interface IHarnessApproval {
+  request_id: string;
+  run_id: string;
+  tool: string;
+  args: string;
+  risk: string;
+  tenant_id: string;
+}
+
 export interface LlmSetting {
   Creative: Variable;
   Custom: Variable;
@@ -86,6 +117,8 @@ export interface IDialog {
   rerank_id?: string;
   tenant_rerank_id?: string;
   meta_data_filter: MetaDataFilter;
+  /** Set when this thread is run by an agent; empty for a plain chat. */
+  agent_id?: string;
 }
 
 interface MetaDataFilter {
@@ -125,6 +158,8 @@ export interface Message {
   chatBoxId?: string;
   attachment?: IAttachment;
   downloads?: IDocumentDownloadInfo[];
+  /** Agent steps streamed with this turn, in arrival order. */
+  think_events?: IThinkEvent[];
 }
 
 export interface IReferenceChunk {
@@ -163,6 +198,7 @@ export interface IAnswer {
   audio_binary?: string;
   data?: any;
   chatBoxId?: string;
+  think_events?: IThinkEvent[];
 }
 
 export interface Docagg {

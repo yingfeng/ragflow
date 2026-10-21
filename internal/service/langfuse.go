@@ -57,10 +57,12 @@ func LangfuseClientFromTenant(ctx context.Context, tenantID, userID, chatID, mod
 }
 
 // getTenantLangfuse returns the Langfuse credentials for a tenant, or
-// (nil, nil) when no row exists.
+// (nil, nil) when no row exists. A process with no database configured (a unit
+// test, or a worker that never opens the pool) has no tracing either, which is
+// the same state as "not configured" rather than an error.
 func getTenantLangfuse(tenantID string) (*entity.TenantLangfuse, error) {
-	if tenantID == "" {
-		return nil, gorm.ErrInvalidDB
+	if tenantID == "" || dao.DB == nil {
+		return nil, nil
 	}
 	var row entity.TenantLangfuse
 	err := dao.DB.Where("tenant_id = ?", tenantID).First(&row).Error

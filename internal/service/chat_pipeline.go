@@ -58,6 +58,10 @@ type ChatPipelineService struct {
 	ModelFactory *ModelFactory
 	MetadataSvc  *MetadataService
 	kbDAO        *dao.KnowledgebaseDAO
+	// harness runs a turn for a thread that is linked to an agent. Nil means the
+	// process runtime; a test injects one to exercise the chat path without a
+	// model provider.
+	harness harnessTurnExecutor
 }
 
 // NewChatPipelineService creates a new ChatPipelineService with all required dependencies.
@@ -144,6 +148,9 @@ type ThinkEvent struct {
 	// Summary is the human sentence for this step, exactly what the think
 	// block shows.
 	Summary string `json:"summary"`
+	// RequestID addresses a waiting approval (kind "approval"). The client posts
+	// it back to settle the call; a wait and its verdict carry the same id.
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // AsyncChat is the Go equivalent of Python's async_chat() in
@@ -242,6 +249,15 @@ func (s *ChatPipelineService) AsyncChat(
 			zap.Bool("configured", resolveWebSearchProvider(chat.PromptConfig) != nil),
 			zap.Any("internet", kwargs["internet"]),
 			zap.Bool("enabled", useWebSearch))
+	}
+
+	// A thread linked to an agent runs its turns through the harness: the agent
+	// owns the prompt, the capabilities and the budget, while the thread supplies
+	// the model, the datasets and the conversation. The link is stored on the
+	// thread, so it outranks the per-request modes below — a request cannot
+	// unlink an agent chat by naming a different mode.
+	if chat.AgentID != "" {
+		return s.harnessTurn(ctx, userID, chat, messages, stream, kwargs)
 	}
 
 	// The smart-reasoning agent runs its own retrieval through its corpus

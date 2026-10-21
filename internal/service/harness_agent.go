@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
@@ -65,11 +66,25 @@ func (s *HarnessAgentService) Resolve(ctx context.Context, tenantID, agentID, ve
 
 // Create stores a new agent and its first version.
 func (s *HarnessAgentService) Create(ctx context.Context, tenantID, createdBy string, def definition.Definition) (*ResolvedAgent, error) {
+	return s.CreateTx(ctx, dao.DB, tenantID, createdBy, def)
+}
+
+// CreateTx stores a new agent inside the caller's transaction. A chat thread and
+// the agent that runs it are created together: a run that has a thread but no
+// agent (or the reverse) is unrecoverable from the UI's point of view.
+func (s *HarnessAgentService) CreateTx(ctx context.Context, db *gorm.DB, tenantID, createdBy string, def definition.Definition) (*ResolvedAgent, error) {
 	if err := def.Validate(); err != nil {
 		return nil, err
 	}
 	agentID := uuid.NewString()
 	versionID := uuid.NewString()
+
+	// An agent created from a chat thread is named after the thread. Agent names
+	// are unique per tenant while chat names are unique per tenant as well, so a
+	// standalone agent may already hold this name; suffix it instead of failing
+	// the chat creation the user actually asked for.
+	def.Name = s.uniqueName(ctx, db, tenantID, def.Name, agentID)
+
 	body, err := json.Marshal(def)
 	if err != nil {
 		return nil, fmt.Errorf("service: encode agent definition: %w", err)
@@ -90,9 +105,22 @@ func (s *HarnessAgentService) Create(ctx context.Context, tenantID, createdBy st
 		Definition: string(body),
 		CreatedBy:  createdBy,
 	}
-	if err := s.agents.CreateWithVersion(ctx, agent, version); err != nil {
+	if err := s.agents.CreateWithVersion(ctx, db, agent, version); err != nil {
 		return nil, err
 	}
 	def.ID = agentID
 	return &ResolvedAgent{AgentID: agentID, VersionID: versionID, Version: 1, Definition: def}, nil
+}
+
+// uniqueName returns name, or a suffixed variant when the tenant already uses it.
+func (s *HarnessAgentService) uniqueName(ctx context.Context, db *gorm.DB, tenantID, name, agentID string) string {
+	taken, err := s.agents.ExistsByName(ctx, db, tenantID, name)
+	if err != nil || !taken {
+		return name
+	}
+	suffix := agentID
+	if len(suffix) > 6 {
+		suffix = suffix[:6]
+	}
+	return name + " (" + suffix + ")"
 }

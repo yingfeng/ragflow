@@ -314,6 +314,41 @@ func migrateIngestionTaskPipelineLogID(ctx context.Context, db *gorm.DB) error {
 	return nil
 }
 
+// migrateDialogAgentID adds the thread→agent link to the shared dialog table.
+//
+// The column belongs to the Go side (Python never writes it) but the table does
+// not: server mode deliberately leaves shared tables alone, and the standalone
+// --migrate action is not something an upgraded deployment is guaranteed to run.
+// A dialog row is selected in full by every chat API, so a missing column fails
+// creating a chat as well as reading it (Error 1054 with agent_id in the field
+// list), which is why this runs on both startup paths.
+func migrateDialogAgentID(ctx context.Context, db *gorm.DB) error {
+	migrator := db.WithContext(ctx).Migrator()
+	if !migrator.HasTable(&entity.Chat{}) {
+		return nil
+	}
+	if migrator.HasColumn(&entity.Chat{}, "agent_id") {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE dialog ADD COLUMN agent_id varchar(64) NOT NULL DEFAULT ''",
+	).Error; err != nil {
+		if isDuplicateColumnError(err) {
+			return nil
+		}
+		return fmt.Errorf("add dialog.agent_id: %w", err)
+	}
+	if !migrator.HasIndex(&entity.Chat{}, "idx_dialog_agent_id") {
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_dialog_agent_id ON dialog (agent_id)",
+		).Error; err != nil {
+			return fmt.Errorf("add dialog agent_id index: %w", err)
+		}
+	}
+	common.Info("Added dialog.agent_id")
+	return nil
+}
+
 // migrateIngestionLogRunIdentity adds the columns and indexes that make each
 // ingestion event belong to one immutable pipeline-operation-log run. It is
 // deliberately explicit: the runtime startup path auto-migrates ingestion

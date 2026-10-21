@@ -31,6 +31,18 @@ type EventQuery struct {
 	Limit  int
 }
 
+// ApprovalRef is one pending tool approval as the API presents it. RequestID
+// addresses the request on its own, so a client that reloaded and lost the event
+// stream can still settle it.
+type ApprovalRef struct {
+	RequestID string `json:"request_id"`
+	RunID     string `json:"run_id"`
+	Tool      string `json:"tool"`
+	Args      string `json:"args"`
+	Risk      string `json:"risk"`
+	TenantID  string `json:"tenant_id"`
+}
+
 // Runs is the executor the handler drives.
 type Runs interface {
 	Invoke(ctx context.Context, req run.Request) (loop.Outcome, error)
@@ -45,6 +57,12 @@ type Runs interface {
 	// request was still waiting. remember turns an allow into a standing grant
 	// for that exact tool-and-arguments pair.
 	ResolveApproval(runID, requestID string, allow bool, reason string, remember bool) bool
+	// PendingApprovals lists one tenant's approvals still waiting in this
+	// process, so a client that missed the announcement can still show them.
+	PendingApprovals(tenantID string) []ApprovalRef
+	// ResolveApprovalKey settles one request by the id PendingApprovals returned.
+	// A request belonging to another tenant is not answerable here.
+	ResolveApprovalKey(requestID, tenantID string, allow bool, reason string, remember bool) bool
 	// Events reads the run's append-only audit log.
 	Events(ctx context.Context, runID string, query EventQuery) ([]*events.Event, error)
 }
@@ -67,6 +85,45 @@ func (h *Handler) Register(group *gin.RouterGroup) {
 	group.GET("/runs/:run_id/events", h.listEvents)
 	group.POST("/runs/:run_id/resume", h.resumeRun)
 	group.POST("/runs/:run_id/approvals/:request_id", h.resolveApproval)
+	group.GET("/approvals", h.listApprovals)
+	group.POST("/approvals/:request_id", h.resolveApprovalKey)
+}
+
+// listApprovals returns the approvals waiting in this process. The tenant of an
+// authenticated caller narrows the list; an operator endpoint that listed every
+// tenant's pending dangerous calls would leak what other tenants are doing.
+func (h *Handler) listApprovals(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "tenant is required"})
+		return
+	}
+	items := h.runs.PendingApprovals(tenantID)
+	if items == nil {
+		items = []ApprovalRef{}
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": items})
+}
+
+// resolveApprovalKey settles one request by the id the approval list handed out.
+// The run that owns it is found from the id, so a client does not have to track
+// which run announced it.
+func (h *Handler) resolveApprovalKey(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "tenant is required"})
+		return
+	}
+	var body approvalRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		return
+	}
+	if !h.runs.ResolveApprovalKey(c.Param("request_id"), tenantID, body.Allow, body.Reason, body.Remember) {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "approval request is not pending"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0})
 }
 
 // resumeRun continues a paused run. The request body is optional and only
@@ -81,7 +138,11 @@ func (h *Handler) resumeRun(c *gin.Context) {
 	if tenantID == "" {
 		tenantID = c.GetString("tenant_id")
 	}
-	outcome, err := h.runs.Resume(c.Request.Context(), run.Request{RunID: runID, TenantID: tenantID})
+	outcome, err := h.runs.Resume(c.Request.Context(), run.Request{
+		RunID:    runID,
+		TenantID: tenantID,
+		UserID:   c.GetString("user_id"),
+	})
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"code": 409, "message": err.Error()})
 		return
@@ -113,7 +174,10 @@ func (h *Handler) resolveApproval(c *gin.Context) {
 
 // createRunRequest is the accepted body.
 type createRunRequest struct {
-	TenantID    string   `json:"tenant_id"`
+	TenantID string `json:"tenant_id"`
+	// ModelRef names the model for this run. Empty falls back to the tenant's
+	// default model, so a deployment needs no process-wide model setting.
+	ModelRef    string   `json:"model_ref"`
 	AgentName   string   `json:"agent_name"`
 	UserMessage string   `json:"user_message"`
 	DatasetIDs  []string `json:"dataset_ids"`
@@ -143,6 +207,8 @@ func (h *Handler) createRun(c *gin.Context) {
 		RunID:       runID,
 		AgentID:     c.Param("agent_id"),
 		TenantID:    tenantID,
+		UserID:      c.GetString("user_id"),
+		ModelRef:    body.ModelRef,
 		AgentName:   body.AgentName,
 		UserMessage: body.UserMessage,
 		Trigger:     "api",
