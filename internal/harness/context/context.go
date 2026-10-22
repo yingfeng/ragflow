@@ -139,6 +139,7 @@ func (b *Builder) Build(system string, lessons []string, history []model.Message
 // proved the prompt does not fit, so the next attempt compacts harder instead of
 // failing the run.
 func (b *Builder) BuildWithTier(system string, lessons []string, history []model.Message, minTier Tier) []model.Message {
+	history = ensureToolOutputs(history)
 	systemContent := b.renderSystemWithinBudget(system, lessons)
 	limit := b.limit()
 	headroom := limit - b.tokens(systemContent)
@@ -505,4 +506,48 @@ func (b *Builder) estimate(messages []model.Message) int {
 		}
 	}
 	return total
+}
+
+// ensureToolOutputs gives every declared tool call a result.
+//
+// A provider rejects a request whose assistant message carries tool_calls that
+// no following tool message answers. The loop writes a result for every call it
+// runs, but a run that was cancelled, checkpointed mid-batch, or recovered from
+// a panic can leave the transcript one message short — and every later request
+// in that run would fail on a 400 instead of on anything the model did.
+//
+// The message is synthesized rather than dropped: the model needs to learn that
+// the call did not return, not that it was never asked.
+func ensureToolOutputs(history []model.Message) []model.Message {
+	var patched []model.Message
+	for index := 0; index < len(history); index++ {
+		message := history[index]
+		patched = append(patched, message)
+		if message.Role != model.RoleAssistant || len(message.ToolCalls) == 0 {
+			continue
+		}
+		answered := make(map[string]struct{}, len(message.ToolCalls))
+		next := index + 1
+		for next < len(history) && history[next].Role == model.RoleTool {
+			answered[history[next].ToolCallID] = struct{}{}
+			patched = append(patched, history[next])
+			next++
+		}
+		for _, call := range message.ToolCalls {
+			if _, ok := answered[call.ID]; ok {
+				continue
+			}
+			patched = append(patched, model.Message{
+				Role:       model.RoleTool,
+				ToolCallID: call.ID,
+				Name:       call.Name,
+				Content:    "[aborted] the call did not return a result",
+			})
+		}
+		index = next - 1
+	}
+	if patched == nil {
+		return history
+	}
+	return patched
 }

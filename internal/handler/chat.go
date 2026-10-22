@@ -372,8 +372,12 @@ func (h *ChatHandler) GetChat(c *gin.Context) {
 	// Build response (same as Python _build_chat_response)
 	// The service already returns GetChatResponse with DatasetIDs and KBNames
 	result := map[string]interface{}{
-		"id":                         chat.ID,
-		"tenant_id":                  chat.TenantID,
+		"id":        chat.ID,
+		"tenant_id": chat.TenantID,
+		// An agent-bound chat ignores the request's mode: every turn runs through
+		// the agent. Omitting the field here made a chat that runs as an agent
+		// indistinguishable from a plain chat on the settings screen.
+		"agent_id":                   chat.AgentID,
 		"name":                       chat.Name,
 		"description":                chat.Description,
 		"icon":                       chat.Icon,

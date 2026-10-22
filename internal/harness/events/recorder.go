@@ -324,6 +324,18 @@ func (r *EventRecorder) RecordMemoryRead(ctx context.Context, store, key string,
 	})
 }
 
+// RecordGrantPersisted records that an "allow always" answer became a standing
+// grant. The grant outlives the run and keeps letting calls through, so its
+// creation belongs to the durable audit trail, not to the run's trace.
+func (r *EventRecorder) RecordGrantPersisted(ctx context.Context, tenantID, tool, argsHash string) {
+	r.record(ctx, EventGrantPersisted, func(ev *Event) {
+		ev.Deterministic = true
+		ev.Metadata["tenant_id"] = tenantID
+		ev.Metadata["tool"] = tool
+		ev.Metadata["args_hash"] = argsHash
+	})
+}
+
 // RecordApproval records a human-in-the-loop decision: the request and the
 // verdict are separate events, so a pending request stays visible when an
 // operator never answers.

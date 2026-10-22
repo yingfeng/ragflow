@@ -42,6 +42,7 @@ func LayerOf(typ EventType) Layer {
 
 	case EventToolCallStart, EventToolCallResult, EventToolCallError,
 		EventApprovalRequest, EventApprovalGranted, EventApprovalDenied,
+		EventGrantPersisted,
 		EventSubAgentCallStart, EventSubAgentCallEnd,
 		EventError, EventMemoryWrite:
 		return LayerAudit

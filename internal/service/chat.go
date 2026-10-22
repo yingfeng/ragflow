@@ -1169,8 +1169,14 @@ func mergeJSONMap(base entity.JSONMap, patch map[string]interface{}) entity.JSON
 func (s *ChatService) buildRESTChatResponse(ctx context.Context, chat *entity.Chat) map[string]interface{} {
 	kbNames, datasetIDs := s.getDatasetNamesAndIDs(ctx, chat.KBIDs)
 	return map[string]interface{}{
-		"id":                         chat.ID,
-		"tenant_id":                  chat.TenantID,
+		"id":        chat.ID,
+		"tenant_id": chat.TenantID,
+		// A chat run by an agent is a different thing from a plain chat: the
+		// backend ignores the request's mode and routes every turn through the
+		// agent. Clients that read a single chat (settings, benchmark drivers)
+		// must be able to see that, so the field cannot live only in the list
+		// response.
+		"agent_id":                   chat.AgentID,
 		"name":                       chat.Name,
 		"description":                chat.Description,
 		"icon":                       chat.Icon,

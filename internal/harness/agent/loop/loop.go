@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -203,6 +204,16 @@ func Build(cfg Config) (*Runner, error) {
 				state.Steers++
 			}
 		}
+		// Budget pressure is reported as fact, once. What the model does with the
+		// fact is the model's decision: the limits themselves are already
+		// enforced by policy, and restating them as instructions only teaches a
+		// weak model to give up before the budget is actually spent.
+		if !state.BudgetNotified {
+			if notice := budgetNotice(state.Budget); notice != "" {
+				state.BudgetNotified = true
+				state.History = append(state.History, model.Message{Role: model.RoleUser, Content: notice})
+			}
+		}
 
 		var lessons []string
 		if deps.Lessons != nil {
@@ -344,6 +355,17 @@ func Build(cfg Config) (*Runner, error) {
 		results := make([]toolkit.Result, len(calls))
 		failures := make([]error, len(calls))
 
+		// A resumed run inherits the batch the dead process had dispatched.
+		// Running a read-only call again costs nothing and recovers the progress;
+		// running a state-changing call again can duplicate the effect it may have
+		// already produced before the crash. Those are reported as unresolved so
+		// the model decides, which is also what the reference runtime does: recovery
+		// restores history, it does not grant replay authority.
+		resumeGuard := IsResumed(ctx) && !state.ResumeHandled
+		if resumeGuard {
+			state.ResumeHandled = true
+		}
+
 		// A graded breaker on repetition. The first repeats are allowed — a model
 		// retrying after a transient failure is doing the right thing — but past
 		// maxRepeatedToolCalls the same call is refused with an explanation, so a
@@ -372,6 +394,12 @@ func Build(cfg Config) (*Runner, error) {
 
 		invoke := func(index int) {
 			call := calls[index]
+			if resumeGuard && !deps.Registry.Parallelizable(call.Tool) {
+				results[index] = toolkit.ErrorResult(fmt.Errorf(
+					"the %q call was dispatched before this run was interrupted and may already have taken effect, so it was not repeated; check the outcome or retry with different arguments",
+					call.Tool))
+				return
+			}
 			if blocked[index] {
 				results[index] = toolkit.ErrorResult(fmt.Errorf(
 					"identical call to %q has already run %d times; change the arguments or answer with what you have",
@@ -457,7 +485,7 @@ func Build(cfg Config) (*Runner, error) {
 		for index, call := range calls {
 			result := results[index]
 			if failures[index] != nil {
-				result = toolkit.ErrorResult(failures[index])
+				result = toolkit.ErrorResult(describeAbort(failures[index]))
 			}
 			state.Budget.ToolCalls++
 			// Progress is measured on what the tool returned, not on what one
@@ -791,11 +819,28 @@ func (r *Runner) Invoke(ctx context.Context, input *Input, config *types.Runnabl
 }
 
 // Resume loads the checkpoint for runID and continues.
+//
+// The resumed marker tells act that its pending batch was dispatched by a run
+// that died: a call may have taken effect without recording a result, so
+// re-running it is not the same as retrying it.
 func (r *Runner) Resume(ctx context.Context, runID string) (Outcome, error) {
 	config := types.NewRunnableConfig()
 	config.ThreadID = runID
 	config.Configurable[constants.ConfigKeyThreadID] = runID
-	return r.Invoke(ctx, nil, config)
+	return r.Invoke(markResumed(ctx), nil, config)
+}
+
+type resumedKey struct{}
+
+func markResumed(ctx context.Context) context.Context {
+	return context.WithValue(ctx, resumedKey{}, true)
+}
+
+// IsResumed reports whether this process took over the run from a checkpoint
+// written by an earlier one.
+func IsResumed(ctx context.Context) bool {
+	resumed, _ := ctx.Value(resumedKey{}).(bool)
+	return resumed
 }
 
 // registerRuntimeCapabilities installs the capabilities the loop itself depends
@@ -1004,6 +1049,43 @@ func renderPlan(plan []toolkit.PlanStep, concluding bool) string {
 		b.WriteString("Every step is complete: answer the question now.\n")
 	}
 	return b.String()
+}
+
+// describeAbort turns a cancellation into a fact the model can act on.
+//
+// A raw "context canceled" reads like a tool failure, and failures invite
+// retries of calls that were stopped on purpose. The truth is uncertainty: the
+// call may have completed, and the model must not assume either way.
+func describeAbort(err error) error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return errors.New("the run's time budget ran out before this call returned; it may or may not have completed — do not assume it failed")
+	case errors.Is(err, context.Canceled):
+		return errors.New("this run was stopped before the call returned; it may or may not have completed — do not assume it failed")
+	}
+	return err
+}
+
+// budgetNotice reports the spend as fact when any budget is at least four
+// fifths gone. Facts only: the model decides what to do with them.
+func budgetNotice(budget Budget) string {
+	var parts []string
+	if budget.MaxTokens > 0 {
+		used := budget.TokensIn + budget.TokensOut
+		if used*5 >= budget.MaxTokens*4 {
+			parts = append(parts, fmt.Sprintf("%d of %d tokens used", used, budget.MaxTokens))
+		}
+	}
+	if budget.MaxToolCalls > 0 && budget.ToolCalls*5 >= budget.MaxToolCalls*4 {
+		parts = append(parts, fmt.Sprintf("%d of %d tool calls made", budget.ToolCalls, budget.MaxToolCalls))
+	}
+	if budget.MaxWallMS > 0 && budget.ElapsedMS*5 >= budget.MaxWallMS*4 {
+		parts = append(parts, fmt.Sprintf("%d of %d ms elapsed", budget.ElapsedMS, budget.MaxWallMS))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Budget status: " + strings.Join(parts, "; ") + "."
 }
 
 func idempotencyKey(tool, arguments string) string {

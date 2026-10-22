@@ -52,6 +52,10 @@ const (
 	EventApprovalRequest EventType = "approval.request"
 	EventApprovalGranted EventType = "approval.granted"
 	EventApprovalDenied  EventType = "approval.denied"
+	// EventGrantPersisted records a "allow always" answer that became a
+	// standing grant: the standing permission is a security-relevant change
+	// outliving the run that created it, so its creation is durable audit.
+	EventGrantPersisted EventType = "approval.grant.persisted"
 
 	// Checkpoint.
 	EventCheckpointCreated  EventType = "checkpoint.created"

@@ -64,14 +64,24 @@ type HarnessAgentRun struct {
 	// UserID is the actor the run acted for. It is persisted because model access
 	// resolves per user: a recovered run without it could resume on a provider
 	// the caller never selected.
-	UserID     string     `gorm:"column:user_id;size:64;default:'';index" json:"user_id"`
-	Status     string     `gorm:"column:status;size:32;not null;default:'running';index" json:"status"`
-	Trigger    string     `gorm:"column:trigger;size:32;default:'api'" json:"trigger"`
-	Input      string     `gorm:"column:input;type:longtext" json:"input"`
-	Output     string     `gorm:"column:output;type:longtext" json:"output"`
+	UserID  string `gorm:"column:user_id;size:64;default:'';index" json:"user_id"`
+	Status  string `gorm:"column:status;size:32;not null;default:'running';index" json:"status"`
+	Trigger string `gorm:"column:trigger;size:32;default:'api'" json:"trigger"`
+	Input   string `gorm:"column:input;type:longtext" json:"input"`
+	Output  string `gorm:"column:output;type:longtext" json:"output"`
+	// Scope is the run's data reach (tenant, datasets, docs) as JSON. It is
+	// persisted because a recovered run rebuilds its tools from scratch: without
+	// it the run would resume with the recovering worker's reach instead of the
+	// one the caller was granted.
+	Scope      string     `gorm:"column:scope;type:text" json:"scope"`
 	Error      string     `gorm:"column:error;type:text" json:"error"`
 	LeaseOwner string     `gorm:"column:lease_owner;size:128;default:''" json:"lease_owner"`
 	LeaseUntil *time.Time `gorm:"column:lease_until" json:"lease_until,omitempty"`
+	// Generation fences run writes. Every lease handover bumps it, and terminal
+	// writes carry the generation they saw: a worker that lost its lease (or a
+	// worker that woke from a long GC pause after recovery took over) cannot
+	// overwrite the successor's run record.
+	Generation int        `gorm:"column:generation;not null;default:0" json:"generation"`
 	StartedAt  *time.Time `gorm:"column:started_at" json:"started_at,omitempty"`
 	EndedAt    *time.Time `gorm:"column:ended_at" json:"ended_at,omitempty"`
 	TokensIn   int        `gorm:"column:tokens_in;default:0" json:"tokens_in"`
@@ -181,3 +191,18 @@ type HarnessAgentLesson struct {
 
 // TableName returns the table name.
 func (HarnessAgentLesson) TableName() string { return "agent_lesson" }
+
+// HarnessLeaderLease is the singleton ticket for background maintenance work
+// (run recovery, retention). One row per task name: in a multi-replica
+// deployment only the lease holder runs the sweep, so recovery scans the same
+// crash once instead of once per replica.
+type HarnessLeaderLease struct {
+	ID         string     `gorm:"column:id;primaryKey;size:64" json:"id"`
+	Owner      string     `gorm:"column:owner;size:128;default:''" json:"owner"`
+	Until      *time.Time `gorm:"column:until" json:"until,omitempty"`
+	CreateTime time.Time  `gorm:"column:create_time;autoCreateTime" json:"create_time"`
+	UpdateTime time.Time  `gorm:"column:update_time;autoUpdateTime" json:"update_time"`
+}
+
+// TableName returns the table name.
+func (HarnessLeaderLease) TableName() string { return "harness_leader_lease" }

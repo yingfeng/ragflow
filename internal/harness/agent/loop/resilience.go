@@ -2,6 +2,8 @@ package loop
 
 import (
 	"context"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +28,10 @@ const (
 	modelRetryBase = 300 * time.Millisecond
 	// modelRetryCeiling caps the backoff.
 	modelRetryCeiling = 3 * time.Second
+	// modelRetryAfterCeiling caps a provider-stated wait. It is separate from
+	// the backoff ceiling because a rate limiter asking for 30 seconds is
+	// telling the truth; the local curve is only a guess.
+	modelRetryAfterCeiling = 60 * time.Second
 	// maxRepeatedToolCalls is how often one identical call may run before act
 	// refuses it. One repeat is a retry; three is a loop.
 	maxRepeatedToolCalls = 3
@@ -90,6 +96,30 @@ func modelBackoff(attempt int) time.Duration {
 	return delay
 }
 
+// retryAfterPattern matches the wait a provider driver appends to its error text
+// when the response carried a Retry-After header.
+var retryAfterPattern = regexp.MustCompile(`retry-after:\s*(\d+)`)
+
+// modelRetryDelay prefers the provider's own wait over the local backoff curve.
+//
+// Retrying before a provider's stated wait is guaranteed to fail again, and it
+// spends an attempt to learn that. The ceiling still applies: one provider
+// answering Retry-After: 3600 must not stall the run for an hour.
+func modelRetryDelay(err error, attempt int) time.Duration {
+	if err != nil {
+		if match := retryAfterPattern.FindStringSubmatch(strings.ToLower(err.Error())); len(match) == 2 {
+			if seconds, convErr := strconv.Atoi(match[1]); convErr == nil && seconds > 0 {
+				delay := time.Duration(seconds) * time.Second
+				if delay < modelRetryAfterCeiling {
+					return delay
+				}
+				return modelRetryAfterCeiling
+			}
+		}
+	}
+	return modelBackoff(attempt)
+}
+
 // callModel retries transient provider failures. Prompt-too-long is not retried
 // here: it needs the prompt rebuilt, which is the caller's decision.
 //
@@ -115,7 +145,7 @@ func callModel(ctx context.Context, mdl model.Model, request model.Request, brea
 			}
 			return model.Response{}, err
 		}
-		timer := time.NewTimer(modelBackoff(attempt))
+		timer := time.NewTimer(modelRetryDelay(err, attempt))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -161,7 +191,7 @@ func callModelStreaming(ctx context.Context, streamer model.Streamer, request mo
 			}
 			return model.Response{}, err
 		}
-		timer := time.NewTimer(modelBackoff(attempt))
+		timer := time.NewTimer(modelRetryDelay(err, attempt))
 		select {
 		case <-ctx.Done():
 			timer.Stop()

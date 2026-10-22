@@ -4,6 +4,10 @@ package run
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -104,6 +108,18 @@ type Service struct {
 	inboxes     map[string]*loop.Inbox
 	subscribers map[string][]chan Event
 	seqs        map[string]int
+	// generations holds the lease generation each owned run was entered under.
+	// A terminal write with a stale number is a fence violation: the run moved
+	// on with another worker.
+	generations map[string]int
+	// leaseLost marks runs whose lease was taken while they were executing.
+	// Another worker owns the record now, so this worker stops and writes no
+	// terminal state: its write would be fenced, and the tokens it would spend
+	// finish an answer nobody will read.
+	leaseLost map[string]bool
+	// userCancels marks runs the user stopped, so closeRun can tell a user
+	// cancellation from a timeout or an internal failure.
+	userCancels map[string]bool
 }
 
 // New builds the service from a loop configuration.
@@ -134,6 +150,9 @@ func New(cfg Config) (*Service, error) {
 		inboxes:     make(map[string]*loop.Inbox),
 		subscribers: make(map[string][]chan Event),
 		seqs:        make(map[string]int),
+		generations: make(map[string]int),
+		leaseLost:   make(map[string]bool),
+		userCancels: make(map[string]bool),
 	}
 
 	// Chain the loop's trace sink so every step is both persisted and streamed.
@@ -163,7 +182,8 @@ func (s *Service) Invoke(ctx context.Context, req Request) (loop.Outcome, error)
 		req.Trigger = "api"
 	}
 
-	if err := s.openRun(ctx, req); err != nil {
+	generation, err := s.openRun(ctx, req)
+	if err != nil {
 		return loop.Outcome{}, err
 	}
 	s.broadcast(req.RunID, Event{Type: EventRunStarted, RunID: req.RunID})
@@ -182,7 +202,7 @@ func (s *Service) Invoke(ctx context.Context, req Request) (loop.Outcome, error)
 	runCtx = s.withAudit(runCtx, req.RunID)
 
 	// Keep the lease alive for long runs; the heartbeat stops with the run.
-	stopHeartbeat := s.startHeartbeat(runCtx, req.RunID)
+	stopHeartbeat := s.startHeartbeat(runCtx, req.RunID, generation, cancel)
 	defer stopHeartbeat()
 
 	audit := events.RecorderFromContext(runCtx)
@@ -205,17 +225,24 @@ func (s *Service) Invoke(ctx context.Context, req Request) (loop.Outcome, error)
 	return outcome, err
 }
 
+// ErrOwnedByAnotherWorker reports that a run could not be entered because a
+// live lease holds it. Recovery must not treat this as a broken run: the winner
+// is executing it right now.
+var ErrOwnedByAnotherWorker = errors.New("run is owned by another worker")
+
 // Resume continues an interrupted run from its checkpoint.
 func (s *Service) Resume(ctx context.Context, req Request) (loop.Outcome, error) {
 	if req.RunID == "" {
 		return loop.Outcome{}, fmt.Errorf("run: run id is required to resume")
 	}
-	if ok, err := s.claim(ctx, req.RunID); err != nil {
+	claimed, generation, err := s.claim(ctx, req.RunID)
+	if err != nil {
 		return loop.Outcome{}, err
-	} else if !ok {
-		return loop.Outcome{}, fmt.Errorf("run: %s is owned by another worker", req.RunID)
 	}
-	defer s.releaseLease(ctx, req.RunID)
+	if !claimed {
+		return loop.Outcome{}, s.claimFailure(ctx, req.RunID)
+	}
+	s.rememberGeneration(req.RunID, generation)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	inbox := loop.NewInbox()
@@ -227,6 +254,12 @@ func (s *Service) Resume(ctx context.Context, req Request) (loop.Outcome, error)
 	runCtx = spill.WithStore(runCtx, spill.New(32))
 	runCtx = loop.WithInbox(runCtx, inbox)
 	runCtx = s.withAudit(runCtx, req.RunID)
+
+	// A resumed run can outlive one lease period just like a fresh one: without
+	// the heartbeat its lease expires mid-run, the next sweep reads it as
+	// crashed and a second worker executes the same run.
+	stopHeartbeat := s.startHeartbeat(runCtx, req.RunID, generation, cancel)
+	defer stopHeartbeat()
 
 	audit := events.RecorderFromContext(runCtx)
 	if audit != nil {
@@ -256,48 +289,16 @@ func (s *Service) withAudit(ctx context.Context, runID string) context.Context {
 	return events.ContextWithRecorder(ctx, recorder)
 }
 
-// Recover resumes the runs a dead worker left behind and reports how many were
-// picked up. A run whose checkpoint cannot be resumed is closed as failed:
-// leaving it "running" hides the crash from every operator view and keeps the
-// lease row alive forever.
-//
-// Runs created within the last two lease periods are skipped — they may belong
-// to a worker that is still starting, and stealing them would double-execute a
-// healthy run.
-func (s *Service) Recover(ctx context.Context) (int, error) {
-	if s.store == nil {
-		return 0, fmt.Errorf("run: persistence is not configured")
-	}
-	runs, err := s.store.ListRecoverable(ctx, 50)
-	if err != nil {
-		return 0, err
-	}
-	cutoff := time.Now().Add(-2 * s.leaseTTL)
-	recovered := 0
-	for _, item := range runs {
-		if item.CreateTime.After(cutoff) {
-			continue
-		}
-		if err := s.store.ReclaimLease(ctx, item.ID); err != nil {
-			continue
-		}
-		if _, err := s.Resume(ctx, Request{
-			RunID:    item.ID,
-			TenantID: item.TenantID,
-			AgentID:  item.AgentID,
-		}); err != nil {
-			_ = s.store.MarkFailed(ctx, item.ID, "recovery failed: "+err.Error())
-			continue
-		}
-		recovered++
-	}
-	return recovered, nil
-}
-
-// Cancel stops a running run. It reports whether the run was owned here.
+// Cancel stops a running run on the user's behalf. It reports whether the run
+// was owned here.
 func (s *Service) Cancel(runID string) bool {
 	s.mu.Lock()
 	cancel, ok := s.cancels[runID]
+	if ok {
+		// Remember who asked: closeRun must record a user stop as cancelled,
+		// not as a failure, and the model must not read it as a crash either.
+		s.userCancels[runID] = true
+	}
 	s.mu.Unlock()
 	if !ok {
 		return false
@@ -343,9 +344,36 @@ func (s *Service) ResolveApproval(runID, requestID string, allow bool, reason st
 		return false
 	}
 	if remember && allow && s.grants != nil && hasPending && pending.TenantID != "" {
-		_ = s.grants.Remember(context.Background(), toolkit.GrantFor(pending.TenantID, pending.Call))
+		if err := s.grants.Remember(context.Background(), toolkit.GrantFor(pending.TenantID, pending.Call)); err == nil {
+			// A standing grant is a permission change that outlives the run:
+			// the audit trail must show who widened what, or the grant is an
+			// unreviewable hole in the approval policy.
+			s.recordGrant(runID, pending.TenantID, pending.Call)
+		}
 	}
 	return true
+}
+
+// recordGrant writes the grant-persisted audit fact with a recorder scoped to
+// the run that created it.
+func (s *Service) recordGrant(runID, tenantID string, call toolkit.Call) {
+	if s.events == nil {
+		return
+	}
+	recorder := events.NewEventRecorder(s.events,
+		events.WithTraceID(runID),
+		events.WithThreadID(runID),
+		events.WithLayers(s.eventLayers),
+	)
+	recorder.RecordGrantPersisted(context.Background(), tenantID, call.Tool, argumentsFingerprint(call.Arguments))
+}
+
+// argumentsFingerprint identifies the arguments a grant covers without copying
+// them into the audit trail: arguments can carry user data, and an audit log
+// must not become a second copy of it.
+func argumentsFingerprint(arguments string) string {
+	sum := sha256.Sum256([]byte(arguments))
+	return hex.EncodeToString(sum[:8])
 }
 
 // Steps returns the persisted audit trail of a run.
@@ -356,9 +384,11 @@ func (s *Service) Steps(ctx context.Context, runID string) ([]entity.HarnessAgen
 	return s.store.ListSteps(ctx, runID, 0)
 }
 
-func (s *Service) openRun(ctx context.Context, req Request) error {
+// openRun creates the run row and enters it, returning the lease generation the
+// caller now holds.
+func (s *Service) openRun(ctx context.Context, req Request) (int, error) {
 	if s.store == nil {
-		return nil
+		return 0, nil
 	}
 	run := &entity.HarnessAgentRun{
 		ID:             req.RunID,
@@ -370,35 +400,67 @@ func (s *Service) openRun(ctx context.Context, req Request) error {
 		Status:         "pending",
 		Trigger:        req.Trigger,
 		Input:          req.UserMessage,
+		Scope:          scopeJSON(req.Scope),
 	}
 	if err := s.store.CreateRun(ctx, run); err != nil {
-		return err
+		return 0, err
 	}
-	if ok, err := s.claim(ctx, req.RunID); err != nil {
-		return err
-	} else if !ok {
-		return fmt.Errorf("run: %s is owned by another worker", req.RunID)
+	ok, generation, err := s.claim(ctx, req.RunID)
+	if err != nil {
+		return 0, err
 	}
+	if !ok {
+		return 0, fmt.Errorf("run: %s: %w", req.RunID, ErrOwnedByAnotherWorker)
+	}
+	s.rememberGeneration(req.RunID, generation)
 	if err := s.store.StartRun(ctx, req.RunID); err != nil {
-		return err
+		return 0, err
 	}
-	return nil
+	return generation, nil
 }
 
 func (s *Service) closeRun(ctx context.Context, runID string, outcome loop.Outcome, runErr error) {
 	status := "done"
 	message := ""
-	if runErr != nil {
+	switch {
+	case s.takeUserCancel(runID) && (runErr == nil || errors.Is(runErr, context.Canceled)):
+		// A stopped run is not a failure: the operator asked for it, and a
+		// failure status would page someone for a decision that was made on
+		// purpose.
+		status = "cancelled"
+		message = "cancelled by user"
+	case runErr != nil:
 		status = "failed"
 		message = runErr.Error()
-	} else if outcome.Interrupted {
+	case outcome.Interrupted:
 		status = "paused"
-	} else if outcome.Stopped != "" {
+	case outcome.Stopped != "":
 		status = "finished"
 	}
 
 	if s.store != nil {
-		_ = s.store.FinishRun(ctx, runID, status, outcome.Text, message, outcome.TokensIn, outcome.TokensOut, outcome.CostUSD)
+		if s.takeLeaseLost(runID) {
+			// The run belongs to a successor now. It may already have written
+			// the answer, so this worker's terminal state would either be
+			// fenced out or, worse, race the successor's own write.
+			s.recordLeaseLost(ctx, runID)
+		} else {
+			// The caller's context may already be cancelled (client hung up).
+			// The terminal write is not part of that request: losing it leaves
+			// the run "running", and the next sweep re-executes finished work.
+			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			applied, err := s.store.FinishRun(writeCtx, runID, s.generationOf(runID),
+				status, outcome.Text, message, outcome.TokensIn, outcome.TokensOut, outcome.CostUSD)
+			switch {
+			case err != nil:
+				// Recording the end must never mask the run's own outcome.
+			case !applied:
+				// The lease changed hands mid-run (recovery, restart) and a
+				// successor owns the run now.
+				s.recordLeaseLost(ctx, runID)
+			}
+			cancel()
+		}
 	}
 
 	event := Event{Type: EventRunFinished, RunID: runID, Outcome: &outcome}
@@ -408,21 +470,91 @@ func (s *Service) closeRun(ctx context.Context, runID string, outcome loop.Outco
 	s.broadcast(runID, event)
 }
 
-func (s *Service) claim(ctx context.Context, runID string) (bool, error) {
+// recordLeaseLost writes the fence violation to the audit trail: a run whose
+// terminal write was rejected means ownership moved, and an operator reading the
+// trace needs that fact next to the work that was thrown away.
+func (s *Service) recordLeaseLost(ctx context.Context, runID string) {
+	if recorder := events.RecorderFromContext(ctx); recorder != nil {
+		recorder.RecordError(ctx, "run "+runID+" was taken over by another worker: its terminal write was dropped")
+	}
+}
+
+// scopeJSON persists the run's data reach so a recovered run keeps the reach it
+// was started with instead of inheriting whatever the recovering worker has.
+func scopeJSON(scope toolkit.Scope) string {
+	encoded, err := json.Marshal(scope)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+// rememberGeneration records the lease generation a run was entered under.
+func (s *Service) rememberGeneration(runID string, generation int) {
+	s.mu.Lock()
+	s.generations[runID] = generation
+	s.mu.Unlock()
+}
+
+func (s *Service) generationOf(runID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.generations[runID]
+}
+
+func (s *Service) takeUserCancel(runID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cancelled := s.userCancels[runID]
+	delete(s.userCancels, runID)
+	return cancelled
+}
+
+func (s *Service) markLeaseLost(runID string) {
+	s.mu.Lock()
+	s.leaseLost[runID] = true
+	s.mu.Unlock()
+}
+
+func (s *Service) takeLeaseLost(runID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lost := s.leaseLost[runID]
+	delete(s.leaseLost, runID)
+	return lost
+}
+
+func (s *Service) claim(ctx context.Context, runID string) (bool, int, error) {
 	if s.store == nil {
-		return true, nil
+		return true, 0, nil
 	}
 	return s.store.AcquireLease(ctx, runID, s.owner, time.Now().Add(s.leaseTTL))
 }
 
-func (s *Service) releaseLease(ctx context.Context, runID string) {
-	if s.store == nil {
-		return
+// claimFailure explains why a lease could not be taken. The distinction is not
+// cosmetic: an operator resuming a finished run needs to hear that, and recovery
+// must not read "somebody owns this" as "this run is broken".
+func (s *Service) claimFailure(ctx context.Context, runID string) error {
+	record, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
 	}
-	_ = s.store.ReleaseLease(ctx, runID)
+	if record == nil {
+		return fmt.Errorf("run %s does not exist", runID)
+	}
+	switch record.Status {
+	case "done", "finished", "failed", "cancelled":
+		return fmt.Errorf("run %s already ended (%s) and cannot be resumed", runID, record.Status)
+	}
+	return fmt.Errorf("run %s: %w", runID, ErrOwnedByAnotherWorker)
 }
 
-func (s *Service) startHeartbeat(ctx context.Context, runID string) func() {
+// startHeartbeat extends the lease until the run returns. It renews rather than
+// re-acquires: a renewal cannot bump the generation, so the heartbeat can never
+// fence the run it is keeping alive. When the renewal stops matching the row,
+// the run has moved on and the loop is cancelled instead of spending more
+// tokens on an answer this worker will not be allowed to record.
+func (s *Service) startHeartbeat(ctx context.Context, runID string, generation int, cancel context.CancelFunc) func() {
 	if s.store == nil {
 		return func() {}
 	}
@@ -438,7 +570,18 @@ func (s *Service) startHeartbeat(ctx context.Context, runID string) func() {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-				_, _ = s.store.AcquireLease(ctx, runID, s.owner, time.Now().Add(s.leaseTTL))
+				renewed, err := s.store.RenewLease(ctx, runID, s.owner, generation, time.Now().Add(s.leaseTTL))
+				if err != nil {
+					// A transient store failure is not a lost lease: the next
+					// tick retries while the current lease is still valid.
+					continue
+				}
+				if renewed {
+					continue
+				}
+				s.markLeaseLost(runID)
+				cancel()
+				return
 			}
 		}
 	}()
@@ -465,6 +608,9 @@ func (s *Service) unregisterRun(runID string) {
 	s.mu.Lock()
 	delete(s.cancels, runID)
 	delete(s.inboxes, runID)
+	delete(s.generations, runID)
+	delete(s.leaseLost, runID)
+	delete(s.userCancels, runID)
 	s.mu.Unlock()
 }
 

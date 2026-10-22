@@ -2,12 +2,17 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
 
+	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
 	"ragflow/internal/harness"
@@ -29,8 +34,9 @@ import (
 // approval broker come from the process-wide state, so an approval raised by an
 // API run can be answered next to one raised by a chat turn.
 type harnessManager struct {
-	settings harness.Settings
-	proc     *service.HarnessProcess
+	settings   harness.Settings
+	proc       *service.HarnessProcess
+	sweepOwner string
 
 	mu       sync.Mutex
 	runtimes map[string]*harness.Runtime
@@ -40,7 +46,11 @@ func newHarnessManager() *harnessManager {
 	return &harnessManager{
 		settings: harness.LoadSettings(),
 		proc:     service.SharedHarnessProcess(),
-		runtimes: make(map[string]*harness.Runtime),
+		// The sweep identifies itself in the leader lease. A per-process id
+		// keeps two replicas from renewing each other's ticket; a restarted
+		// replica simply waits for the old ticket to expire.
+		sweepOwner: "recover-" + uuid.NewString(),
+		runtimes:   make(map[string]*harness.Runtime),
 	}
 }
 
@@ -183,13 +193,45 @@ func (m *harnessManager) Events(ctx context.Context, runID string, query harness
 	return m.proc.Events.Range(ctx, 0, 0, filter)
 }
 
+// Resume rebuilds one run's runtime and continues it from its checkpoint.
+//
+// The caller knows a run id and little else, so the row supplies the identity
+// and the data reach the run was started with. Resuming with an empty scope is
+// not a harmless default: the retrieval tools read an empty dataset list as the
+// whole tenant, which would hand a recovered run more data than the caller who
+// started it was granted.
 func (m *harnessManager) Resume(ctx context.Context, req run.Request) (loop.Outcome, error) {
+	req = m.adoptRunRecord(ctx, req)
 	runtime, err := m.buildRuntime(ctx, req)
 	if err != nil {
 		return loop.Outcome{}, err
 	}
 	defer m.track(req.RunID, runtime)()
 	return runtime.Service.Resume(ctx, req)
+}
+
+// adoptRunRecord fills a resume request from the run row it names.
+func (m *harnessManager) adoptRunRecord(ctx context.Context, req run.Request) run.Request {
+	record, err := m.proc.Store.GetRun(ctx, req.RunID)
+	if err != nil || record == nil {
+		return req
+	}
+	if req.TenantID == "" {
+		req.TenantID = record.TenantID
+	}
+	if req.UserID == "" {
+		req.UserID = record.UserID
+	}
+	if req.AgentID == "" {
+		req.AgentID = record.AgentID
+	}
+	if req.AgentVersionID == "" {
+		req.AgentVersionID = record.AgentVersionID
+	}
+	if scope, ok := decodeScope(record.Scope); ok {
+		req.Scope = scope
+	}
+	return req
 }
 
 func (m *harnessManager) ResolveApproval(runID, requestID string, allow bool, reason string, remember bool) bool {
@@ -248,27 +290,96 @@ func (m *harnessManager) ResolveApprovalKey(requestID, tenantID string, allow bo
 	return true
 }
 
+// recoverTask names the sweep in the leader lease table.
+const recoverTask = "run-recovery"
+
 // recoverAll resumes the runs a previous worker left behind.
+//
+// One replica sweeps. Every replica scanning the same crashed runs turns
+// recovery into a race for leases the losers had no business touching, and the
+// loser of such a race must not be allowed to react by failing the run the
+// winner is executing — hence the leader ticket and the ownership check below.
+//
+// Runs created within the last two lease periods are skipped: they may belong to
+// a worker that is still starting, and stealing them would execute a healthy
+// run twice.
 func (m *harnessManager) recoverAll(ctx context.Context) (int, error) {
+	// The ticket outlives one sweep interval: taking it for exactly the interval
+	// would let it lapse at the moment the holder renews it.
+	leader, err := m.proc.Store.TryAcquireLeaderLease(ctx, recoverTask, m.sweepOwner, time.Now().Add(3*run.DefaultLeaseTTL))
+	if err != nil {
+		return 0, err
+	}
+	if !leader {
+		return 0, nil
+	}
 	runs, err := m.proc.Store.ListRecoverable(ctx, 50)
 	if err != nil {
 		return 0, err
 	}
+	cutoff := time.Now().Add(-2 * run.DefaultLeaseTTL)
 	recovered := 0
 	for _, item := range runs {
-		if _, err := m.Resume(ctx, run.Request{
-			RunID:    item.ID,
-			TenantID: item.TenantID,
-			UserID:   item.UserID,
-			AgentID:  item.AgentID,
-			Scope:    toolkit.Scope{TenantID: item.TenantID},
-		}); err != nil {
-			_ = m.proc.Store.MarkFailed(ctx, item.ID, "recovery failed: "+err.Error())
+		if item.CreateTime.After(cutoff) {
 			continue
 		}
-		recovered++
+		// A run that still looks leased must be cleared first, and the clear is
+		// conditional: a worker that renewed between the scan and the clear
+		// keeps its run. A run with no lease at all is claimed by Resume itself.
+		if item.LeaseOwner != "" {
+			if reclaimed, err := m.proc.Store.ReclaimLease(ctx, item.ID); err != nil || !reclaimed {
+				continue
+			}
+		}
+		_, err := m.Resume(ctx, run.Request{RunID: item.ID})
+		if err == nil {
+			recovered++
+			continue
+		}
+		if errors.Is(err, run.ErrOwnedByAnotherWorker) {
+			// Somebody else is running it. Failing it here would close a run
+			// that is working.
+			continue
+		}
+		// The checkpoint cannot be resumed (or the runtime cannot be rebuilt):
+		// leaving the run "running" hides the crash from every operator view.
+		_ = m.proc.Store.MarkFailed(ctx, item.ID, "recovery failed: "+err.Error())
 	}
 	return recovered, nil
+}
+
+// decodeScope reads the data reach a run was started with. A row written before
+// the scope column existed decodes to nothing, so the caller keeps its own
+// tenant-only scope rather than a zero value that would read as "no
+// restriction" downstream.
+func decodeScope(raw string) (toolkit.Scope, bool) {
+	if raw == "" {
+		return toolkit.Scope{}, false
+	}
+	var scope toolkit.Scope
+	if err := json.Unmarshal([]byte(raw), &scope); err != nil || scope.TenantID == "" {
+		return toolkit.Scope{}, false
+	}
+	return scope, true
+}
+
+// sweep recovers crashed runs for the lifetime of the process. Recovering only
+// at startup would pick up a dead worker's runs when some replica happens to
+// restart, so a deployment that stays up for weeks would keep them "running"
+// for weeks.
+func (m *harnessManager) sweep(ctx context.Context) {
+	ticker := time.NewTicker(2 * run.DefaultLeaseTTL)
+	defer ticker.Stop()
+	for {
+		if _, err := m.recoverAll(ctx); err != nil {
+			common.Warn("harness: run recovery sweep failed", zap.Error(err))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // registerHarness mounts the harness API.
@@ -284,9 +395,7 @@ func registerHarness(routerInstance *router.Router) {
 		group.Use(bindCallerTenant())
 		handler.Register(group)
 	})
-	go func() {
-		_, _ = manager.recoverAll(context.Background())
-	}()
+	go manager.sweep(context.Background())
 }
 
 // tenantOfUser resolves the tenant a user acts as. The chat services resolve it

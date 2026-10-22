@@ -171,6 +171,38 @@ func TestPatchChatHandlerSuccess(t *testing.T) {
 	}
 }
 
+// A chat that runs as an agent must say so when read back: the difference decides
+// which pipeline a turn takes, and the settings screen — or any client reading one
+// chat instead of the list — cannot infer it from anything else.
+func TestGetChatHandlerReturnsAgentID(t *testing.T) {
+	db := setupChatHandlerTestDB(t)
+	createChatHandlerTestChat(t, db, "chat-1", "user-1")
+	if err := db.Model(&entity.Chat{}).Where("id = ?", "chat-1").Update("agent_id", "agent-1").Error; err != nil {
+		t.Fatalf("link agent: %v", err)
+	}
+
+	h := NewChatHandler(service.NewChatService(), service.NewUserService())
+	c, w := setupGinContextWithUser("GET", "/api/v1/chats/chat-1", "")
+	c.Params = []gin.Param{{Key: "chat_id", Value: "chat-1"}}
+
+	h.GetChat(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	data, ok := resp["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected object data, got %+v", resp["data"])
+	}
+	if data["agent_id"] != "agent-1" {
+		t.Fatalf("agent_id = %v, want agent-1", data["agent_id"])
+	}
+}
+
 func TestUpdateChatHandlerRejectsNonOwner(t *testing.T) {
 	db := setupChatHandlerTestDB(t)
 	createChatHandlerTestChat(t, db, "chat-1", "tenant-2")

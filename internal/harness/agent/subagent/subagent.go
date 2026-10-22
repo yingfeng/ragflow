@@ -125,8 +125,13 @@ func (s *Spawner) runnerFor(maxRounds int) (*loop.Runner, error) {
 	return runner, nil
 }
 
-// openChild records the child run before it starts, so a parent crash leaves a
-// row that recovery can find instead of an anonymous orphan.
+// openChild records the child run before it starts, so the delegation is
+// visible and attributable instead of an anonymous orphan.
+//
+// A child holds no lease: the spawner that started it owns the call and blocks
+// on it. Recovery therefore skips child rows (ListRecoverable) — "no live
+// lease" says nothing about a child that is still running — and resumes the
+// parent instead, which re-enters the delegation from its checkpoint.
 func (s *Spawner) openChild(ctx context.Context, runID, parentRunID string, req subagent.Request) {
 	if s.store == nil || parentRunID == "" {
 		return
@@ -158,7 +163,10 @@ func (s *Spawner) closeChild(ctx context.Context, runID string, outcome loop.Out
 		status = "failed"
 		message = runErr.Error()
 	}
-	_ = s.store.FinishRun(ctx, runID, status, outcome.Text, message, outcome.TokensIn, outcome.TokensOut, outcome.CostUSD)
+	// A child run holds no lease of its own, so its generation stays zero and
+	// the fenced write is unconditional from the spawner that owns it. Recovery
+	// never leases a child (see openChild), which is what keeps this zero valid.
+	_, _ = s.store.FinishRun(ctx, runID, 0, status, outcome.Text, message, outcome.TokensIn, outcome.TokensOut, outcome.CostUSD)
 }
 
 // Spawn runs one child to completion.

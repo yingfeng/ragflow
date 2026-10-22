@@ -62,6 +62,15 @@ type State struct {
 	// History is what makes it survive compaction.
 	Plan []toolkit.PlanStep `json:"plan,omitempty"`
 
+	// ResumeHandled records that the first act after a restart already treated
+	// its inherited batch as possibly-already-dispatched. Later rounds in the
+	// same process must execute normally.
+	ResumeHandled bool `json:"resume_handled,omitempty"`
+
+	// BudgetNotified records that the run already told the model how much of
+	// the budget is gone. One fact, once — nagging spends the budget it reports.
+	BudgetNotified bool `json:"budget_notified,omitempty"`
+
 	FinalText string `json:"final_text"`
 
 	Budget  Budget         `json:"budget"`

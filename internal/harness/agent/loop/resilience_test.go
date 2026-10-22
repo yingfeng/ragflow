@@ -145,3 +145,21 @@ func TestCompactionTierForBoost(t *testing.T) {
 		t.Errorf("boost 9 = %v, want aggressive prune", got)
 	}
 }
+
+// A provider that states how long to wait must not be retried earlier: the
+// attempt would be spent proving the wait was real.
+func TestModelRetryDelayPrefersProviderHint(t *testing.T) {
+	err := errors.New("SILICONFLOW API error: 429 Too Many Requests, retry-after: 7, body: ...")
+	if got := modelRetryDelay(err, 1); got != 7*time.Second {
+		t.Fatalf("delay = %v, want the provider's 7s", got)
+	}
+	// A wait beyond the ceiling is clamped: one provider must not stall a run.
+	err = errors.New("429 retry-after: 3600")
+	if got := modelRetryDelay(err, 1); got != modelRetryAfterCeiling {
+		t.Fatalf("delay = %v, want the provider ceiling %v", got, modelRetryAfterCeiling)
+	}
+	// No hint: the local curve still applies.
+	if got := modelRetryDelay(errors.New("429 rate limited"), 2); got != modelBackoff(2) {
+		t.Fatalf("delay = %v, want the local backoff %v", got, modelBackoff(2))
+	}
+}

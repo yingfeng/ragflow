@@ -221,6 +221,7 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 		&entity.HarnessAgentPermissionGrant{},
 		&entity.HarnessAgentFeedback{},
 		&entity.HarnessAgentLesson{},
+		&entity.HarnessLeaderLease{},
 	}
 	dataModels = append(dataModels, permissionDataModelsEE()...)
 
@@ -385,6 +386,9 @@ func autoMigrateRuntimeModels(ctx context.Context, db *gorm.DB) error {
 		&entity.HarnessAgentPermissionGrant{},
 		&entity.HarnessAgentFeedback{},
 		&entity.HarnessAgentLesson{},
+		// The recovery sweep takes its leader ticket from this table, so a
+		// deployment that never ran --migrate would have no crash recovery.
+		&entity.HarnessLeaderLease{},
 	}
 	for _, m := range goRuntimeModels {
 		if err := autoMigrateSafely(ctx, db, m); err != nil {

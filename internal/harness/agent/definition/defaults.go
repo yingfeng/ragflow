@@ -1,6 +1,10 @@
 package definition
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // DefaultPrompt is the stable prefix of every agent that does not write its own.
 //
@@ -63,3 +67,34 @@ const AgentRules = `## Runtime rules
   covering many cases — write the steps out with the plan tool first and keep
   their status current. The plan is shown back to you every round; an open step
   is the signal that the answer is not finished yet.`
+
+// EnvironmentSection describes where and when the run happens.
+//
+// A long-horizon agent is asked about "today", "the latest release", "this
+// year". Without a date in its context it will date-stamp answers from its
+// weights. The workspace is included only when a shell is actually available,
+// so the block never claims a capability the run does not have.
+func EnvironmentSection(now time.Time, workspace string) string {
+	zone, offset := now.Zone()
+	var b strings.Builder
+	b.WriteString("## Environment\n")
+	fmt.Fprintf(&b, "- current date: %s (%s, UTC%s)\n", now.Format("2006-01-02"), now.Weekday(), formatOffset(offset))
+	if zone != "" {
+		fmt.Fprintf(&b, "- timezone: %s\n", zone)
+	}
+	if workspace != "" {
+		fmt.Fprintf(&b, "- workspace root: %s (shell commands run here)\n", workspace)
+	}
+	b.WriteString("- Anchor relative time to this date: \"today\", \"latest\" and \"this year\" mean relative to it, not to your training data.")
+	return b.String()
+}
+
+// formatOffset renders a UTC offset as ±HH:MM.
+func formatOffset(seconds int) string {
+	sign := "+"
+	if seconds < 0 {
+		sign = "-"
+		seconds = -seconds
+	}
+	return fmt.Sprintf("%s%02d:%02d", sign, seconds/3600, (seconds%3600)/60)
+}

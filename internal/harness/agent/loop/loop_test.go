@@ -305,3 +305,33 @@ func TestLoop_NewOutputCountsAsProgress(t *testing.T) {
 		t.Fatalf("tool calls = %d, want 4", capability.calls)
 	}
 }
+
+// A run that died between dispatch and result cannot know whether a
+// state-changing call took effect. Replaying it would duplicate the effect, so
+// the resumed batch reports the call as unresolved and lets the model decide.
+func TestLoop_ResumeDoesNotReplayMutatingCall(t *testing.T) {
+	capability := &fakeCap{tool: "write_thing", result: toolkit.Result{Content: "written"}}
+	mdl := model.NewFake(
+		model.CallTool("c1", "write_thing", `{"query":"x"}`),
+		model.Reply("done"),
+	)
+	runner := buildRunner(t, mdl, capability, Config{})
+
+	// A resumed context is what Runner.Resume hands the graph after a restart.
+	outcome, err := runner.Invoke(markResumed(context.Background()), &Input{RunID: "run-resume", UserMessage: "write it"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if capability.invoked != 0 {
+		t.Fatalf("a state-changing call was replayed after resume (%d calls)", capability.invoked)
+	}
+	noticed := false
+	for _, message := range outcome.FinalState.History {
+		if message.Role == model.RoleTool && strings.Contains(message.Content, "may already have taken effect") {
+			noticed = true
+		}
+	}
+	if !noticed {
+		t.Fatal("the model was never told the call may have taken effect")
+	}
+}

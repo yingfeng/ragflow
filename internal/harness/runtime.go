@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"ragflow/internal/agentic_rag"
 	"ragflow/internal/cli/filesystem"
@@ -174,13 +175,20 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		}
 	}
 
+	// The environment block is assembled per run, after the operator's prompt and
+	// the runtime rules: it is the only part of the system prompt that changes on
+	// its own, and a model that does not know the date will date-stamp facts on
+	// its own.
+	systemPrompt := definition.EffectiveSystemPrompt(cfg.SystemPrompt) + "\n\n" +
+		definition.EnvironmentSection(time.Now(), cfg.ExecRoot)
+
 	deps := loop.Deps{
 		Model:                  chatModel,
 		Registry:               registry,
 		Builder:                builder,
 		ModelName:              cfg.ModelRef,
 		Breaker:                cfg.Breakers.For(cfg.ModelRef),
-		SystemPrompt:           definition.EffectiveSystemPrompt(cfg.SystemPrompt),
+		SystemPrompt:           systemPrompt,
 		Lessons:                cfg.Lessons,
 		Concurrency:            cfg.Concurrency,
 		MaxOutputTokens:        cfg.MaxOutputTokens,
@@ -282,12 +290,4 @@ func registerCapabilities(ctx context.Context, registry *toolkit.Registry, cfg R
 		}
 	}
 	return notes, nil
-}
-
-// Recover resumes runs left behind by a dead worker.
-func (r *Runtime) Recover(ctx context.Context) (int, error) {
-	if r == nil || r.Service == nil {
-		return 0, fmt.Errorf("harness: runtime is not configured")
-	}
-	return r.Service.Recover(ctx)
 }
