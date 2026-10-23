@@ -2,6 +2,7 @@ import message from '@/components/ui/message';
 import {
   IHarnessAgentDefinition,
   IHarnessAgentDetail,
+  IHarnessSkill,
 } from '@/interfaces/database/chat';
 import chatService from '@/services/next-chat-service';
 import api from '@/utils/api';
@@ -10,6 +11,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 export enum HarnessAgentApiAction {
   FetchAgent = 'fetchHarnessAgent',
   UpdateAgent = 'updateHarnessAgent',
+  FetchSkills = 'fetchHarnessSkills',
 }
 
 /**
@@ -90,4 +92,27 @@ export const useUpdateHarnessAgent = () => {
   });
 
   return { loading, updateAgent: mutateAsync };
+};
+
+/**
+ * The skills the caller may attach to this agent.
+ *
+ * The list comes from the server's own resolution of the user's skillspace, so
+ * a skill offered here is one the run will be able to read. A failed load shows
+ * an empty picker rather than an error: an agent without extra skills still
+ * runs, and the built-in retrieval policy applies regardless.
+ */
+export const useFetchHarnessSkills = (enabled = true) => {
+  const { data, isFetching: loading } = useQuery<IHarnessSkill[]>({
+    queryKey: [HarnessAgentApiAction.FetchSkills],
+    enabled,
+    gcTime: 0,
+    refetchOnWindowFocus: false,
+    queryFn: async () => {
+      const { data } = await chatService.fetchHarnessSkills({}, true);
+      return data?.code === 0 ? ((data.data ?? []) as IHarnessSkill[]) : [];
+    },
+  });
+
+  return { skills: data ?? [], loading };
 };

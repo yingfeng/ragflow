@@ -975,6 +975,10 @@ NER：使用 spaCy NER 和基于规则的关键词提取来抽取 Entities 和 R
       agentPromptTip:
         '决定这个 agent 如何检索与作答；上面的提示词决定回复的措辞。',
       agentVersion: '第 {{version}} 版',
+      agentSkills: '技能',
+      agentSkillsTip:
+        '从你的技能空间选择；保存后下一轮起加载。内置的检索策略始终生效。',
+      agentSkillsEmpty: '技能空间里还没有技能，可在技能页面创建或安装。',
       agentSteps: 'Agent 步骤（{{count}}）',
       agentReasoning: '思考过程（{{count}} 轮）',
       approvalTitle: '需要审批工具调用',

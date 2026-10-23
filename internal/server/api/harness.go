@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,7 @@ func (m *harnessManager) buildRuntime(ctx context.Context, req run.Request) (*ha
 	policy := definition.PolicyConfig{}
 	prompt := ""
 	versionID := req.AgentVersionID
+	var enabledSkills []string
 	if req.AgentID != "" {
 		resolved, err := m.proc.Agents.Resolve(ctx, req.TenantID, req.AgentID, req.AgentVersionID)
 		if err != nil {
@@ -72,6 +74,7 @@ func (m *harnessManager) buildRuntime(ctx context.Context, req run.Request) (*ha
 		if resolved.Definition.Addendum != "" {
 			prompt += "\n\n" + resolved.Definition.Addendum
 		}
+		enabledSkills = resolved.Definition.Skills
 		versionID = resolved.VersionID
 	}
 	req.AgentVersionID = versionID
@@ -98,7 +101,10 @@ func (m *harnessManager) buildRuntime(ctx context.Context, req run.Request) (*ha
 		PolicyConfig:   policy,
 		MaxRounds:      policy.MaxRounds,
 		SkillsRoot:     m.settings.SkillsRoot,
+		SkillLoader:    service.NewHarnessSkillLoader(req.UserID, req.TenantID),
+		EnabledSkills:  enabledSkills,
 		ExecRoot:       m.settings.ExecRoot,
+		Lessons:        service.HarnessLessons(m.proc.Store, req.TenantID, req.AgentID),
 		Approvals:      approvals,
 		Grants:         m.proc.Grants,
 		Breakers:       m.proc.Breakers,
@@ -400,8 +406,47 @@ func registerHarness(routerInstance *router.Router) {
 		group.Use(bindCallerTenant())
 		runs.Register(group)
 		agents.Register(group)
+		group.GET("/skills", harnessSkills)
 	})
 	go manager.sweep(context.Background())
+}
+
+// harnessSkills lists the skills the caller may attach to an agent.
+//
+// The picker and the loader share one resolution (service.HarnessSkillOptions),
+// so a skill offered in the UI is one the run will actually be able to read.
+func harnessSkills(c *gin.Context) {
+	ctx := c.Request.Context()
+	userID := c.GetString("user_id")
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": common.CodeUnauthorized, "message": "authentication required"})
+		return
+	}
+	skills, err := service.HarnessSkillOptions(ctx, userID, c.GetString("tenant_id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": common.CodeServerError, "message": err.Error()})
+		return
+	}
+	type skillOption struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Version     string   `json:"version,omitempty"`
+		WhenToUse   string   `json:"when_to_use,omitempty"`
+		AutoLoad    bool     `json:"auto_load,omitempty"`
+		Resources   []string `json:"resources,omitempty"`
+	}
+	out := make([]skillOption, 0, len(skills))
+	for _, item := range skills {
+		out = append(out, skillOption{
+			Name:        item.Name,
+			Description: item.Description,
+			Version:     item.Version,
+			WhenToUse:   item.WhenToUse,
+			AutoLoad:    item.AutoLoad,
+			Resources:   item.Resources,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"code": common.CodeSuccess, "data": out})
 }
 
 // tenantOfUser resolves the tenant a user acts as. The chat services resolve it

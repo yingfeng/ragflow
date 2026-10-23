@@ -325,6 +325,8 @@ export default {
   // the agent that runs a thread: its definition is read and replaced as a version
   harnessAgent: (agentId: string) =>
     `${restAPIv1}/harness/agents/${encodeURIComponent(agentId)}`,
+  // skills the caller may attach to an agent, resolved from their skillspace
+  harnessSkills: `${restAPIv1}/harness/skills`,
 
   // next chat
   fetchExternalChatInfo: (id: string) => `${restAPIv1}/chatbots/${id}/info`,

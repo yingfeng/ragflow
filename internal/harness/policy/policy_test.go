@@ -147,3 +147,48 @@ func TestProgress_KeepsAPlanIdleOnlyWhileThePoolGrows(t *testing.T) {
 		t.Fatalf("advice = %q, want the flat-pool wording", stagnant[0].Advice)
 	}
 }
+
+// TestProgress_KeepsAnEnumerationAlive: the nudges are spent and the search is
+// flat, but the run's own plan still lists open steps. That is an enumeration
+// whose last item has not been found, not a run that is finished — handing it
+// to the answer call is how a long list comes back short by one name per stall.
+func TestProgress_KeepsAnEnumerationAlive(t *testing.T) {
+	verdicts := Progress{}.Check(Snapshot{
+		Round:          20,
+		StagnantRounds: 3,
+		OpenPlanSteps:  1,
+		// A plan that is merely not moving fast is not the idle case here: the
+		// flat pool is what triggered the stall.
+		PlanIdleRounds: 1,
+		Nudges:         2, // the base allowance is already spent
+	})
+	if len(verdicts) != 1 || verdicts[0].Action != ActionNudge {
+		t.Fatalf("verdicts = %+v, want a nudge, not a hand-off to the answer call", verdicts)
+	}
+	if !strings.Contains(verdicts[0].Advice, "open step") {
+		t.Fatalf("advice = %q, want the open-step wording", verdicts[0].Advice)
+	}
+}
+
+// TestProgress_EndsAnEnumerationThatNeverClosesItsPlan: the extension is bounded,
+// so a plan the model never closes still ends on the policy rather than on hope.
+func TestProgress_EndsAnEnumerationThatNeverClosesItsPlan(t *testing.T) {
+	verdicts := Progress{}.Check(Snapshot{
+		Round:          40,
+		StagnantRounds: 3,
+		OpenPlanSteps:  1,
+		Nudges:         2 + planKeepingNudges,
+	})
+	if len(verdicts) != 1 || verdicts[0].Action != ActionBlock {
+		t.Fatalf("verdicts = %+v, want the bounded hand-off", verdicts)
+	}
+}
+
+// TestProgress_NoOpenPlanStillHandsOff: without a plan there is no claim that
+// anything is left, so the original behaviour stands.
+func TestProgress_NoOpenPlanStillHandsOff(t *testing.T) {
+	verdicts := Progress{}.Check(Snapshot{StagnantRounds: 3, Nudges: 2})
+	if len(verdicts) != 1 || verdicts[0].Action != ActionBlock {
+		t.Fatalf("verdicts = %+v, want a block", verdicts)
+	}
+}

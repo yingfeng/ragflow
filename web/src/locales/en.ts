@@ -1080,6 +1080,11 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       agentPromptTip:
         'How the agent researches the reply. The chat prompt above shapes the wording of the reply.',
       agentVersion: 'v{{version}}',
+      agentSkills: 'Skills',
+      agentSkillsTip:
+        'Picked from your skillspace and loaded on the next turn. The built-in retrieval policy always applies.',
+      agentSkillsEmpty:
+        'No skills in your skillspace yet. Create or install one on the skills page.',
       agentSteps: 'Agent steps ({{count}})',
       agentReasoning: 'Thinking ({{count}} rounds)',
       approvalTitle: 'Tool approval required',

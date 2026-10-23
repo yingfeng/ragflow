@@ -19,7 +19,8 @@ import (
 // registered at all (see registerCapabilities), so an empty value degrades the
 // tool surface instead of breaking a turn.
 type Settings struct {
-	// SkillsRoot holds <name>/SKILL.md packages. Empty disables skills.
+	// SkillsRoot holds <name>/SKILL.md packages layered over the built-in set.
+	// Empty leaves only the built-in skills, which always ship with the binary.
 	SkillsRoot string
 	// ExecRoot is the shell workspace. Empty leaves exec_shell unregistered.
 	// When set, the sandbox is auto-detected: no working isolation means the

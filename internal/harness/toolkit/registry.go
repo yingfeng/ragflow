@@ -101,6 +101,25 @@ type RequiredToolList interface {
 	RequiredTools() []string
 }
 
+// Guide is an optional Capability extension. It contributes instructions that
+// must be in force from the first round, rather than discovered on demand.
+//
+// The distinction from a tool description is what the text is for. A schema
+// says how to call one tool; nothing in it says which leg to try first, when a
+// snippet is enough, or that one routing call replaces several blind searches.
+// The distinction from a skill body is when it is read: a skill is loaded by
+// the model when it recognises the situation, which cannot work for a rule the
+// model does not yet know it needs. Policy therefore comes from this interface.
+//
+// The content is still data, not code: the skill capability implements this by
+// returning the bodies of the skills that declared auto_load, so an operator
+// changes the policy by editing a file.
+type Guide interface {
+	// SystemNote renders the capability's standing instructions. Empty means
+	// the capability adds nothing.
+	SystemNote(ctx context.Context) string
+}
+
 // Registry routes tool calls to the owning capability.
 //
 // A capability can be registered active or deferred. Deferred tools stay in the
@@ -289,6 +308,33 @@ func (r *Registry) RequiredTools() []string {
 		}
 	}
 	return out
+}
+
+// SystemNotes collects the standing instructions of every registered capability
+// that declares them, in registration order.
+//
+// Registration order, not name order, is what a reader expects: a capability's
+// note follows the capability it belongs to. The result is part of the system
+// prompt, so it is assembled once per run and stays byte-stable for the run — a
+// note that reshuffles between rounds breaks the provider's prefix cache for no
+// gain.
+func (r *Registry) SystemNotes(ctx context.Context) string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	parts := make([]string, 0, len(r.caps))
+	for _, capability := range r.caps {
+		guide, ok := capability.(Guide)
+		if !ok {
+			continue
+		}
+		if text := strings.TrimSpace(guide.SystemNote(ctx)); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // Without returns a registry that keeps every capability except the ones owning

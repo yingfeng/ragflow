@@ -280,6 +280,16 @@ type Progress struct {
 	PlanIdleRoundsWhileProgressing int
 }
 
+// planKeepingNudges extends the nudge allowance while the model's own plan still
+// has open steps.
+//
+// An enumeration's last item is what closes its step, so an open step is the
+// run's own statement that the list is incomplete. Each extra correction is one
+// stall cycle (the counter resets after a nudge, so this is not four extra
+// rounds but four extra stalls); the bound exists so a plan the model never
+// closes still ends on a budget rather than on a promise.
+const planKeepingNudges = 4
+
 // Name implements Policy.
 func (Progress) Name() string { return "progress" }
 
@@ -362,10 +372,37 @@ func (p Progress) Check(snapshot Snapshot) []Verdict {
 						"An open step is not a reason to stop: keep it open while it is still adding evidence.",
 					stalledRounds, observation, snapshot.Citations),
 			})
+		} else if snapshot.OpenPlanSteps > 0 && !planIdleStall && snapshot.Nudges < nudges+planKeepingNudges {
+			// The nudges are spent, but the run's own plan still lists open
+			// steps — and for an enumeration the last item is exactly the one
+			// that closes them. Handing such a run to the answer call is how a
+			// long enumeration comes back one name short per stalled round: the
+			// plan said "enumerate all" the whole time.
+			//
+			// So keep it running and restate the correction instead. It costs
+			// one injected message per stall cycle (the counter resets, so this
+			// fires about every StagnantRounds rounds), and the round and token
+			// budgets remain the hard stop — planKeepingNudges only bounds how
+			// long a plan can hold a run open without evidence.
+			//
+			// A plan that stopped moving is different: there the run is not
+			// enumerating, it is holding itself open (see planIdleStall), and
+			// that still goes to the answer call.
+			out = append(out, Verdict{
+				Action:   ActionNudge,
+				Severity: SeverityInfo,
+				Reason:   reason,
+				Advice: fmt.Sprintf(
+					"Your plan still lists %d open step(s) and the last %d rounds %s. "+
+						"If every item is now found, close the steps and answer. If not, change the axis of the search — "+
+						"another chapter, another set of names, a wider read — not the same query again.",
+					snapshot.OpenPlanSteps, stalledRounds, observation),
+			})
 		} else {
-			// The fact has been restated as often as it is useful. Hand the run
-			// to the answer call instead of ending it: the evidence already
-			// collected is what the answer is written from.
+			// The fact has been restated as often as it is useful, and the plan
+			// no longer claims anything is left. Hand the run to the answer
+			// call instead of ending it: the evidence already collected is what
+			// the answer is written from.
 			out = append(out, Verdict{
 				Action:   ActionBlock,
 				Severity: SeverityWarning,

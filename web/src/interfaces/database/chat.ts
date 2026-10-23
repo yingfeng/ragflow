@@ -73,11 +73,23 @@ export interface IHarnessAgentPolicy {
 }
 
 /** What a user writes: the agent's instructions and its run limits. */
+/** One skill the caller may attach to an agent, resolved from their skillspace. */
+export interface IHarnessSkill {
+  name: string;
+  description: string;
+  version?: string;
+  when_to_use?: string;
+  auto_load?: boolean;
+  resources?: string[];
+}
+
 export interface IHarnessAgentDefinition {
   id?: string;
   name: string;
   prompt: string;
   policy?: IHarnessAgentPolicy;
+  /** Skills selected from the caller's skillspace. Empty keeps the built-in set. */
+  skills?: string[];
   [key: string]: unknown;
 }
 

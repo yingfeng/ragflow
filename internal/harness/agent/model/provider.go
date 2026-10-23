@@ -141,14 +141,22 @@ func (p *Provider) buildRequest(req Request) ([]providermodel.Message, *provider
 	}
 	if tools := toProviderTools(req.Tools); len(tools) > 0 {
 		config.Tools = tools
-		// An empty ToolChoice means "auto"; a named one is the required-tool
-		// gate and must survive verbatim — it is how the loop guarantees the
-		// first retrieval happens instead of a round of pure planning.
-		choice := req.ToolChoice
-		if choice == "" {
-			choice = "auto"
+		if req.ToolChoice != "" {
+			// The required-tool gate names one tool. The wire format for a
+			// named choice is the OBJECT form; the bare string form is only
+			// defined for auto/none/required, and a provider that receives a
+			// tool name as a string either rejects the request or silently
+			// ignores the gate — observed live: a forced first retrieval still
+			// came back as a todo_write call. ToolChoiceValue is the object
+			// slot the base provider writes to the request body verbatim.
+			config.ToolChoiceValue = map[string]any{
+				"type":     "function",
+				"function": map[string]any{"name": req.ToolChoice},
+			}
+		} else {
+			auto := "auto"
+			config.ToolChoice = &auto
 		}
-		config.ToolChoice = &choice
 	}
 	return messages, config
 }

@@ -3,6 +3,7 @@
 import { Collapse } from '@/components/collapse';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import {
@@ -15,6 +16,7 @@ import {
 import { useFetchChat } from '@/hooks/use-chat-request';
 import {
   useFetchHarnessAgent,
+  useFetchHarnessSkills,
   useUpdateHarnessAgent,
 } from '@/hooks/use-harness-agent-request';
 import { IHarnessAgentDefinition } from '@/interfaces/database/chat';
@@ -36,12 +38,14 @@ export function AgentExecutionSettings() {
   const agentId = chat?.agent_id;
   const { data: agent } = useFetchHarnessAgent(agentId);
   const { updateAgent, loading } = useUpdateHarnessAgent();
+  const { skills: availableSkills } = useFetchHarnessSkills(!!agentId);
 
   const [prompt, setPrompt] = useState('');
   // A numeric Input reports a number here, a text one a string: the box keeps
   // whatever it is given and the value is normalized only when it is sent.
   const [maxRounds, setMaxRounds] = useState<string | number>('0');
   const [approval, setApproval] = useState<'auto' | 'ask'>('ask');
+  const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [version, setVersion] = useState<number>();
 
   useEffect(() => {
@@ -51,6 +55,7 @@ export function AgentExecutionSettings() {
     setPrompt(agent.definition?.prompt ?? '');
     setMaxRounds(String(agent.definition?.policy?.max_rounds ?? 0));
     setApproval(agent.definition?.policy?.approval ?? 'ask');
+    setSelectedSkills(agent.definition?.skills ?? []);
     setVersion(agent.version);
   }, [agent]);
 
@@ -66,8 +71,9 @@ export function AgentExecutionSettings() {
         max_rounds: parseRounds(maxRounds),
         approval,
       },
+      skills: selectedSkills,
     };
-  }, [agent, prompt, maxRounds, approval]);
+  }, [agent, prompt, maxRounds, approval, selectedSkills]);
 
   // A plain chat runs no agent, so there is nothing to edit and no section to show.
   if (!agentId) {
@@ -149,6 +155,48 @@ export function AgentExecutionSettings() {
               </SelectItem>
             </SelectContent>
           </Select>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-1">
+            <span className="text-sm">{t('chat.agentSkills')}</span>
+            <span className="text-xs text-text-secondary">
+              {t('chat.agentSkillsTip')}
+            </span>
+          </div>
+          {availableSkills.length === 0 ? (
+            <span className="text-xs text-text-secondary">
+              {t('chat.agentSkillsEmpty')}
+            </span>
+          ) : (
+            <div className="flex max-h-48 flex-col gap-2 overflow-y-auto pr-1">
+              {availableSkills.map((skill) => (
+                <label
+                  key={skill.name}
+                  className="flex items-start gap-2"
+                  data-testid={`agent-skill-${skill.name}`}
+                >
+                  <Checkbox
+                    className="mt-0.5"
+                    checked={selectedSkills.includes(skill.name)}
+                    onCheckedChange={(checked) =>
+                      setSelectedSkills((current) =>
+                        checked
+                          ? [...current, skill.name]
+                          : current.filter((name) => name !== skill.name),
+                      )
+                    }
+                  />
+                  <span className="flex flex-col">
+                    <span className="text-sm">{skill.name}</span>
+                    <span className="text-xs text-text-secondary">
+                      {skill.description}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="text-right">

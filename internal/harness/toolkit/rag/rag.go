@@ -128,19 +128,24 @@ func (c *Capability) Tools() []model.ToolSpec {
 // RequiredTools implements toolkit.RequiredToolList. A run whose only job is
 // corpus evidence must gather some before it may plan or write: without the
 // gate, its first round can go to think/todo_write and produce nothing the
-// answer can stand on. The agentic pipeline drives the same gate through its
-// retrieval model (agentic_rag/retrieval_model.go), with the same shape: any
-// one locate tool lifts it.
+// answer can stand on.
+//
+// The order is the recall-first preference of the agentic pipeline
+// (agentic_rag/retrieval_model.go): bm25 ranks the whole corpus against the
+// question and can surface names the model never thought to grep for, while a
+// grep can only match what the model already knows to type. Forcing the
+// alphabetically-first name (grep_chunks) instead measured 11 names on the
+// kill-count run: the forced first grep hit only the well-known line, and the
+// model never saw the passages that held the rest. One locate tool lifts the
+// gate.
 func (c *Capability) RequiredTools() []string {
-	required := make([]string, 0, len(retrievalTools))
-	for name := range retrievalTools {
-		if _, ok := c.factories[name]; !ok {
-			continue
+	preference := []string{"search_bm25_chunks", "search_chunks", "grep_chunks", "search_semantic_chunks"}
+	for _, name := range preference {
+		if _, ok := c.factories[name]; ok {
+			return []string{name}
 		}
-		required = append(required, name)
 	}
-	sort.Strings(required)
-	return required
+	return nil
 }
 
 // Invoke implements toolkit.Capability. The run scope narrows the dataset scope

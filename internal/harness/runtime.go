@@ -77,8 +77,17 @@ type RuntimeConfig struct {
 	// Filesystem backs fs_* tools. Nil leaves them unregistered: a read tool
 	// over a missing engine would fail on every call.
 	Filesystem *filesystem.Engine
-	// SkillsRoot is the directory holding <name>/SKILL.md. Empty disables skills.
+	// SkillsRoot is a directory holding <name>/SKILL.md, layered over the
+	// built-in skills. Empty leaves only the built-in set.
 	SkillsRoot string
+	// SkillLoader supplies skills from the platform's skillspace. It layers over
+	// the built-in set, so an installed skill with a bundled name replaces it
+	// instead of appearing twice.
+	SkillLoader skill.Loader
+	// EnabledSkills is the agent's selection from SkillLoader. Empty means the
+	// agent runs with the built-in skills only: a tenant's skillspace is a
+	// catalog, and putting all of it in one agent's prompt is not a default.
+	EnabledSkills []string
 	// ExecRoot is the shell workspace. Empty leaves exec_shell unregistered:
 	// there is no sandbox to run it in, and registering it anyway would expose
 	// the host shell.
@@ -153,6 +162,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if cfg.Sampling != nil {
 		providerCfg.Temperature = cfg.Sampling.Temperature
 		providerCfg.TopP = cfg.Sampling.TopP
+		providerCfg.Thinking = cfg.Sampling.Thinking
 	}
 	chatModel := NewModel(chat, providerCfg)
 
@@ -186,12 +196,18 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		}
 	}
 
-	// The environment block is assembled per run, after the operator's prompt and
-	// the runtime rules: it is the only part of the system prompt that changes on
-	// its own, and a model that does not know the date will date-stamp facts on
-	// its own.
-	systemPrompt := definition.EffectiveSystemPrompt(cfg.SystemPrompt) + "\n\n" +
-		definition.EnvironmentSection(time.Now(), cfg.ExecRoot)
+	// Standing instructions follow the runtime rules. They come from auto_load
+	// skills, so the policy is a file an operator edits, not a constant; the
+	// registry only decides which capabilities get to contribute one.
+	//
+	// The environment block is assembled last: it is the only part of the system
+	// prompt that changes on its own, and everything before it has to stay
+	// byte-stable for the provider's prefix cache.
+	systemPrompt := definition.EffectiveSystemPrompt(cfg.SystemPrompt)
+	if note := registry.SystemNotes(ctx); note != "" {
+		systemPrompt += "\n\n" + note
+	}
+	systemPrompt += "\n\n" + definition.EnvironmentSection(time.Now(), cfg.ExecRoot)
 
 	deps := loop.Deps{
 		Model:                  chatModel,
@@ -286,10 +302,12 @@ func registerCapabilities(ctx context.Context, registry *toolkit.Registry, cfg R
 			return nil, err
 		}
 	}
-	if cfg.SkillsRoot != "" {
-		if err := registry.Register(skill.New(&skill.FSLoader{Root: cfg.SkillsRoot})); err != nil {
-			return nil, err
-		}
+	// Skills are always registered: the built-in set (the retrieval policy that
+	// every turn runs under) ships with the binary, so a deployment without a
+	// skills directory still has policy. Installed skills layer over it, and the
+	// agent's selection narrows only that installed layer.
+	if err := registry.Register(skill.New(skillLayers(cfg))); err != nil {
+		return nil, err
 	}
 	if cfg.ExecRoot != "" {
 		// Shell access is only offered inside a sandbox. When none works the tool
@@ -311,4 +329,18 @@ func registerCapabilities(ctx context.Context, registry *toolkit.Registry, cfg R
 		}
 	}
 	return notes, nil
+}
+
+// skillLayers composes the skill sources in precedence order: the bundled set is
+// the floor, the tenant directory overrides it, and the platform skillspace
+// contributes only what the agent selected.
+func skillLayers(cfg RuntimeConfig) skill.Loader {
+	layers := []skill.Loader{skill.Bundled()}
+	if cfg.SkillsRoot != "" {
+		layers = append(layers, skill.FSLoader{Root: cfg.SkillsRoot})
+	}
+	if cfg.SkillLoader != nil {
+		layers = append(layers, skill.SelectedLoader{Inner: cfg.SkillLoader, Names: cfg.EnabledSkills})
+	}
+	return skill.MergedLoader{Layers: layers}
 }

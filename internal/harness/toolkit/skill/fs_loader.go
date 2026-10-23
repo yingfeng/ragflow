@@ -125,16 +125,33 @@ func parseSkillFile(path string) (Skill, string, error) {
 	if len(raw) > MaxSkillFileBytes {
 		return Skill{}, "", fmt.Errorf("skill: %s exceeds %d bytes", filepath.Base(path), MaxSkillFileBytes)
 	}
-	content := strings.ReplaceAll(string(raw), "\r\n", "\n")
-	skill := Skill{Name: filepath.Base(filepath.Dir(path))}
+	skill, body := parseSkillContent(string(raw), filepath.Base(filepath.Dir(path)))
+	return skill, body, nil
+}
+
+// ParseManifest splits a SKILL.md into its manifest and body.
+//
+// Hosts that store skills as something other than a directory (the platform's
+// skillspace keeps each version as a file tree) parse with this, so one parser
+// governs every source: two parsers would drift, and the difference would only
+// show up in whichever deployment used the other one.
+func ParseManifest(raw, fallbackName string) (Skill, string) {
+	return parseSkillContent(raw, fallbackName)
+}
+
+// parseSkillContent splits a SKILL.md into its manifest and body. dirName is
+// the fallback name when the front matter omits one (the skill's directory).
+func parseSkillContent(raw, dirName string) (Skill, string) {
+	content := strings.ReplaceAll(raw, "\r\n", "\n")
+	skill := Skill{Name: dirName}
 
 	if !strings.HasPrefix(content, "---\n") {
-		return skill, strings.TrimSpace(content), nil
+		return skill, strings.TrimSpace(content)
 	}
 	rest := content[len("---\n"):]
 	end := strings.Index(rest, "\n---")
 	if end < 0 {
-		return skill, strings.TrimSpace(content), nil
+		return skill, strings.TrimSpace(content)
 	}
 
 	listKey := ""
@@ -170,6 +187,8 @@ func parseSkillFile(path string) (Skill, string, error) {
 			if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
 				skill.MaxTokens = parsed
 			}
+		case "auto_load", "auto-load":
+			skill.AutoLoad = value == "true" || value == "yes"
 		case "disable_model_invocation", "disable-model-invocation":
 			skill.DisableModelInvocation = value == "true" || value == "yes"
 		case "allowed_tools", "allowed-tools":
@@ -190,7 +209,7 @@ func parseSkillFile(path string) (Skill, string, error) {
 		}
 	}
 	body := strings.TrimSpace(rest[end+len("\n---"):])
-	return skill, body, nil
+	return skill, body
 }
 
 func appendListItem(skill *Skill, key, value string) {

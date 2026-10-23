@@ -40,6 +40,7 @@ const {
   listHarnessApprovals,
   resolveHarnessApproval,
   harnessAgent,
+  harnessSkills,
 } = api;
 
 const methods = {
@@ -136,6 +137,10 @@ const methods = {
   updateHarnessAgent: {
     url: harnessAgent,
     method: 'put',
+  },
+  fetchHarnessSkills: {
+    url: harnessSkills,
+    method: 'get',
   },
 } as const;
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"ragflow/internal/harness/agent/loop"
 	harnessmodel "ragflow/internal/harness/agent/model"
 	"ragflow/internal/harness/agent/run"
+	"ragflow/internal/harness/store"
 	"ragflow/internal/harness/toolkit"
 )
 
@@ -316,8 +319,15 @@ func (harnessRuntimeExecutor) Run(ctx context.Context, req harnessTurnRequest) (
 		PolicyConfig:   resolved.Definition.Policy,
 		MaxRounds:      resolved.Definition.Policy.MaxRounds,
 		SkillsRoot:     harnessSettings.SkillsRoot,
-		ExecRoot:       harnessSettings.ExecRoot,
-		WebSearch:      req.WebSearch,
+		// Skills come from the caller's own skillspace, narrowed to what this
+		// agent selected. The built-in retrieval policy applies regardless.
+		SkillLoader:   NewHarnessSkillLoader(req.UserID, req.TenantID),
+		EnabledSkills: resolved.Definition.Skills,
+		ExecRoot:      harnessWorkspace(req.SessionID),
+		// Lessons close the self-improvement loop: the store records them, the
+		// loop renders them, and without this the loop never read them back.
+		Lessons:   HarnessLessons(proc.Store, req.TenantID, resolved.AgentID),
+		WebSearch: req.WebSearch,
 		Approver: harnessApprover{
 			broker: proc.Approvals,
 			report: req.OnApproval,
@@ -637,4 +647,67 @@ func conversationIDOf(kwargs map[string]interface{}) string {
 	}
 	id, _ := kwargs["conversation_id"].(string)
 	return id
+}
+
+// HarnessLessons supplies the lessons this agent has earned.
+//
+// The store records them, the loop renders them as "## Relevant experience",
+// and until this was wired nothing read them back — the self-improvement loop
+// was open at its last step. Returning a closure keeps the read lazy: a turn
+// that never reaches the model (a rejected request) does not pay for it.
+func HarnessLessons(runs *store.RunStore, tenantID, agentID string) func(context.Context) []string {
+	if runs == nil {
+		return nil
+	}
+	return func(ctx context.Context) []string {
+		lessons, err := runs.ListLessons(ctx, tenantID, agentID, 8)
+		if err != nil {
+			return nil
+		}
+		out := make([]string, 0, len(lessons))
+		for _, lesson := range lessons {
+			title := strings.TrimSpace(lesson.Title)
+			body := strings.TrimSpace(lesson.Body)
+			switch {
+			case title != "" && body != "":
+				out = append(out, title+": "+body)
+			case title != "":
+				out = append(out, title)
+			case body != "":
+				out = append(out, body)
+			}
+		}
+		return out
+	}
+}
+
+// harnessWorkspace resolves the shell workspace for one conversation.
+//
+// The configured root is per worker; the subdirectory is per conversation, so
+// one thread cannot read another's files and a long task can pick up on the
+// next turn where it stopped. A directory that cannot be created disables the
+// shell rather than falling back to the shared root: two conversations sharing
+// a workspace is a correctness bug, not a degradation.
+func harnessWorkspace(conversationID string) string {
+	base := harnessSettings.ExecRoot
+	if base == "" {
+		return ""
+	}
+	segment := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return -1
+		}
+	}, conversationID)
+	if segment == "" {
+		return base
+	}
+	dir := filepath.Join(base, segment)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		common.Warn("harness: conversation workspace unavailable, shell disabled", zap.Error(err))
+		return ""
+	}
+	return dir
 }

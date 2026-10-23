@@ -77,6 +77,10 @@ type RSIConfig struct {
 type SamplingConfig struct {
 	Temperature *float64 `json:"temperature,omitempty"`
 	TopP        *float64 `json:"top_p,omitempty"`
+	// Thinking enables the model's reasoning output. It is sampling, not
+	// identity: the same model is chatty or silent depending on this switch,
+	// and a run that cannot see its own reasoning panel cannot be followed.
+	Thinking *bool `json:"thinking,omitempty"`
 }
 
 type Definition struct {
@@ -92,6 +96,15 @@ type Definition struct {
 
 	// Addendum is written only by RSI (prompt.addendum surface).
 	Addendum string `json:"addendum,omitempty"`
+
+	// Skills selects skills from the caller's skillspace.
+	//
+	// The built-in skills ship with the binary and always apply; this list
+	// selects from the user's own space, which is a catalog shared by every
+	// agent of the tenant. Naming none keeps the agent on the built-in set —
+	// loading a whole skillspace into every agent's prompt would spend context
+	// on procedures the agent was not asked to follow.
+	Skills []string `json:"skills,omitempty"`
 }
 
 var (

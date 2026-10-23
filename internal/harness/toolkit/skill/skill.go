@@ -5,6 +5,7 @@ package skill
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"ragflow/internal/harness/agent/model"
@@ -43,6 +44,16 @@ type Skill struct {
 	AllowedTools []string
 	// MaxTokens is the skill's own body budget, when the manifest declares one.
 	MaxTokens int
+	// AutoLoad puts the body in the system prompt instead of behind skill_load.
+	//
+	// Skills split into two kinds by how they are meant to take effect. A
+	// procedure ("how to review a contract") is worth its tokens only when it
+	// applies, so the model discovers it and loads it. A policy ("which
+	// retrieval leg to try first, when a snippet is enough") applies to every
+	// turn of the run, and progressive disclosure would mean the model has to
+	// know to ask for the rules it does not yet know — so a policy skill
+	// declares auto_load and the harness renders it beside the runtime rules.
+	AutoLoad bool
 	// DisableModelInvocation hides the skill from the model-driven catalog; it
 	// can still be loaded by an explicit user action.
 	DisableModelInvocation bool
@@ -69,6 +80,62 @@ func New(loader Loader) *Capability {
 
 // Name implements toolkit.Capability.
 func (*Capability) Name() string { return "skill" }
+
+// MaxSystemNoteChars bounds what auto_load skills may add to the system prompt.
+//
+// The note is part of the stable prompt prefix, so it is paid for on every
+// round of every run. 8 KB is roughly two pages of policy — enough for the
+// tool-usage rules this exists for, small enough that a careless skill cannot
+// crowd the transcript out of the window.
+const MaxSystemNoteChars = 8 << 10
+
+// SystemNote implements toolkit.Guide: the bodies of the auto_load skills, in
+// name order, ready to be rendered into the system prompt.
+//
+// Order is by name, not by loader order: the note is part of the prompt prefix,
+// and a prefix that reshuffles when a loader's directory order changes would
+// invalidate the provider's cache for no gain.
+func (c *Capability) SystemNote(ctx context.Context) string {
+	if c.loader == nil {
+		return ""
+	}
+	skills, err := c.loader.List(ctx)
+	if err != nil {
+		return ""
+	}
+	names := make([]string, 0, len(skills))
+	for _, item := range skills {
+		if item.AutoLoad {
+			names = append(names, item.Name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+
+	var builder strings.Builder
+	for _, name := range names {
+		item, err := c.loader.Load(ctx, name)
+		if err != nil {
+			continue
+		}
+		body := strings.TrimSpace(item.Body)
+		if body == "" {
+			continue
+		}
+		// An auto-loaded body states policy; its own header would be noise in
+		// the system prompt, where the section already names the source.
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString(clipMiddle(body, MaxSystemNoteChars-builder.Len()))
+		if builder.Len() >= MaxSystemNoteChars {
+			break
+		}
+	}
+	return strings.TrimSpace(builder.String())
+}
 
 // ToolRisk implements toolkit.RiskClassifier: reading a skill changes nothing.
 func (*Capability) ToolRisk(string) toolkit.Risk { return toolkit.RiskReadOnly }
@@ -132,13 +199,15 @@ func (c *Capability) Invoke(ctx context.Context, call toolkit.Call) (toolkit.Res
 }
 
 // renderCatalog renders the metadata list under one budget. Entries the manifest
-// hides from the model are skipped; a catalog that would exceed the budget stops
-// early and says how many entries it withheld, because a silently short list
-// reads like "there is nothing else".
+// hides from the model are skipped, and so are auto_load skills: their body is
+// already in the system prompt, so listing them again only invites a redundant
+// skill_load. A catalog that would exceed the budget stops early and says how
+// many entries it withheld, because a silently short list reads like "there is
+// nothing else".
 func renderCatalog(skills []Skill) string {
 	visible := make([]Skill, 0, len(skills))
 	for _, item := range skills {
-		if item.DisableModelInvocation {
+		if item.DisableModelInvocation || item.AutoLoad {
 			continue
 		}
 		visible = append(visible, item)

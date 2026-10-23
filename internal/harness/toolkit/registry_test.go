@@ -112,3 +112,49 @@ func TestRegistryWithoutNilRegistry(t *testing.T) {
 		t.Fatalf("child = %#v, want an empty registry", child)
 	}
 }
+
+// guidedCapability is a capability that states a standing note, and one that
+// states an empty one: both must be handled without special-casing names.
+type guidedCapability struct {
+	namedCapability
+	guidance string
+}
+
+func (c *guidedCapability) SystemNote(context.Context) string { return c.guidance }
+
+func TestRegistryGuidanceFollowsRegistrationOrder(t *testing.T) {
+	registry := registered(t,
+		&guidedCapability{namedCapability: namedCapability{name: "rag", tools: []string{"search"}}, guidance: "retrieval policy"},
+		&namedCapability{name: "builtin", tools: []string{"think"}},
+		&guidedCapability{namedCapability: namedCapability{name: "files", tools: []string{"read"}}, guidance: "file policy"},
+	)
+
+	if guidance := registry.SystemNotes(context.Background()); guidance != "retrieval policy\n\nfile policy" {
+		t.Fatalf("guidance = %q", guidance)
+	}
+}
+
+// TestRegistryGuidanceSkipsEmpty keeps a silent capability from injecting blank
+// lines into the system prompt prefix.
+func TestRegistryGuidanceSkipsEmpty(t *testing.T) {
+	registry := registered(t,
+		&guidedCapability{namedCapability: namedCapability{name: "rag", tools: []string{"search"}}, guidance: "  \n "},
+		&guidedCapability{namedCapability: namedCapability{name: "builtin", tools: []string{"think"}}, guidance: "only policy"},
+	)
+
+	if guidance := registry.SystemNotes(context.Background()); guidance != "only policy" {
+		t.Fatalf("guidance = %q", guidance)
+	}
+}
+
+func TestRegistryGuidanceWithoutGuides(t *testing.T) {
+	registry := registered(t, &namedCapability{name: "rag", tools: []string{"search"}})
+
+	if guidance := registry.SystemNotes(context.Background()); guidance != "" {
+		t.Fatalf("guidance = %q, want empty", guidance)
+	}
+	var nilRegistry *Registry
+	if guidance := nilRegistry.SystemNotes(context.Background()); guidance != "" {
+		t.Fatalf("nil registry guidance = %q, want empty", guidance)
+	}
+}

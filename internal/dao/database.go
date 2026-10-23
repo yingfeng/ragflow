@@ -197,6 +197,7 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 		&entity.EvaluationResult{},
 		&entity.TimeRecord{},
 		&entity.License{},
+		&entity.SkillSpace{},
 		&entity.SkillSearchConfig{},
 		&entity.TenantModelInstance{},
 		&entity.TenantModel{},

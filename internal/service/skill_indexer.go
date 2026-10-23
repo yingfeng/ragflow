@@ -576,6 +576,15 @@ func (s *SkillIndexerService) getSkillsFromFileSystem(ctx context.Context, tenan
 
 // findLatestVersion finds the latest semantic version from a list of version folders
 func (s *SkillIndexerService) findLatestVersion(versions []*entity.File) *entity.File {
+	return findLatestSkillVersion(versions)
+}
+
+// findLatestSkillVersion resolves the current version of a skill.
+//
+// Shared with the harness skill loader so an agent and the search index never
+// disagree about which version of a skill is in force: two implementations
+// would drift the moment a version naming scheme changes.
+func findLatestSkillVersion(versions []*entity.File) *entity.File {
 	if len(versions) == 0 {
 		return nil
 	}
@@ -794,6 +803,14 @@ func (s *SkillIndexerService) parseSkillMetadata(content, defaultName string) (n
 
 // getFileContent retrieves the content of a file from storage
 func (s *SkillIndexerService) getFileContent(ctx context.Context, tenantID string, file *entity.File) ([]byte, error) {
+	return readSkillFileContent(ctx, tenantID, file)
+}
+
+// readSkillFileContent reads one skill file from storage.
+//
+// Bucket is the folder the file lives in: upload stores per folder, so this
+// works for any version directory without knowing the layout above it.
+func readSkillFileContent(ctx context.Context, tenantID string, file *entity.File) ([]byte, error) {
 	if file.Location == nil || *file.Location == "" {
 		return nil, fmt.Errorf("file location is empty")
 	}
