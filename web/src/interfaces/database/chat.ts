@@ -8,6 +8,30 @@ export interface IDocumentDownloadInfo {
   size?: number;
 }
 
+export interface AgenticRagOverride {
+  content?: string;
+  tools?: string[];
+}
+
+export interface AgenticRagTemplate {
+  id: string;
+  name: string;
+  description: string;
+  temperature?: number | null;
+  tools: string[];
+  content: string;
+}
+
+// Response of GET /api/v1/chats/:chat_id/agentic-rag
+export interface IAgenticRagSettings {
+  base_template: string;
+  defaults: AgenticRagTemplate;
+  override: AgenticRagOverride | null;
+  effective: AgenticRagTemplate;
+  available_tools: Array<{ name: string; description: string }>;
+  using_defaults: boolean;
+}
+
 export interface PromptConfig {
   empty_response: string;
   parameters: Parameter[];
@@ -20,6 +44,7 @@ export interface PromptConfig {
   use_kg: boolean;
   reasoning?: boolean;
   cross_languages?: Array<string>;
+  agentic_rag?: AgenticRagOverride | null;
   brave_api_key?: string;
   exa_api_key?: string;
   firecrawl_api_key?: string;
@@ -31,7 +56,6 @@ export interface PromptConfig {
   tavily_api_key?: string;
   youcom_api_key?: string;
   web_search_provider?: WebSearchProvider;
-  toc_enhance?: boolean;
 }
 
 export interface Parameter {
@@ -72,7 +96,6 @@ export interface IHarnessAgentPolicy {
   approval?: 'auto' | 'ask';
 }
 
-/** What a user writes: the agent's instructions and its run limits. */
 /** One skill the caller may attach to an agent, resolved from their skillspace. */
 export interface IHarnessSkill {
   name: string;
@@ -83,6 +106,7 @@ export interface IHarnessSkill {
   resources?: string[];
 }
 
+/** What a user writes: the agent's instructions and its run limits. */
 export interface IHarnessAgentDefinition {
   id?: string;
   name: string;
@@ -158,9 +182,9 @@ export interface IDialog {
   rerank_candidates_count: number;
   rerank_id?: string;
   tenant_rerank_id?: string;
-  meta_data_filter: MetaDataFilter;
   /** Set when this thread is run by an agent; empty for a plain chat. */
   agent_id?: string;
+  meta_data_filter: MetaDataFilter;
 }
 
 interface MetaDataFilter {
@@ -200,6 +224,8 @@ export interface Message {
   chatBoxId?: string;
   attachment?: IAttachment;
   downloads?: IDocumentDownloadInfo[];
+  usage?: ITurnUsage;
+  elapsed_ms?: number;
   /** Agent steps streamed with this turn, in arrival order. */
   think_events?: IThinkEvent[];
 }
@@ -229,6 +255,13 @@ export interface IReferenceObject {
   doc_aggs: Record<string, Docagg>;
 }
 
+/** One turn's token cost, as reported by the final SSE chunk. */
+export interface ITurnUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
 export interface IAnswer {
   answer: string;
   attachment?: IAttachment;
@@ -240,6 +273,9 @@ export interface IAnswer {
   audio_binary?: string;
   data?: any;
   chatBoxId?: string;
+  /** Present on the final chunk only; absent for answers restored from history. */
+  usage?: ITurnUsage;
+  elapsed_ms?: number;
   think_events?: IThinkEvent[];
 }
 

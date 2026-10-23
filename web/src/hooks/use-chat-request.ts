@@ -20,6 +20,7 @@ import message from '@/components/ui/message';
 import { ChatSearchParams } from '@/constants/chat';
 import { ListDeletionKey } from '@/constants/list-deletion';
 import {
+  IAgenticRagSettings,
   IClientConversation,
   IConversation,
   IDialog,
@@ -71,6 +72,12 @@ export const enum ChatApiAction {
   ListPendingApprovals = 'listPendingApprovals',
   ResolveApproval = 'resolveApproval',
 }
+
+export const AgenticRagKeys = {
+  all: ['agenticRag'] as const,
+  config: (chatId?: string) =>
+    [...AgenticRagKeys.all, 'config', chatId] as const,
+};
 
 export const useGetChatSearchParams = () => {
   const [currentQueryParameters] = useSearchParams();
@@ -227,6 +234,7 @@ export const useUpdateChat = () => {
           queryKey: [ChatApiAction.FetchChatList],
         });
         queryClient.invalidateQueries({ queryKey: [ChatApiAction.FetchChat] });
+        queryClient.invalidateQueries({ queryKey: AgenticRagKeys.all });
         message.success(t('message.modified'));
       }
       return data?.code;
@@ -263,6 +271,7 @@ export const usePatchChat = () => {
           queryKey: [ChatApiAction.FetchChatList],
         });
         queryClient.invalidateQueries({ queryKey: [ChatApiAction.FetchChat] });
+        queryClient.invalidateQueries({ queryKey: AgenticRagKeys.all });
         message.success(t('message.modified'));
       }
       return data?.code;
@@ -292,6 +301,21 @@ export const useFetchChat = () => {
   });
 
   return { data, loading, refetch };
+};
+
+export const useFetchAgenticRagConfig = (chatId?: string) => {
+  const { data, isFetching: loading } = useQuery<IAgenticRagSettings>({
+    queryKey: AgenticRagKeys.config(chatId),
+    enabled: !!chatId,
+    gcTime: 0,
+    refetchOnWindowFocus: false,
+    queryFn: async () => {
+      const { data } = await chatService.getAgenticRagConfig(chatId);
+      return data?.data;
+    },
+  });
+
+  return { data, loading };
 };
 
 //#region Session

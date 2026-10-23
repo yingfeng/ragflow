@@ -21,6 +21,7 @@ const {
   createChat,
   listChats,
   getChat,
+  getAgenticRagConfig,
   updateChat,
   patchChat,
   deleteChat,
@@ -54,6 +55,10 @@ const methods = {
   },
   getChat: {
     url: getChat,
+    method: 'get',
+  },
+  getAgenticRagConfig: {
+    url: getAgenticRagConfig,
     method: 'get',
   },
   updateChat: {

@@ -704,7 +704,6 @@ func modifyColumnTypes(ctx context.Context, db *gorm.DB) error {
 			return err
 		}
 	}
-
 	return nil
 }
 

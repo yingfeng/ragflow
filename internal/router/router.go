@@ -50,6 +50,7 @@ type Router struct {
 	difyRetrievalHandler *handler.DifyRetrievalHandler
 	pluginHandler        *handler.PluginHandler
 	modelHandler         *handler.ModelHandler
+	modelGroupHandler    *handler.ModelGroupHandler
 	fileCommitHandler    *handler.FileCommitHandler
 	botHandler           *handler.BotHandler
 	componentsHandler    *handler.ComponentsHandler
@@ -97,6 +98,7 @@ func NewRouter(
 	difyRetrievalHandler *handler.DifyRetrievalHandler,
 	pluginHandler *handler.PluginHandler,
 	modelHandler *handler.ModelHandler,
+	modelGroupHandler *handler.ModelGroupHandler,
 	fileCommitHandler *handler.FileCommitHandler,
 	openaiChatHandler *handler.OpenAIChatHandler,
 	botHandler *handler.BotHandler,
@@ -133,6 +135,7 @@ func NewRouter(
 		difyRetrievalHandler: difyRetrievalHandler,
 		pluginHandler:        pluginHandler,
 		modelHandler:         modelHandler,
+		modelGroupHandler:    modelGroupHandler,
 		fileCommitHandler:    fileCommitHandler,
 		botHandler:           botHandler,
 		componentsHandler:    componentsHandler,
@@ -316,13 +319,14 @@ func (r *Router) Setup(engine *gin.Engine) {
 			}
 
 			// Chat routes
-			chats := v1.Group("/chats")
+			chats := v1.Group("/chats", ToggleChat())
 			{
 				chats.GET("", r.chatHandler.ListChats)
 				chats.POST("", r.chatHandler.Create)
 				chats.DELETE("", r.chatHandler.BulkDeleteChats)
 				chats.DELETE("/:chat_id", r.chatHandler.DeleteChat)
 				chats.GET("/:chat_id", r.chatHandler.GetChat)
+				chats.GET("/:chat_id/agentic-rag", r.chatHandler.GetAgenticRAGConfig)
 				chats.PUT("/:chat_id", r.chatHandler.UpdateChat)
 				chats.PATCH("/:chat_id", r.chatHandler.PatchChat)
 				chats.GET("/:chat_id/sessions", r.chatSessionHandler.ListChatSessions)
@@ -334,7 +338,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 				chats.PUT("/:chat_id/sessions/:session_id/messages/:msg_id/feedback", r.chatSessionHandler.UpdateMessageFeedback)
 			}
 
-			chat := v1.Group("/chat")
+			chat := v1.Group("/chat", ToggleChat())
 			{
 				chat.POST("/completions", r.chatSessionHandler.ChatCompletions)
 				chat.POST("/mindmap", r.chatHandler.MindMap)
@@ -342,11 +346,11 @@ func (r *Router) Setup(engine *gin.Engine) {
 				chat.POST("/audio/speech", r.chatHandler.ChatAudioSpeech)
 				chat.POST("/audio/transcription", r.chatHandler.ChatAudioTranscription)
 			}
-			v1.POST("/openai/:chat_id/chat/completions", r.openaiChatHandler.OpenAIChatCompletions)
+			v1.POST("/openai/:chat_id/chat/completions", ToggleChat(), r.openaiChatHandler.OpenAIChatCompletions)
 			v1.POST("/retrieval", r.datasetsHandler.SearchDatasets)
 
 			// Dataset routes
-			datasets := v1.Group("/datasets")
+			datasets := v1.Group("/datasets", ToggleDataset())
 			{
 				datasets.GET("", r.datasetsHandler.ListDatasets)
 				datasets.GET("/tags/aggregation", r.datasetsHandler.AggregateTags)
@@ -428,7 +432,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 			}
 
 			// Search routes
-			searches := v1.Group("/searches")
+			searches := v1.Group("/searches", ToggleSearch())
 			{
 				searches.GET("", r.searchHandler.ListSearches)
 				searches.POST("", r.searchHandler.CreateSearch)
@@ -438,7 +442,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 				searches.POST("/:search_id/completions", r.searchHandler.Completion)
 			}
 
-			files := v1.Group("/files")
+			files := v1.Group("/files", ToggleFile())
 			{
 				files.POST("", r.fileHandler.UploadFile)
 				files.GET("", r.fileHandler.ListFiles)
@@ -450,13 +454,13 @@ func (r *Router) Setup(engine *gin.Engine) {
 				files.GET("/:id", r.fileHandler.Download)
 			}
 
-			workspaceFiles := v1.Group("/workspace-files")
+			workspaceFiles := v1.Group("/workspace-files", ToggleFile())
 			{
 				workspaceFiles.GET("/:file_id/versions", r.fileCommitHandler.GetFileVersionHistory)
 			}
 
 			// File commit routes — /folders/ takes folder_id directly
-			commitFolders := v1.Group("/folders")
+			commitFolders := v1.Group("/folders", ToggleFile())
 			{
 				commitFolders.POST("/:folder_id/commits", r.fileCommitHandler.CreateCommit)
 				commitFolders.GET("/:folder_id/commits", r.fileCommitHandler.ListCommits)
@@ -469,7 +473,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 			}
 
 			// /workspaces/{workspace_id}/commits — alias for /folders/ (workspace_id == folder_id)
-			commitWorkspaces := v1.Group("/workspaces")
+			commitWorkspaces := v1.Group("/workspaces", ToggleFile())
 			{
 				commitWorkspaces.POST("/:workspace_id/commits", r.fileCommitHandler.CreateCommit)
 				commitWorkspaces.GET("/:workspace_id/commits", r.fileCommitHandler.ListCommits)
@@ -482,7 +486,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 			}
 
 			// /datasets/{dataset_id}/commits — resolve dataset_id → folder_id via middleware
-			commitDatasets := v1.Group("/datasets/:dataset_id")
+			commitDatasets := v1.Group("/datasets/:dataset_id", ToggleDataset())
 			commitDatasets.Use(handler.CommitFolderResolver(r.fileCommitHandler, "datasets", "dataset_id"))
 			{
 				commitDatasets.POST("/commits", r.fileCommitHandler.CreateCommit)
@@ -496,7 +500,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 			}
 
 			// Memory routes
-			memory := v1.Group("/memories")
+			memory := v1.Group("/memories", ToggleMemory())
 			{
 				memory.POST("", r.memoryHandler.CreateMemory)
 				memory.PUT("/:memory_id", r.memoryHandler.UpdateMemory)
@@ -507,7 +511,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 			}
 
 			// Message routes
-			message := v1.Group("/messages")
+			message := v1.Group("/messages", ToggleMemory())
 			{
 				message.GET("", r.memoryHandler.GetMessages)
 				message.POST("", r.memoryHandler.AddMessage)
@@ -540,7 +544,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 			}
 
 			// provider pool route group
-			provider := v1.Group("/providers")
+			provider := v1.Group("/providers", ToggleModel())
 			{
 				provider.GET("", r.providerHandler.ListProviders)
 				provider.PUT("", r.providerHandler.AddProvider)
@@ -576,7 +580,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 				command.POST("/file/parse", r.providerHandler.ParseFile)
 			}
 
-			model := v1.Group("/models")
+			model := v1.Group("/models", ToggleModel())
 			{
 				// GET /models returns the tenant's added models across
 				// all instances. Front-end useFetchAllAddedModels consumes this.
@@ -585,9 +589,15 @@ func (r *Router) Setup(engine *gin.Engine) {
 				// Tenant default-model selection (used by the agent page's useFetchDefaultModels hook)
 				model.GET("/default", r.tenantHandler.GetDefaultModels)
 				model.PATCH("/default", r.tenantHandler.SetDefaultModels)
+
+				model.POST("/groups", r.modelGroupHandler.CreateModelGroup)
+				model.DELETE("/groups/:group_name", r.modelGroupHandler.DeleteModelGroup)
+				model.GET("/groups", r.modelGroupHandler.ShowModelGroup)                            // LIST and SHOW MODEL GROUP
+				model.POST("/groups/:group_name/model", r.modelGroupHandler.AddModelToGroup)        // ADD MODEL TO GROUP
+				model.DELETE("/groups/:group_name/model", r.modelGroupHandler.RemoveModelFromGroup) // REMOVE MODEL FROM GROUP
 			}
 
-			allModels := v1.Group("/all-models")
+			allModels := v1.Group("/all-models", ToggleModel())
 			{
 				allModels.GET("", r.modelHandler.ListAllModels)
 				allModels.GET("/:model_name", r.modelHandler.ShowModel)
@@ -657,7 +667,9 @@ func (r *Router) Setup(engine *gin.Engine) {
 			system := v1.Group("/system")
 			{
 				system.GET("/status", r.systemHandler.GetStatus)
-				system.GET("/stats", r.statsHandler.GetStats) // TODO: need to reconsider this endpoint and function
+				system.GET("/stats/chat", r.statsHandler.GetChatStats)
+				system.GET("/stats/group", r.statsHandler.GetGroupStats)
+				system.GET("/stats/model", r.statsHandler.GetModelStats)
 
 				config := system.Group("/config")
 				{
@@ -701,6 +713,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 				system.PUT("/memory", r.systemHandler.SetMemory)
 				system.GET("/concurrency", r.systemHandler.GetConcurrency)
 				system.PUT("/concurrency", r.systemHandler.SetConcurrency)
+				system.GET("/quota", r.systemHandler.GetQuota)
 			}
 
 			// Chat Channel

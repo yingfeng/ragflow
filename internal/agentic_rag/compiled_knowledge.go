@@ -58,16 +58,15 @@ func compiledKnowledgeTools(tenantID string, datasetIDs []string) []tool.BaseToo
 	return out
 }
 
-// DatasetsHaveCompiledKnowledge reports whether any bound dataset carries a
+// datasetsHaveCompiledKnowledge reports whether any bound dataset carries a
 // knowledge-compilation product. Compiled products are exactly the rows that
 // carry compile_kwd; ordinary chunks do not (that is what the default retriever
 // excludes with must_not/exists compile_kwd), so a single existence read answers
 // it. A missing engine or an empty scope is false, leaving the tools undeclared.
-func DatasetsHaveCompiledKnowledge(ctx context.Context, tenantID string, datasetIDs []string) bool {
+func datasetsHaveCompiledKnowledge(ctx context.Context, de engine.DocEngine, tenantID string, datasetIDs []string) bool {
 	if len(datasetIDs) == 0 {
 		return false
 	}
-	de := engine.Get()
 	if de == nil {
 		return false
 	}
@@ -90,6 +89,35 @@ func DatasetsHaveCompiledKnowledge(ctx context.Context, tenantID string, dataset
 		return false
 	}
 	return len(res.Chunks) > 0
+}
+
+// DatasetsHaveCompiledKnowledge is the engine-free entry point for callers that
+// gate the same tools outside a run: the harness toolkit assembles its toolset
+// before any engine handle is in hand. A run should pass the engine it already
+// holds to datasetsHaveCompiledKnowledge instead of resolving the global one.
+func DatasetsHaveCompiledKnowledge(ctx context.Context, tenantID string, datasetIDs []string) bool {
+	return datasetsHaveCompiledKnowledge(ctx, engine.Get(), tenantID, datasetIDs)
+}
+
+func toolsForRun(ctx context.Context, tmpl Template, in Input, de engine.DocEngine) []tool.BaseTool {
+	tools := toolsFor(ctx, tmpl, in.TenantID, in.DatasetIDs, in.Tools)
+	if len(in.Tools) != 0 || tmpl.strictTools {
+		common.InfoCtx(ctx, "agentic_rag: compiled-knowledge tools skipped",
+			zap.Strings("datasets", in.DatasetIDs),
+			zap.String("reason", "explicit tool selection"))
+	} else if datasetsHaveCompiledKnowledge(ctx, de, in.TenantID, in.DatasetIDs) {
+		compiled := compiledKnowledgeTools(in.TenantID, in.DatasetIDs)
+		tools = append(tools, compiled...)
+		common.InfoCtx(ctx, "agentic_rag: compiled-knowledge tools injected",
+			zap.Strings("datasets", in.DatasetIDs),
+			zap.String("reason", "compile_kwd rows present in the bound datasets"),
+			zap.Int("tools", len(compiled)))
+	} else {
+		common.InfoCtx(ctx, "agentic_rag: compiled-knowledge tools skipped",
+			zap.Strings("datasets", in.DatasetIDs),
+			zap.String("reason", "no compile_kwd row in the bound datasets"))
+	}
+	return tools
 }
 
 // datasetsHaveClaims reports whether any bound dataset carries knowledge-compiled

@@ -644,6 +644,8 @@ func extractorChunkList(v any) ([]map[string]any, bool) {
 	switch list := v.(type) {
 	case []map[string]any:
 		return list, true
+	case []schema.ChunkDoc:
+		return schema.ChunkDocsToMaps(list), true
 	case []any:
 		out := make([]map[string]any, 0, len(list))
 		for _, item := range list {
@@ -1652,9 +1654,6 @@ func extractorContextLength(ctx context.Context, db *gorm.DB, llmID string) int 
 	if fn := getExtractorContextLengthOverride(); fn != nil {
 		return fn(ctx, llmID)
 	}
-	if db == nil {
-		db = dao.DB
-	}
 	state, err := runtime.GetStateFromContext(ctx)
 	if err != nil || state == nil {
 		return 0
@@ -1681,14 +1680,14 @@ func defaultChatModelRef(ctx context.Context, db *gorm.DB, tenantID string) stri
 		// No database to read the tenant's default chat model from.
 		return ""
 	}
-	tenant, err := dao.NewTenantDAO().GetByID(ctx, db, tenantID)
-	if err != nil || tenant == nil {
+	membership, err := resolveDefaultModelMembership(ctx, db, tenantID)
+	if err != nil || membership == nil {
 		return ""
 	}
-	if tenant.TenantLLMID != nil && *tenant.TenantLLMID != "" {
-		return *tenant.TenantLLMID
+	if membership.TenantLLMID != nil && *membership.TenantLLMID != "" {
+		return *membership.TenantLLMID
 	}
-	return tenant.LLMID
+	return membership.LLMID
 }
 
 // extractorContextFitBudget returns 97% of the model's context window as the
