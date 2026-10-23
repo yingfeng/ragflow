@@ -45,10 +45,14 @@ const (
 )
 
 // Request is one delegation.
+//
+// A child runs the agent that spawned it: the spawner holds one prompt, one
+// policy and one tool surface, so letting the model name a different agent
+// would either be ignored or run this agent under that name. Named-agent
+// delegation needs a resolver the spawner does not have.
 type Request struct {
-	AgentID string
-	Prompt  string
-	Scope   toolkit.Scope
+	Prompt string
+	Scope  toolkit.Scope
 	// Depth is the child's delegation depth: parent depth + 1.
 	Depth int
 }
@@ -149,8 +153,7 @@ func (c *Capability) Tools() []model.ToolSpec {
 			Name:        ToolName,
 			Description: "Delegate a self-contained task to a child agent and wait for its answer. The child has its own context, so send everything it needs and expect only its final answer.",
 			Parameters: toolkit.ObjectSchema(map[string]any{
-				"prompt":   map[string]any{"type": "string", "description": "Self-contained task statement."},
-				"agent_id": map[string]any{"type": "string", "description": "Optional agent definition to run."},
+				"prompt": map[string]any{"type": "string", "description": "Self-contained task statement."},
 			}, "prompt"),
 		},
 		{
@@ -186,8 +189,7 @@ func (c *Capability) Invoke(ctx context.Context, call toolkit.Call) (toolkit.Res
 }
 
 type spawnArgs struct {
-	Prompt  string `json:"prompt"`
-	AgentID string `json:"agent_id"`
+	Prompt string `json:"prompt"`
 }
 
 type spawnManyArgs struct {
@@ -285,10 +287,9 @@ func (c *Capability) spawnOne(ctx context.Context, call toolkit.Call) (toolkit.R
 		return toolkit.Result{}, fmt.Errorf("prompt is required")
 	}
 	outcome, err := c.spawner.Spawn(ctx, Request{
-		AgentID: args.AgentID,
-		Prompt:  args.Prompt,
-		Scope:   toolkit.ScopeFrom(ctx),
-		Depth:   DepthFrom(ctx) + 1,
+		Prompt: args.Prompt,
+		Scope:  toolkit.ScopeFrom(ctx),
+		Depth:  DepthFrom(ctx) + 1,
 	})
 	if err != nil {
 		return toolkit.Result{}, err

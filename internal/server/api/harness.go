@@ -15,6 +15,7 @@ import (
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
+	"ragflow/internal/handler"
 	"ragflow/internal/harness"
 	harnessapi "ragflow/internal/harness/agent/api"
 	"ragflow/internal/harness/agent/definition"
@@ -390,10 +391,15 @@ func (m *harnessManager) sweep(ctx context.Context) {
 // no agents has nothing to run and every endpoint answers empty.
 func registerHarness(routerInstance *router.Router) {
 	manager := newHarnessManager()
-	handler := harnessapi.New(manager)
+	runs := harnessapi.New(manager)
+	// Editing an agent is an app-level concern: it reads and writes the same
+	// tables the runtime resolves a run from, so it shares the process' agent
+	// service rather than taking a second connection to the same rows.
+	agents := handler.NewHarnessAgentHandler(manager.proc.Agents)
 	routerInstance.SetHarness(func(group *gin.RouterGroup) {
 		group.Use(bindCallerTenant())
-		handler.Register(group)
+		runs.Register(group)
+		agents.Register(group)
 	})
 	go manager.sweep(context.Background())
 }

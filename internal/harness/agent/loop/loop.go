@@ -135,6 +135,7 @@ const defaultMaxRounds = 1000
 // the retrieval and got an empty message.
 const answerInstruction = `Stop searching and answer the user's question now, in the question's own language.
 Use only the conversation above, including the tool results already collected. Reply with the final answer text directly: no tool calls, no plan, no description of what you searched, and no mention of this instruction.
+Before giving a count or a list, walk the tool results above and include every matching item found there — a count is only as complete as that list, and the last passage you read is not the whole search.
 If the collected evidence genuinely cannot answer the question, say what is missing and state the best-supported partial answer instead of leaving the reply empty.`
 
 // Build compiles the loop graph.
@@ -195,6 +196,7 @@ func Build(cfg Config) (*Runner, error) {
 		state.NewOutputs = 0
 		state.ThinkTerminal = false
 		state.EvidenceBefore = len(state.Evidence)
+		state.EvidenceCalls = 0
 
 		// Messages injected while the run was executing join the transcript
 		// before the prompt is assembled, so the model sees them this round.
@@ -219,16 +221,59 @@ func Build(cfg Config) (*Runner, error) {
 		if deps.Lessons != nil {
 			lessons = deps.Lessons(ctx)
 		}
-		state.Prompt = deps.Builder.BuildWithTier(deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost))
+		speculator := speculatorFrom(ctx)
+		var hint *agentctx.FoldHint
+		if speculator != nil {
+			hint = speculator.Hint()
+		}
+		var usedHint bool
+		state.Prompt, usedHint = deps.Builder.BuildWithFoldHint(deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost), hint)
+		if usedHint {
+			speculator.NoteHintAdopted()
+		}
 		// The plan rides after the transcript: the cacheable system prefix stays
 		// byte-identical across rounds while the model still sees what is left.
+		//
+		// Only when it CHANGES. A step list restated byte-for-byte every round is
+		// harness-only noise — the loop already carries the model's own plan
+		// message in History — and a standing reminder of the open steps reads as
+		// a standing reminder that they are the whole job.
 		if plan := renderPlan(state.Plan, false); plan != "" {
-			state.Prompt = append(state.Prompt, model.Message{Role: model.RoleUser, Content: plan})
+			if fingerprint := planFingerprint(state.Plan); fingerprint != state.PlanShown {
+				state.PlanShown = fingerprint
+				state.Prompt = append(state.Prompt, model.Message{Role: model.RoleUser, Content: plan})
+			}
+		}
+		// The evidence pool is NOT injected while the loop is searching. It reads
+		// as a list of what has already been found, and a model handed that list
+		// stops searching: measured on one enumeration, adding it to prepare cut
+		// the run from 29 rounds to 8 and the answer from 15 names to 9 — the
+		// model answered from the pool instead of continuing to search outside it.
+		// The pool belongs to the answer call, where a list is what the output
+		// needs (see the answer node).
+		//
+		// The question is re-stated every round, and it has to be. A chat turn
+		// arrives with the whole thread in History, so the prompt carries every
+		// earlier question too; without this line the model lost track of which
+		// one it was answering and answered an older turn's question instead
+		// (observed: a question about 三国 answered a list of 秦 and 霸王别姬
+		// questions from earlier turns). The wording names the turn's question and
+		// says the passages are evidence for it — it does NOT say "answer now",
+		// which is what made runs stop searching after a few rounds.
+		if anchor := questionAnchor(state.Question); anchor != "" {
+			state.Prompt = append(state.Prompt, model.Message{Role: model.RoleUser, Content: anchor})
+		}
+		// Speculate now, on the same transcript this prompt was built from: the
+		// summary is written while think and act do their work, so the round
+		// that has to fold finds it ready instead of paying for it inline.
+		if speculator != nil {
+			speculator.MaybeStart(deps.SystemPrompt, lessons, state.History)
 		}
 		record(deps, StepRecord{
 			RunID:      state.RunID,
 			Phase:      "prepare",
 			Round:      state.Entry.Round,
+			Decision:   ternary(usedHint, "speculated", ""),
 			DurationMS: time.Since(start).Milliseconds(),
 		})
 		return state, nil
@@ -253,10 +298,25 @@ func Build(cfg Config) (*Runner, error) {
 			Messages:  state.Prompt,
 			Tools:     tools,
 			MaxTokens: deps.MaxOutputTokens,
+			// The required-tool gate: until the transcript shows one required
+			// tool call after the turn's last user message, the model is told
+			// which tool to use instead of asked. Without it, the first round
+			// can go to pure planning and produce no evidence at all.
+			ToolChoice: requiredToolChoice(tools, deps.Registry.RequiredTools(), state.History),
 		}
+		// A round's text is held until the round is over, because only then does
+		// the loop know what it was. A round that ends the turn produced the
+		// answer; a round that goes on to call a tool produced working text that
+		// belongs in the step panel. Sending both to the answer area is what let
+		// one round print a draft the next round overwrote.
+		answerSink := DeltaSinkFromContext(ctx)
+		workingSink := ReasoningSinkFromContext(ctx)
+		var held []string
 		var response model.Response
-		if streamer, ok := deps.Model.(model.Streamer); ok && DeltaSinkFromContext(ctx) != nil {
-			response, err = callModelStreaming(ctx, streamer, request, deps.Breaker, DeltaSinkFromContext(ctx))
+		if streamer, ok := deps.Model.(model.Streamer); ok && (answerSink != nil || workingSink != nil) {
+			response, err = callModelStreaming(ctx, streamer, request, deps.Breaker, func(text string) {
+				held = append(held, text)
+			})
 		} else {
 			response, err = callModel(ctx, deps.Model, request, deps.Breaker)
 		}
@@ -265,6 +325,10 @@ func Build(cfg Config) (*Runner, error) {
 			// the prompt and try again instead of failing the run; after
 			// ptlAttempts recoveries the run genuinely cannot fit.
 			if isPromptTooLongError(err) && state.PtLErrors < ptlAttempts {
+				// The round is about to be replayed on a smaller prompt, so what
+				// it streamed is a draft: sending it to the answer area would
+				// leave it in front of the text the replay writes there.
+				emitReasoning(held, workingSink)
 				state.PtLErrors++
 				state.CompactionBoost++
 				state.RetryPrepare = true
@@ -278,6 +342,10 @@ func Build(cfg Config) (*Runner, error) {
 				})
 				return state, nil
 			}
+			// The provider produced this text before it failed. It counts as
+			// shown — the retry path refuses to replay a call that streamed — so
+			// it reaches the answer area instead of vanishing with the error.
+			flushAnswerText(held, answerSink)
 			if recorder := events.RecorderFromContext(ctx); recorder != nil {
 				recorder.RecordError(ctx, err.Error())
 			}
@@ -315,7 +383,40 @@ func Build(cfg Config) (*Runner, error) {
 		}
 		state.ThinkTerminal = len(assistant.ToolCalls) == 0
 		if state.ThinkTerminal {
-			state.FinalText = strings.TrimSpace(assistant.Content)
+			// A turn that ends without a tool call is not automatically an answer.
+			// "Let me see the final truncated chunk and continue searching" is the
+			// model narrating its next step; delivering that as the reply leaves
+			// the user with a sentence about work that never happened. Treat it as
+			// no answer so the answer call writes one from the evidence already
+			// collected.
+			state.FinalText = ""
+			if text := strings.TrimSpace(assistant.Content); !looksLikeNarration(text) {
+				state.FinalText = text
+			}
+			// Consecutive rounds that produced only prose. Policies read it to
+			// tell "still working on an open plan step" from "restating a partial
+			// answer": only the first deserves another round.
+			state.TerminalRounds++
+		} else {
+			state.TerminalRounds = 0
+			// A round that goes on to call tools has concluded nothing. Keeping an
+			// earlier draft here is how a run that wrote an answer and then kept
+			// researching delivered the pre-research answer: the loop finished with
+			// text it had already invalidated.
+			state.FinalText = ""
+		}
+		// Now that the round is known to be the turn's end or not, the held text
+		// has exactly one home: the answer area for the round that ends the turn,
+		// the step panel for the round that went on to call a tool.
+		//
+		// A terminal round whose text was rejected as narration wrote no answer,
+		// so its words are working text as well: flushing them would park "let me
+		// check that" in the answer area, where the grace round or the answer
+		// call then streams the real reply underneath it.
+		if state.ThinkTerminal && state.FinalText != "" {
+			flushAnswerText(held, answerSink)
+		} else {
+			emitReasoning(held, workingSink)
 		}
 
 		record(deps, StepRecord{
@@ -394,6 +495,19 @@ func Build(cfg Config) (*Runner, error) {
 
 		invoke := func(index int) {
 			call := calls[index]
+			// Every pending call reports its lifecycle, including the ones that
+			// never reach the tool. A blocked or non-replayed call is still an
+			// event in the transcript, and a step panel left on "searching…"
+			// because the call was refused before it started describes work the
+			// run never did.
+			finish := trackTool(ctx, toolCallView{tool: call.Tool, arguments: call.Arguments})
+			defer func() {
+				// A tool-level failure is reported in the result, not as an error
+				// from Invoke: the call ran and failed, and the progress stream
+				// has to show that the same way it shows a call that never
+				// returned.
+				finish(failures[index] != nil || results[index].IsError)
+			}()
 			if resumeGuard && !deps.Registry.Parallelizable(call.Tool) {
 				results[index] = toolkit.ErrorResult(fmt.Errorf(
 					"the %q call was dispatched before this run was interrupted and may already have taken effect, so it was not repeated; check the outcome or retry with different arguments",
@@ -406,8 +520,6 @@ func Build(cfg Config) (*Runner, error) {
 					call.Tool, maxRepeatedToolCalls))
 				return
 			}
-			finish := trackTool(ctx, toolCallView{tool: call.Tool, arguments: call.Arguments})
-			defer func() { finish(failures[index]) }()
 
 			approvalCall := toolkit.Call{ID: call.ID, Tool: call.Tool, Arguments: call.Arguments}
 			recorder := events.RecorderFromContext(ctx)
@@ -507,6 +619,15 @@ func Build(cfg Config) (*Runner, error) {
 			if !result.Inline {
 				// Oversized output leaves the context window here; the model gets
 				// a preview and a handle instead of paying for the whole payload.
+				// An Inline result is exempt: it is a tool that already bounded
+				// its own output (a retrieval window — grep's 30 matches,
+				// list_chunks' one chunk window). Re-spilling it does not shrink
+				// the payload, it only moves it behind a handle: the preview is a
+				// preview of the preview, and the model has to spend one read_spill
+				// round to get back to the text it just asked for. That round comes
+				// out of the same budget the searches need. The per-result ceiling
+				// in the context builder (MaxToolResultBytes, 64 KiB) is the only
+				// guard a bounded window still needs.
 				content = spill.MaybeSpill(ctx, content, inlineBudget)
 			}
 			state.History = append(state.History, model.Message{
@@ -522,7 +643,16 @@ func Build(cfg Config) (*Runner, error) {
 				}
 			}
 			state.Evidence = append(state.Evidence, result.Evidence...)
+			if len(result.Evidence) > 0 {
+				state.EvidenceCalls++
+			}
 			if plan, ok := result.Meta[toolkit.MetaPlan].([]toolkit.PlanStep); ok && len(plan) > 0 {
+				// Only a plan that actually changed counts as progress: a model
+				// republishing the same three open steps every round would
+				// otherwise reset the idle clock forever.
+				if fingerprint := planFingerprint(plan); fingerprint != planFingerprint(state.Plan) {
+					state.PlanRound = state.Entry.Round
+				}
 				state.Plan = plan
 			}
 			record(deps, StepRecord{
@@ -532,6 +662,7 @@ func Build(cfg Config) (*Runner, error) {
 				Tool:     call.Tool,
 				ArgsHash: call.IdempotencyKey,
 				Decision: ternary(result.IsError, "error", "ok"),
+				Reason:   describeCall(call, result),
 			})
 		}
 		state.Pending = nil
@@ -568,14 +699,30 @@ func Build(cfg Config) (*Runner, error) {
 		if state.NewEvidence < 0 {
 			state.NewEvidence = 0
 		}
-		// A round made progress when it either cited something new or produced
-		// new tool output. Both halves matter: evidence alone would call a
-		// productive read-only round stagnant, and output alone would let a tool
-		// that keeps re-reading the same payload look productive.
-		if state.NewEvidence == 0 && state.NewOutputs == 0 {
-			state.StagnantRounds++
-		} else {
+		// Progress is new evidence units, not new output text.
+		//
+		// A different regex, a rephrased BM25 query or a second slice of the same
+		// chunk all return fresh text over the same chunks, so an output
+		// fingerprint advances every round while the pool stops growing. That is
+		// how a retrieval run spent 47 rounds re-reading its own hits: every
+		// round looked productive, so nothing stopped it.
+		//
+		// Tools that publish no evidence units (shell, files, planning) keep the
+		// output-based signal, and a run that has never produced evidence has no
+		// pool to judge by.
+		switch {
+		case state.NewEvidence > 0:
 			state.StagnantRounds = 0
+		case state.EvidenceCalls > 0:
+			// Searched and the pool did not grow. This is the round that stops a
+			// run grinding through rewrite after rewrite of the same query.
+			state.StagnantRounds++
+		case state.NewOutputs > 0 && len(state.Evidence) == 0:
+			// No evidence model at all (shell, files): output is the only signal.
+			state.StagnantRounds = 0
+		default:
+			// read_spill and planning: reading what was already retrieved is
+			// neither progress nor stagnation, so the counter stays put.
 		}
 		return state, nil
 	})
@@ -587,6 +734,16 @@ func Build(cfg Config) (*Runner, error) {
 			return nil, err
 		}
 		state.Verdict = deps.Policy.Decide(snapshotOf(state))
+		if state.Verdict.Action == policy.ActionNudge {
+			// The correction joins the transcript as a fact from the run's own
+			// instrumentation, and the counter it reports restarts: the next
+			// stall is a new stall, not the same one counted twice.
+			if advice := strings.TrimSpace(state.Verdict.Advice); advice != "" {
+				state.History = append(state.History, model.Message{Role: model.RoleUser, Content: advice})
+			}
+			state.Nudges++
+			state.StagnantRounds = 0
+		}
 		if recorder := events.RecorderFromContext(ctx); recorder != nil {
 			recorder.RecordVerdict(ctx, string(state.Verdict.Action), state.Verdict.Reason, state.Entry.Round, len(state.Evidence))
 		}
@@ -610,9 +767,12 @@ func Build(cfg Config) (*Runner, error) {
 		if err != nil {
 			return nil, err
 		}
-		// A pause is a hand-off to a human, not an ending: the run resumes and
-		// answering now would spend a call the resumed round repeats.
-		if strings.TrimSpace(state.FinalText) != "" || state.Verdict.Action == policy.ActionPause {
+		// Only a run that already holds text may skip this call. A pause used to
+		// skip it too, on the assumption that a human would resume the run — but
+		// no resume entry exists on the chat path, so a paused run handed the
+		// caller an empty message. One call for a partial answer that names its
+		// own truncation is worth more than silence.
+		if strings.TrimSpace(state.FinalText) != "" {
 			return state, nil
 		}
 		start := time.Now()
@@ -626,6 +786,21 @@ func Build(cfg Config) (*Runner, error) {
 		messages := deps.Builder.BuildWithTier(deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost))
 		if plan := renderPlan(state.Plan, true); plan != "" {
 			messages = append(messages, model.Message{Role: model.RoleUser, Content: plan})
+		}
+		// The evidence pool lives outside the transcript. Compaction trims
+		// History as the context fills, so a long run reaches this call holding
+		// only its last few rounds: the passages that proved the earliest items
+		// are gone from the prompt even though the loop still holds them. That is
+		// how a 50-round run answered with fewer names than a 6-round one. Feeding
+		// the pool here is what makes "answer from what you collected" true.
+		if evidence := renderEvidencePool(state.Evidence); evidence != "" {
+			messages = append(messages, model.Message{Role: model.RoleUser, Content: evidence})
+		}
+		if anchor := questionAnchor(state.Question); anchor != "" {
+			messages = append(messages, model.Message{Role: model.RoleUser, Content: anchor})
+		}
+		if note := stoppingNote(state); note != "" {
+			messages = append(messages, model.Message{Role: model.RoleUser, Content: note})
 		}
 		messages = append(messages, model.Message{Role: model.RoleUser, Content: answerInstruction})
 		request := model.Request{
@@ -644,6 +819,12 @@ func Build(cfg Config) (*Runner, error) {
 			state.Errors = append(state.Errors, StepError{Tool: "answer", Message: clip(err.Error(), 256)})
 			if recorder := events.RecorderFromContext(ctx); recorder != nil {
 				recorder.RecordError(ctx, err.Error())
+			}
+			// A failed concluding call must not become an empty message: the run
+			// already paid for the evidence and may already have written prose
+			// this turn. Fall back to it rather than deliver nothing.
+			if strings.TrimSpace(state.FinalText) == "" {
+				state.FinalText = lastAssistantText(state.History)
 			}
 			record(deps, StepRecord{
 				RunID:      state.RunID,
@@ -669,6 +850,7 @@ func Build(cfg Config) (*Runner, error) {
 		state.FinalText = strings.TrimSpace(assistant.Content)
 		if state.FinalText == "" {
 			state.Errors = append(state.Errors, StepError{Tool: "answer", Message: "answer model returned no text"})
+			state.FinalText = lastAssistantText(state.History)
 		}
 		record(deps, StepRecord{
 			RunID:      state.RunID,
@@ -690,17 +872,31 @@ func Build(cfg Config) (*Runner, error) {
 		}
 		state.Done = true
 		state.Budget.ElapsedMS = time.Now().UnixMilli() - state.StartedMS
+		label := string(state.Verdict.Action)
+		if state.Verdict.Code != "" {
+			// A stable label beats the action: "budget_limited" says why the run
+			// ended, "finish" only says that it did.
+			label = state.Verdict.Code
+		}
 		if state.Verdict.Reason != "" {
-			state.Stopped = string(state.Verdict.Action) + ": " + state.Verdict.Reason
+			state.Stopped = label + ": " + state.Verdict.Reason
 		} else if state.Verdict.Action != "" && state.Verdict.Action != policy.ActionContinue {
-			state.Stopped = string(state.Verdict.Action)
+			state.Stopped = label
+		}
+		// The model's own plan says how much of its stated work was left when the
+		// run ended. Without it a stopped record cannot be told apart from a
+		// complete one, which is what made "12 of 16" invisible in the log.
+		if total, open := planCounts(state.Plan); open > 0 {
+			state.Stopped += fmt.Sprintf("; %d/%d plan steps open", open, total)
 		}
 		record(deps, StepRecord{
 			RunID:    state.RunID,
 			Phase:    "finish",
 			Round:    state.Entry.Round,
 			Decision: string(state.Verdict.Action),
-			Reason:   state.Verdict.Reason,
+			// Stopped, not Verdict.Reason: it carries the plan coverage too, so a
+			// stopped record can be told apart from a complete one.
+			Reason: clip(state.Stopped, 400),
 		})
 		return state, nil
 	})
@@ -740,7 +936,7 @@ func Build(cfg Config) (*Runner, error) {
 		if err != nil {
 			return nil, err
 		}
-		if state.Verdict.Action == policy.ActionContinue {
+		if state.Verdict.Action == policy.ActionContinue || state.Verdict.Action == policy.ActionNudge {
 			return "prepare", nil
 		}
 		return "answer", nil
@@ -794,8 +990,14 @@ func (r *Runner) Invoke(ctx context.Context, input *Input, config *types.Runnabl
 	}
 	// One allowlist per run: a skill that narrows the tools during round three
 	// must still narrow them in round four, and the holder is shared through the
-	// context every node receives.
-	ctx = toolkit.WithAllowlist(ctx)
+	// context every node receives. It is replaced rather than reused because a
+	// delegated child arrives with its parent's context, and a shared holder
+	// would let either run narrow the other's tool surface.
+	ctx = toolkit.ReplaceAllowlist(ctx)
+	// Compaction speculation is per run: its hint indexes this run's history.
+	if r.deps.Builder != nil {
+		ctx = withSpeculator(ctx, agentctx.NewSpeculator(r.deps.Builder))
+	}
 	if config == nil {
 		config = types.NewRunnableConfig()
 	}
@@ -828,6 +1030,20 @@ func (r *Runner) Resume(ctx context.Context, runID string) (Outcome, error) {
 	config.ThreadID = runID
 	config.Configurable[constants.ConfigKeyThreadID] = runID
 	return r.Invoke(markResumed(ctx), nil, config)
+}
+
+type speculatorKey struct{}
+
+// withSpeculator attaches the run's compaction speculation. It lives in the
+// context rather than in State because it owns a goroutine, and State is
+// serialized for checkpoints.
+func withSpeculator(ctx context.Context, speculator *agentctx.Speculator) context.Context {
+	return context.WithValue(ctx, speculatorKey{}, speculator)
+}
+
+func speculatorFrom(ctx context.Context) *agentctx.Speculator {
+	speculator, _ := ctx.Value(speculatorKey{}).(*agentctx.Speculator)
+	return speculator
 }
 
 type resumedKey struct{}
@@ -897,6 +1113,7 @@ func newState(input Input, policyConfig definition.PolicyConfig, maxRounds int) 
 		AgentName:   input.AgentName,
 		StartedMS:   time.Now().UnixMilli(),
 		History:     seedHistory(input),
+		Question:    turnQuestion(input),
 		SeenCalls:   make(map[string]struct{}),
 		SeenOutputs: make(map[string]struct{}),
 		CallRepeats: make(map[string]int),
@@ -912,6 +1129,7 @@ func newState(input Input, policyConfig definition.PolicyConfig, maxRounds int) 
 }
 
 func snapshotOf(state *State) policy.Snapshot {
+	planTotal, planOpen := planCounts(state.Plan)
 	return policy.Snapshot{
 		RunID:           state.RunID,
 		Round:           state.Entry.Round,
@@ -928,12 +1146,33 @@ func snapshotOf(state *State) policy.Snapshot {
 		NewEvidence:     state.NewEvidence,
 		StagnantRounds:  state.StagnantRounds,
 		RepeatedCalls:   state.RepeatedCalls,
+		Nudges:          state.Nudges,
 		HasFinalText:    strings.TrimSpace(state.FinalText) != "",
 		Citations:       state.Citations,
 		UnresolvedCalls: state.UnresolvedCalls,
 		ScopeViolations: state.ScopeViolations,
 		ThinkTerminal:   state.ThinkTerminal,
+		PlanSteps:       planTotal,
+		OpenPlanSteps:   planOpen,
+		PlanIdleRounds:  planIdleRounds(state),
+		TerminalRounds:  state.TerminalRounds,
 	}
+}
+
+// planIdleRounds is how many rounds have passed since the plan last changed. A
+// plan with no open steps is not holding the run open, so it reports zero.
+func planIdleRounds(state *State) int {
+	if _, open := planCounts(state.Plan); open == 0 {
+		return 0
+	}
+	if state.PlanRound <= 0 {
+		return 0
+	}
+	idle := state.Entry.Round - state.PlanRound
+	if idle < 0 {
+		return 0
+	}
+	return idle
 }
 
 func outcomeOf(state *State) Outcome {
@@ -1006,6 +1245,170 @@ func compactionTierFor(boost int) agentctx.Tier {
 	}
 }
 
+// lastAssistantText is the most recent thing the model said that was not a tool
+// call. It is the fallback when the concluding call fails or returns nothing: a
+// partial answer the model already wrote beats an empty message, and the caller
+// has no way to recover a run that ends without text.
+func lastAssistantText(history []model.Message) string {
+	for index := len(history) - 1; index >= 0; index-- {
+		message := history[index]
+		if message.Role != model.RoleAssistant {
+			continue
+		}
+		if text := strings.TrimSpace(message.Content); text != "" && !looksLikeNarration(text) {
+			return text
+		}
+	}
+	return ""
+}
+
+// narrationPrefixes are how a model announces the next action instead of
+// answering. A terminal round that starts with one of these and produced no
+// tool call ended without an answer.
+var narrationPrefixes = []string{
+	"let me", "let's", "let us", "i'll", "i will", "i should", "i need to",
+	"now let me", "now i ", "next,", "next i", "continuing", "i'm going to",
+	"let me see", "i am going to",
+}
+
+// looksLikeNarration reports that a terminal message is a statement of intent
+// rather than an answer. Empty text counts: nothing was answered.
+func looksLikeNarration(text string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(text))
+	if trimmed == "" {
+		return true
+	}
+	for _, prefix := range narrationPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// turnQuestion is what this run was asked: the explicit user message, else the
+// last user turn of the seeded history.
+func turnQuestion(input Input) string {
+	if question := strings.TrimSpace(input.UserMessage); question != "" {
+		return question
+	}
+	for index := len(input.Messages) - 1; index >= 0; index-- {
+		if input.Messages[index].Role != model.RoleUser {
+			continue
+		}
+		if text := strings.TrimSpace(input.Messages[index].Content); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+// questionAnchor restates the request at the end of the prompt, where compaction
+// cannot reach it.
+//
+// Compaction drops messages from the front of the history, and the request is
+// the first thing a long run loses. Without an anchor the run answers whatever
+// it just read: a search for Guan Yu's kills came back with a lecture on Liu
+// Bei's teacher, because a passage about Zheng Xuan was the most recent context
+// and nothing in the prompt still said what had been asked.
+// requiredToolChoice decides whether this sampling request must name a tool.
+//
+// The gate follows the agentic pipeline's retrieval gate: scan back through the
+// transcript to the turn's last user message; if no required tool was called
+// after it, force the first required tool that is visible in this request. One
+// real call lifts the gate — after that the model chooses freely again, and a
+// turn that already used one is never re-forced.
+func requiredToolChoice(tools []model.ToolSpec, required []string, history []model.Message) string {
+	if len(required) == 0 || len(tools) == 0 {
+		return ""
+	}
+	visible := make(map[string]bool, len(tools))
+	for _, spec := range tools {
+		visible[spec.Name] = true
+	}
+	needed := make(map[string]bool, len(required))
+	for _, name := range required {
+		needed[name] = true
+	}
+	for index := len(history) - 1; index >= 0; index-- {
+		message := history[index]
+		if message.Role == model.RoleUser {
+			break // the turn's question; nothing before it counts
+		}
+		if message.Role != model.RoleAssistant {
+			continue
+		}
+		for _, call := range message.ToolCalls {
+			if visible[call.Name] && needed[call.Name] {
+				return ""
+			}
+		}
+	}
+	for _, name := range required {
+		if visible[name] {
+			return name
+		}
+	}
+	return ""
+}
+
+func questionAnchor(question string) string {
+	trimmed := strings.TrimSpace(question)
+	if trimmed == "" {
+		return ""
+	}
+	return "The question for this turn, unchanged:\n" + trimmed +
+		"\n\nThe messages above are earlier turns and retrieved passages. Answer the question above; the passages are evidence for it, not a new question to answer."
+}
+
+// stoppingNote tells the answer call that the search was cut short, so the reply
+// can say so instead of implying it covered everything.
+//
+// Only a real ceiling counts: an exhausted budget, a pause, or unresolved calls.
+// "completion has no final text" is NOT a ceiling — it means the model narrated
+// its next step instead of writing the answer, and the search itself may be
+// complete. Treating that as truncation and telling the model not to present a
+// partial count made it drop names it had already found: the same run went from
+// 16 names to 6.
+func stoppingNote(state *State) string {
+	reason := strings.TrimSpace(state.Verdict.Reason)
+	cutShort := state.Verdict.Action == policy.ActionPause ||
+		strings.Contains(reason, "exhausted") ||
+		strings.Contains(reason, "no result")
+	if !cutShort {
+		return ""
+	}
+	if reason == "" {
+		reason = string(state.Verdict.Action)
+	}
+	var b strings.Builder
+	b.WriteString("The search ended early: " + reason + ".\n")
+	b.WriteString("Answer from everything already collected and cover all of it — do not drop items found earlier just because the search stopped. Add one sentence saying the list may not be complete.\n")
+	if total, open := planCounts(state.Plan); open > 0 {
+		fmt.Fprintf(&b, "%d of %d plan step(s) were left open.\n", open, total)
+	}
+	return b.String()
+}
+
+// planCounts reports how many steps a plan holds and how many are not done.
+//
+// renderPlan and the policy snapshot both read these numbers, so "the plan says
+// this is unfinished" cannot disagree between the prompt and the verdict: the
+// model is told to keep working on an open step and the loop refuses to call a
+// run finished while one remains.
+func planCounts(plan []toolkit.PlanStep) (total, open int) {
+	for _, step := range plan {
+		if strings.TrimSpace(step.Description) == "" {
+			continue
+		}
+		total++
+		if strings.TrimSpace(step.Status) != "completed" {
+			open++
+		}
+	}
+	return total, open
+}
+
 // renderPlan turns the model's own step list into a prompt section.
 //
 // It is appended after the transcript rather than into the system prompt: the
@@ -1019,7 +1422,7 @@ func renderPlan(plan []toolkit.PlanStep, concluding bool) string {
 	}
 	var b strings.Builder
 	b.WriteString("Plan state (from your plan tool, kept across rounds):\n")
-	open, written := 0, 0
+	written := 0
 	for _, step := range plan {
 		description := strings.TrimSpace(step.Description)
 		if description == "" {
@@ -1029,18 +1432,16 @@ func renderPlan(plan []toolkit.PlanStep, concluding bool) string {
 		if status == "" {
 			status = "pending"
 		}
-		if status != "completed" {
-			open++
-		}
 		written++
 		fmt.Fprintf(&b, "%d. [%s] %s\n", written, status, description)
 	}
+	_, open := planCounts(plan)
 	if written == 0 {
 		return ""
 	}
 	switch {
 	case concluding && open > 0:
-		fmt.Fprintf(&b, "%d step(s) are still open: state which part of the answer they leave unresolved.\n", open)
+		fmt.Fprintf(&b, "%d step(s) were left open. Answer from the evidence already collected: include every item you found and mention the gap in one sentence.\n", open)
 	case concluding:
 		b.WriteString("Every step is complete.\n")
 	case open > 0:
@@ -1110,6 +1511,111 @@ func stripCitationHandles(text string) string {
 func outputFingerprint(tool, content string) string {
 	sum := sha256.Sum256([]byte(tool + "\x00" + content))
 	return hex.EncodeToString(sum[:8])
+}
+
+// planFingerprint identifies a plan's shape and progress: the same steps with
+// the same statuses hash the same, so republishing it is not progress.
+func planFingerprint(plan []toolkit.PlanStep) string {
+	if len(plan) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, step := range plan {
+		b.WriteString(step.ID)
+		b.WriteString("\x00")
+		b.WriteString(step.Description)
+		b.WriteString("\x00")
+		b.WriteString(step.Status)
+		b.WriteString("\x01")
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:8])
+}
+
+// Evidence pool bounds for the answer call. The list is the run's own record of
+// what it retrieved, so it is worth re-sending even when History still carries
+// the same passages; the caps keep that from turning into the whole corpus.
+const (
+	// The pool is re-sent on every round, so its size is paid per round: these
+	// caps keep one run's memory bounded without dropping the passages that
+	// proved the earliest findings — the ones compaction removes first.
+	evidencePoolMaxItems = 160
+	evidencePoolMaxLine  = 320
+	evidencePoolMaxBytes = 24 << 10
+)
+
+// renderEvidencePool lists the evidence units a run collected, keyed by their
+// citation handle. It exists because History is a lossy view of the same
+// material: compaction drops old tool results first, and the passages that
+// proved the earliest findings are exactly the oldest.
+//
+// The wording matters in both directions. It has to tell the model this list is
+// its memory (so it stops re-fetching what it already has), and it must NOT read
+// as a complete corpus (a list-shaped question would otherwise be answered from
+// whatever happened to be collected by then).
+func renderEvidencePool(evidence []toolkit.Evidence) string {
+	if len(evidence) == 0 {
+		return ""
+	}
+	seen := make(map[string]struct{}, len(evidence))
+	var b strings.Builder
+	b.WriteString("## Collected evidence\n")
+	b.WriteString("Passages this run has already retrieved. The transcript above may have been compacted, so this list is your memory of what you have found so far: cite these handles as they are, and do not retrieve the same passage again unless you need its full text. An item that is NOT listed here has simply not been retrieved yet — its absence is not evidence that it does not exist.\n")
+	written := 0
+	for _, item := range evidence {
+		ref := strings.TrimSpace(item.Ref)
+		line := strings.TrimSpace(item.Snippet)
+		if ref == "" && line == "" {
+			continue
+		}
+		key := ref
+		if key == "" {
+			key = clip(line, 64)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		if written >= evidencePoolMaxItems || b.Len() >= evidencePoolMaxBytes {
+			b.WriteString("- … more evidence was collected than fits here; answer from what is listed and say what you could not restate.\n")
+			break
+		}
+		b.WriteString("- ")
+		if ref != "" {
+			b.WriteString(ref)
+			if line != "" {
+				b.WriteString(": ")
+			}
+		}
+		if line != "" {
+			b.WriteString(clip(line, evidencePoolMaxLine))
+		} else if item.Source != "" {
+			b.WriteString(item.Source)
+		}
+		b.WriteString("\n")
+		written++
+	}
+	if written == 0 {
+		return ""
+	}
+	return b.String()
+}
+
+// describeCall records what a call actually asked for and how much came back.
+//
+// The step log otherwise keeps only a tool name and an argument hash, which is
+// enough to spot a repeated call but not enough to explain a short answer: the
+// pattern behind it, and whether its output was large enough to be spilled, are
+// exactly the two facts that cannot be recovered after the run.
+func describeCall(call PendingCall, result toolkit.Result) string {
+	reason := strings.TrimSpace(call.Arguments)
+	if reason == "" {
+		reason = "-"
+	}
+	if size := len(result.Content); size > 0 {
+		reason = fmt.Sprintf("%s | %d bytes", reason, size)
+	}
+	return clip(reason, 180)
 }
 
 func toolNames(calls []model.ToolCall) string {

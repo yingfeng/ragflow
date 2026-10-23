@@ -17,6 +17,14 @@ import (
 )
 
 // DefaultInlineBytes is the threshold above which output is spilled.
+//
+// Do not raise it on the theory that read_spill rounds are wasted. A retrieval
+// result is a page of one-line match snippets: enough to LOCATE a chunk, not
+// enough to enumerate what is inside it. Spilling is what turns that into a
+// deliberate deep read — the model reads a whole chunk through read_spill and
+// picks the names out of it. Raising this to 32 KiB inlined the snippets
+// instead, and the same question went from 16 names in 8 rounds to 12 names in
+// 7: the run still read as much text, it just read less of each chunk.
 const DefaultInlineBytes = 8 << 10
 
 // The inline preview takes this share of the threshold. It is derived from the
@@ -112,8 +120,13 @@ func MaybeSpill(ctx context.Context, content string, threshold int) string {
 	}
 
 	id := store.Put(content)
-	return fmt.Sprintf("%s\n\n[output truncated: %d bytes total, stored as %s — call read_spill with id %q (offset=0, limit=%d) to read it in windows]",
-		truncateRunes(content, previewLimit), len(content), id, id, ReadWindowBytes)
+	// The offsets are spelled out because models otherwise guess them: a run was
+	// observed reading one payload at offset 0, 16383, 4000, 500 and then 0
+	// again, spending six rounds on the same bytes.
+	windows := (len(content) + ReadWindowBytes - 1) / ReadWindowBytes
+	return fmt.Sprintf("%s\n\n[output truncated: %d bytes total, stored as %s in %d windows of %d bytes. Read a window with read_spill(id=%q, offset=<0, %d, %d, ...>, limit=%d). Read each window at most once and stop as soon as what you need is covered.]",
+		truncateRunes(content, previewLimit), len(content), id, windows, ReadWindowBytes,
+		id, ReadWindowBytes, 2*ReadWindowBytes, ReadWindowBytes)
 }
 
 // Capability exposes read_spill.

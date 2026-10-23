@@ -41,6 +41,10 @@ export function SingleChatBox({ conversation }: IProps) {
   } = useSendMessage();
   const { data: userInfo } = useFetchUserInfo();
   const { data: currentDialog } = useFetchChat();
+  // A thread linked to an agent runs every turn through the agent, so the
+  // pipeline mode selector offers a choice the backend ignores. Hide it rather
+  // than show a control that changes nothing.
+  const isAgentChat = Boolean(currentDialog?.agent_id);
   const { createConversationBeforeUploadDocument } =
     useCreateConversationBeforeUploadDocument();
   const { conversationId } = useGetChatSearchParams();
@@ -129,7 +133,7 @@ export function SingleChatBox({ conversation }: IProps) {
           onUpload={handleUploadFile}
           isUploading={isUploading}
           removeFile={removeFile}
-          showReasoning
+          showReasoning={!isAgentChat}
           showInternet={showInternet}
         />
         {visible && (

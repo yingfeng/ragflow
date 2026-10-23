@@ -66,6 +66,9 @@ type RuntimeConfig struct {
 	AgentName      string
 	// SystemPrompt is the agent definition's instruction block.
 	SystemPrompt string
+	// Sampling pins the model's sampling behaviour. Nil keeps the provider
+	// default, which moves with the model — see definition.SamplingConfig.
+	Sampling *definition.SamplingConfig
 	// PolicyConfig and MaxRounds bound the loop.
 	PolicyConfig definition.PolicyConfig
 	MaxRounds    int
@@ -143,7 +146,15 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		}
 		chat = resolved
 	}
-	chatModel := NewModel(chat, ModelProviderConfig{})
+	// Sampling is pinned from the definition: the provider default moves with
+	// the model, and an unpinned run is not reproducible across a model swap
+	// (the agentic pipeline pins 0.5 for the same reason).
+	providerCfg := model.ProviderConfig{}
+	if cfg.Sampling != nil {
+		providerCfg.Temperature = cfg.Sampling.Temperature
+		providerCfg.TopP = cfg.Sampling.TopP
+	}
+	chatModel := NewModel(chat, providerCfg)
 
 	registry := toolkit.NewRegistry()
 	notes, err := registerCapabilities(ctx, registry, cfg)
@@ -198,19 +209,6 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		Approver:               approver,
 	}
 
-	// Delegation is registered after the deps exist, because the spawner needs
-	// the very loop it will run children on.
-	selfDelegation := false
-	if spawner, err := agentsubagent.New(deps, cfg.PolicyConfig, 0); err == nil {
-		// The store is what makes a child inspectable: without it the control
-		// tools cannot answer, so the spawner reports the plane as unavailable
-		// and only the blocking delegation tools are registered.
-		spawner = spawner.WithStore(cfg.Store)
-		if err := registry.Register(subagent.New(spawner)); err == nil {
-			selfDelegation = true
-		}
-	}
-
 	service, err := run.New(run.Config{
 		Loop: loop.Config{
 			Deps:         deps,
@@ -226,6 +224,29 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// Delegation is registered after the service, so the children inherit the
+	// service's step sink: a child's rounds belong in the run tables and the
+	// stream next to its parent's, and a spawner built from the bare deps would
+	// drop every one of them. The registry is read per round, so registering the
+	// tools after the graph is compiled still offers them to the parent, and the
+	// spawner's snapshot of the registry (taken before this registration) is what
+	// keeps children from delegating again.
+	childDeps := deps
+	childDeps.Sink = service.StepSink()
+	selfDelegation := false
+	if spawner, spawnErr := agentsubagent.New(childDeps, cfg.PolicyConfig, 0); spawnErr == nil {
+		// The store is what makes a child inspectable: without it the control
+		// tools cannot answer, so the spawner reports the plane as unavailable
+		// and only the blocking delegation tools are registered. The audit log
+		// makes the child's own trace readable under its run id.
+		spawner = spawner.WithStore(cfg.Store).
+			WithAudit(cfg.EventLog, cfg.EventLayers).
+			WithAgentIdentity(cfg.AgentID)
+		if registerErr := registry.Register(subagent.New(spawner)); registerErr == nil {
+			selfDelegation = true
+		}
 	}
 	if !selfDelegation {
 		notes = append(notes, "delegation tools are unavailable: the sub-agent spawner could not be built")

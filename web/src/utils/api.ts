@@ -322,6 +322,9 @@ export default {
   listHarnessApprovals: `${restAPIv1}/harness/approvals`,
   resolveHarnessApproval: (requestId: string) =>
     `${restAPIv1}/harness/approvals/${encodeURIComponent(requestId)}`,
+  // the agent that runs a thread: its definition is read and replaced as a version
+  harnessAgent: (agentId: string) =>
+    `${restAPIv1}/harness/agents/${encodeURIComponent(agentId)}`,
 
   // next chat
   fetchExternalChatInfo: (id: string) => `${restAPIv1}/chatbots/${id}/info`,

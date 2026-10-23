@@ -16,6 +16,7 @@ import (
 	"ragflow/internal/entity"
 	"ragflow/internal/harness/agent/definition"
 	"ragflow/internal/harness/agent/loop"
+	"ragflow/internal/harness/events"
 	"ragflow/internal/harness/store"
 	"ragflow/internal/harness/toolkit"
 	"ragflow/internal/harness/toolkit/subagent"
@@ -37,6 +38,15 @@ type Spawner struct {
 	maxRounds    int
 	store        *store.RunStore
 	readOnly     bool
+	// agentID is the definition the spawner's children run. A child inherits the
+	// parent's agent (same prompt, policy and tool surface), so its run row has
+	// to name that agent rather than a name the model chose.
+	agentID string
+	// audit is the event log child runs write to. Nil leaves the child under the
+	// parent's recorder, which is the default only because a host without an
+	// event log has no trace to write in the first place.
+	audit  events.EventLog
+	layers events.LayerFilter
 
 	mu      sync.Mutex
 	runners map[int]*loop.Runner
@@ -50,6 +60,66 @@ type Spawner struct {
 func (s *Spawner) WithStore(runStore *store.RunStore) *Spawner {
 	s.store = runStore
 	return s
+}
+
+// WithAgentIdentity names the agent a child run belongs to. Children run the
+// agent that spawned them, so their run rows are attributable to it.
+func (s *Spawner) WithAgentIdentity(agentID string) *Spawner {
+	if s == nil {
+		return s
+	}
+	s.mu.Lock()
+	s.agentID = agentID
+	s.mu.Unlock()
+	return s
+}
+
+// WithAudit gives each child its own audit trace.
+//
+// A child is a run, and the run id is the trace id: GET /runs/{child}/events
+// reads the child's trace, so its model calls, tool calls and verdicts have to
+// be recorded under the child's id. Inheriting the parent's recorder instead
+// wrote every child event into the parent's trace, where a reader looking up the
+// child by id finds nothing and the child looks like it never ran.
+func (s *Spawner) WithAudit(log events.EventLog, layers events.LayerFilter) *Spawner {
+	if s == nil || log == nil {
+		return s
+	}
+	s.mu.Lock()
+	s.audit = log
+	if layers != nil {
+		s.layers = layers
+	}
+	s.mu.Unlock()
+	return s
+}
+
+// childAudit scopes the child's context to its own trace. Without an event log
+// the parent's recorder (if any) is inherited unchanged.
+func (s *Spawner) childAudit(ctx context.Context, runID string) context.Context {
+	s.mu.Lock()
+	log := s.audit
+	layers := s.layers
+	s.mu.Unlock()
+	if log == nil {
+		return ctx
+	}
+	if layers == nil {
+		layers = events.DefaultLayerFilter
+	}
+	recorder := events.NewEventRecorder(log,
+		events.WithTraceID(runID),
+		events.WithThreadID(runID),
+		events.WithLayers(layers),
+	)
+	return events.ContextWithRecorder(ctx, recorder)
+}
+
+// agentIdentity reads the agent a child run belongs to.
+func (s *Spawner) agentIdentity() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.agentID
 }
 
 // WithReadOnly restricts children to read-only tools. This is the Astra
@@ -138,7 +208,7 @@ func (s *Spawner) openChild(ctx context.Context, runID, parentRunID string, req 
 	}
 	record := &entity.HarnessAgentRun{
 		ID:          runID,
-		AgentID:     req.AgentID,
+		AgentID:     s.agentIdentity(),
 		ParentRunID: parentRunID,
 		Depth:       req.Depth,
 		TenantID:    req.Scope.TenantID,
@@ -176,7 +246,10 @@ func (s *Spawner) Spawn(ctx context.Context, req subagent.Request) (subagent.Out
 	}
 
 	// The child sees the delegation depth it was created at, so a registry that
-	// still contains the delegation tools cannot recurse past the limit.
+	// still contains the delegation tools cannot recurse past the limit. Its own
+	// run state is detached from the parent's context: cancellation still
+	// propagates, but the transcript, spill handles and answer stream do not.
+	ctx = loop.FreshRunContext(ctx)
 	ctx = subagent.WithDepth(ctx, req.Depth)
 
 	// Half the parent's remaining rounds, rounded up: the child needs enough to
@@ -189,10 +262,11 @@ func (s *Spawner) Spawn(ctx context.Context, req subagent.Request) (subagent.Out
 	runID := uuid.NewString()
 	parentRunID := toolkit.RunIDFrom(ctx)
 	s.openChild(ctx, runID, parentRunID, req)
+	ctx = s.childAudit(ctx, runID)
 
 	outcome, err := runner.Invoke(ctx, &loop.Input{
 		RunID:       runID,
-		AgentName:   req.AgentID,
+		AgentName:   s.agentIdentity(),
 		UserMessage: req.Prompt,
 		Scope:       req.Scope,
 	}, nil)

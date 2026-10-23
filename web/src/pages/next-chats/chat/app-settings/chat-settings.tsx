@@ -22,6 +22,7 @@ import { useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
 import { z } from 'zod';
+import { AgentExecutionSettings } from './agent-execution-settings';
 import ChatBasicSetting from './chat-basic-settings';
 import { ChatPromptEngine } from './chat-prompt-engine';
 import { SavingButton } from './saving-button';
@@ -210,6 +211,7 @@ export function ChatSettings({ hasSingleChatBox }: ChatSettingsProps) {
                       collapseOpen={advancedSettingOpen}
                       onCollapseOpenChange={onAdvancedSettingOpenChange}
                     ></ChatPromptEngine>
+                    <AgentExecutionSettings />
                   </section>
                 </ScrollArea>
 

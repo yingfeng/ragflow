@@ -28,8 +28,7 @@ func (c *Capability) controlTools() []model.ToolSpec {
 			Description: fmt.Sprintf("Start a child agent without waiting for it and return its run id. Use %s to collect the answer. A child never outlives its parent run.",
 				StatusName),
 			Parameters: toolkit.ObjectSchema(map[string]any{
-				"prompt":   map[string]any{"type": "string", "description": "Self-contained task statement."},
-				"agent_id": map[string]any{"type": "string", "description": "Optional agent definition to run."},
+				"prompt": map[string]any{"type": "string", "description": "Self-contained task statement."},
 			}, "prompt"),
 		},
 		{
@@ -66,8 +65,7 @@ func (c *Capability) controlTools() []model.ToolSpec {
 }
 
 type startArgs struct {
-	Prompt  string `json:"prompt"`
-	AgentID string `json:"agent_id"`
+	Prompt string `json:"prompt"`
 }
 
 type statusArgs struct {
@@ -114,10 +112,9 @@ func (c *Capability) start(ctx context.Context, call toolkit.Call) (toolkit.Resu
 		return toolkit.Result{}, fmt.Errorf("prompt is required")
 	}
 	runID, err := c.controller.Start(ctx, Request{
-		AgentID: args.AgentID,
-		Prompt:  args.Prompt,
-		Scope:   toolkit.ScopeFrom(ctx),
-		Depth:   DepthFrom(ctx) + 1,
+		Prompt: args.Prompt,
+		Scope:  toolkit.ScopeFrom(ctx),
+		Depth:  DepthFrom(ctx) + 1,
 	})
 	if err != nil {
 		return toolkit.Result{}, err

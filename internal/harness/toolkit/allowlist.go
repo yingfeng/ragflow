@@ -95,6 +95,17 @@ func WithAllowlist(ctx context.Context) context.Context {
 	if AllowlistFrom(ctx) != nil {
 		return ctx
 	}
+	return ReplaceAllowlist(ctx)
+}
+
+// ReplaceAllowlist installs a fresh holder, replacing an inherited one.
+//
+// The holder is mutable: skill_load narrows it and every later round reads it.
+// A run is the unit of restriction, and a delegated child is invoked with its
+// parent's context, so inheriting the holder would let either run narrow the
+// other — a skill loaded in a child would restrict the parent's next round, and
+// a parent's skill would silently restrict the child.
+func ReplaceAllowlist(ctx context.Context) context.Context {
 	return context.WithValue(ctx, allowlistKey{}, NewAllowlist())
 }
 

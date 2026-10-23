@@ -1073,7 +1073,15 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
         'Dangerous tools (shell, writes outside the process) wait for your approval when enabled.',
       agentApprovalAsk: 'Ask me first',
       agentApprovalAuto: 'Run without asking',
+      agentExecution: 'Agent settings',
+      agentExecutionTip:
+        'Saving stores a new version of the agent. Turns already answered keep the version they ran with; the next turn uses this one.',
+      agentPrompt: 'Agent instructions',
+      agentPromptTip:
+        'How the agent researches the reply. The chat prompt above shapes the wording of the reply.',
+      agentVersion: 'v{{version}}',
       agentSteps: 'Agent steps ({{count}})',
+      agentReasoning: 'Thinking ({{count}} rounds)',
       approvalTitle: 'Tool approval required',
       approvalPending: 'Waiting for your decision',
       approvalAllow: 'Allow',

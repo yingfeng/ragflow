@@ -104,34 +104,69 @@ func (b Budget) TierFor(usedTokens int) Tier {
 	}
 }
 
-// keepRecentToolResults is the adaptive counterpart of Astra's microcompact:
-// the more pressure, the fewer tool results stay inline.
-func keepRecentToolResults(tier Tier, base int) int {
+// DefaultKeepToolResultBytes is the byte budget for verbatim tool output kept in
+// the transcript at zero pressure.
+//
+// It replaces a fixed result COUNT (six results), and the difference is the whole
+// reason an enumeration came out short: the evidence for a list is accumulated
+// across many rounds, so a count cap deletes exactly the rounds that carry it —
+// a 29-round enumeration was observed answering from the six results it could
+// still see. A byte budget keeps every round that actually fits instead of
+// counting rounds as if each one cost the same.
+// The number is sized from the workload it has to survive: a 24-round
+// enumeration pulls roughly 8 KiB of retrieval output per round, and the earlier
+// 96 KiB budget kept only the last ~12 of them. The rounds it dropped were the
+// ones holding the names already found, so the run re-read the same passages
+// (34 spill reads in that run) and the longer it searched the shorter its list
+// got — 14 names at 10 rounds, 9 names at 24. This budget holds a whole
+// enumeration instead, which is what removes the reason to re-read at all.
+const DefaultKeepToolResultBytes = 160 << 10
+
+// toolResultByteBudget is the adaptive counterpart of Astra's microcompact: the
+// more pressure, the fewer bytes of tool output stay verbatim.
+//
+// Zero pressure clears NOTHING, and the zero is deliberate rather than an
+// unlimited setting. The agentic loop these tools come from keeps every tool
+// result in the transcript until the window itself fills, and it answers a
+// counting question in a few rounds because of it: one broad search returns
+// thirty passages at once, and every later round still sees all thirty. Clearing
+// on the normal path removes exactly that advantage — the older passages are the
+// ones holding the first names found, so the answer gets shorter the longer the
+// run searches.
+func toolResultByteBudget(tier Tier, base int) int {
+	if tier <= TierNormal {
+		return 0
+	}
+	if base <= 0 {
+		base = DefaultKeepToolResultBytes
+	}
+	shrink := func(factor int, floor int) int {
+		budget := base / factor
+		if budget < floor {
+			return floor
+		}
+		return budget
+	}
 	switch tier {
 	case TierAggressivePrune:
-		return 1
+		return shrink(8, 8<<10)
 	case TierCompactHistory:
-		if base > 2 {
-			return 2
-		}
-		return base
-	case TierTrimSchemas:
-		if base > 4 {
-			return 4
-		}
-		return base
+		return shrink(4, 16<<10)
 	default:
-		if base < 6 {
-			return 6
-		}
-		return base
+		return shrink(2, 24<<10)
 	}
 }
 
-// toolResultBudget shrinks the per-result inline limit under pressure.
+// toolResultBudget shrinks the per-result ceiling under pressure.
+//
+// This is a rendering guard, not memory management: the content volume is
+// already bounded by the loop's spill threshold, which replaces an oversized
+// result with a preview plus a handle. The ceiling must therefore stay ABOVE one
+// read_spill window (16 KiB) — cutting there would truncate the very bytes the
+// model just asked to read back.
 func toolResultBudget(tier Tier, base int) int {
 	if base <= 0 {
-		base = 16 << 10
+		base = 64 << 10
 	}
 	shrink := func(factor int, floor int) int {
 		limit := base / factor
@@ -142,11 +177,11 @@ func toolResultBudget(tier Tier, base int) int {
 	}
 	switch tier {
 	case TierAggressivePrune:
-		return shrink(8, 2<<10)
+		return shrink(4, 20<<10)
 	case TierCompactHistory:
-		return shrink(2, 4<<10)
+		return shrink(2, 24<<10)
 	case TierTrimSchemas:
-		return shrink(1, 8<<10)
+		return shrink(1, 32<<10)
 	default:
 		return base
 	}

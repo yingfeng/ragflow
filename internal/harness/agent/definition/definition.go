@@ -69,6 +69,16 @@ type RSIConfig struct {
 }
 
 // Definition is what a user writes.
+// SamplingConfig pins how the run's model samples. Without it the provider
+// default applies, and the default changes with the model: a comparison
+// between two models is then also a comparison between two temperatures, and
+// no run is reproducible across a model swap. agentic_rag pins 0.5 for exactly
+// this reason (conf/agentic_rag.yaml).
+type SamplingConfig struct {
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"top_p,omitempty"`
+}
+
 type Definition struct {
 	ID     string       `json:"id"`
 	Name   string       `json:"name"`
@@ -76,6 +86,9 @@ type Definition struct {
 	Caps   []CapRef     `json:"caps,omitempty"`
 	Policy PolicyConfig `json:"policy,omitempty"`
 	RSI    RSIConfig    `json:"rsi,omitempty"`
+	// Sampling pins the model's sampling behaviour for this agent. Nil keeps
+	// the provider default, which is a moving target — see SamplingConfig.
+	Sampling *SamplingConfig `json:"sampling,omitempty"`
 
 	// Addendum is written only by RSI (prompt.addendum surface).
 	Addendum string `json:"addendum,omitempty"`
@@ -111,6 +124,14 @@ func (d *Definition) Validate() error {
 	if d.Policy.MaxRounds < 0 || d.Policy.MaxTokens < 0 || d.Policy.MaxToolCalls < 0 ||
 		d.Policy.MaxWallSec < 0 || d.Policy.MaxCostUSD < 0 {
 		return errors.New("definition: policy limits must not be negative")
+	}
+	if d.Sampling != nil {
+		if d.Sampling.Temperature != nil && (*d.Sampling.Temperature < 0 || *d.Sampling.Temperature > 2) {
+			return fmt.Errorf("definition: sampling temperature %v outside [0, 2]", *d.Sampling.Temperature)
+		}
+		if d.Sampling.TopP != nil && (*d.Sampling.TopP <= 0 || *d.Sampling.TopP > 1) {
+			return fmt.Errorf("definition: sampling top_p %v outside (0, 1]", *d.Sampling.TopP)
+		}
 	}
 	if _, err := toolkit.NewRuleSet(d.Policy.Permissions); err != nil {
 		return fmt.Errorf("definition: %w", err)

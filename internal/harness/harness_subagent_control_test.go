@@ -23,7 +23,7 @@ import (
 type controlModel struct{}
 
 func (*controlModel) Complete(_ context.Context, req model.Request) (model.Response, error) {
-	last := req.Messages[len(req.Messages)-1]
+	last := routingTarget(req)
 	switch {
 	case last.Role == model.RoleTool && strings.Contains(last.Content, "<subagent_children"):
 		return response("parent: " + last.Content), nil
@@ -89,9 +89,9 @@ func TestSubagentControlPlaneStartAndStatus(t *testing.T) {
 		}
 	}
 
-	runner, err := BuildLoop(loop.Config{Deps: deps})
+	runner, err := loop.Build(loop.Config{Deps: deps})
 	if err != nil {
-		t.Fatalf("BuildLoop: %v", err)
+		t.Fatalf("Build: %v", err)
 	}
 	outcome, err := runner.Invoke(context.Background(), &loop.Input{RunID: "run-control", UserMessage: "delegate"}, nil)
 	if err != nil {

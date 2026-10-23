@@ -49,19 +49,42 @@ func TestTierForThresholds(t *testing.T) {
 	}
 }
 
-func TestKeepRecentToolResultsShrinksWithPressure(t *testing.T) {
-	if got := keepRecentToolResults(TierNormal, 4); got != 6 {
-		t.Errorf("normal = %d, want 6", got)
+// TestToolResultByteBudgetShrinksWithPressure pins the retention budget: normal
+// pressure clears nothing, and only real pressure starts dropping the older
+// rounds. It is a byte budget rather than a result count because an enumeration
+// accumulates its evidence over rounds.
+func TestToolResultByteBudgetShrinksWithPressure(t *testing.T) {
+	normal := toolResultByteBudget(TierNormal, DefaultKeepToolResultBytes)
+	trim := toolResultByteBudget(TierTrimSchemas, DefaultKeepToolResultBytes)
+	compact := toolResultByteBudget(TierCompactHistory, DefaultKeepToolResultBytes)
+	prune := toolResultByteBudget(TierAggressivePrune, DefaultKeepToolResultBytes)
+
+	if normal != 0 {
+		t.Errorf("normal budget = %d, want 0 (no clearing at zero pressure)", normal)
 	}
-	if got := keepRecentToolResults(TierCompactHistory, 6); got != 2 {
-		t.Errorf("compact = %d, want 2", got)
+	if !(trim > compact && compact > prune) {
+		t.Errorf("budgets must shrink with pressure: trim=%d compact=%d prune=%d", trim, compact, prune)
 	}
-	if got := keepRecentToolResults(TierAggressivePrune, 6); got != 1 {
-		t.Errorf("prune = %d, want 1", got)
+	if prune < 8<<10 {
+		t.Errorf("prune budget = %d, must still hold one spilled retrieval page (8 KiB)", prune)
 	}
 }
 
-func TestBuildKeepsRecentToolResultsAtNormalPressure(t *testing.T) {
+// TestToolResultCeilingStaysAboveReadWindow pins the ordering that keeps C from
+// cutting what spill just stored: the per-result rendering ceiling must never
+// fall below one read_spill window (16 KiB), at any tier.
+func TestToolResultCeilingStaysAboveReadWindow(t *testing.T) {
+	for _, tier := range []Tier{TierNormal, TierTrimSchemas, TierCompactHistory, TierAggressivePrune} {
+		if got := toolResultBudget(tier, 64<<10); got < 16<<10 {
+			t.Errorf("tier %v ceiling = %d, must stay at or above the 16 KiB read window", tier, got)
+		}
+	}
+}
+
+// A run must not lose passages it already read while the window still has room.
+// Clearing the older results at zero pressure left a 29-round enumeration
+// answering from the six results that were still visible.
+func TestBuildKeepsEveryToolResultAtNormalPressure(t *testing.T) {
 	builder := New(Config{MaxInputTokens: 100_000})
 	history := []model.Message{{Role: model.RoleUser, Content: "go"}}
 	for i := 0; i < 8; i++ {
@@ -81,8 +104,8 @@ func TestBuildKeepsRecentToolResultsAtNormalPressure(t *testing.T) {
 		}
 		kept++
 	}
-	if kept != 6 || cleared != 2 {
-		t.Fatalf("kept=%d cleared=%d, want 6/2", kept, cleared)
+	if kept != 8 || cleared != 0 {
+		t.Fatalf("kept=%d cleared=%d, want every result kept at normal pressure", kept, cleared)
 	}
 }
 

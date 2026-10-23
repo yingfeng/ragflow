@@ -21,8 +21,12 @@ import {
   ChevronDown,
   ChevronRight,
   ShieldQuestion,
+  Sparkles,
   Wrench,
 } from 'lucide-react';
+
+/** A round the model spent working before it called a tool. */
+const ReasoningKind = 'reasoning';
 import { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -105,21 +109,34 @@ export function ApprovalCard({ event }: { event: IThinkEvent }) {
 }
 
 /**
- * An agent turn's activity: the approvals it is blocked on, and the tool calls
- * it already made. Steps stay collapsed by default — they are the working, not
- * the answer — while an approval is always visible because the turn cannot
- * finish without it.
+ * An agent turn's activity: the approvals it is blocked on, the rounds it spent
+ * thinking, and the tool calls it made. Steps stay collapsed by default — they
+ * are the working, not the answer — while an approval is always visible because
+ * the turn cannot finish without it.
+ *
+ * The answer area holds only the turn's final text. A round that went on to call
+ * a tool lands here instead, which is what keeps one round from overwriting the
+ * text the next one prints.
  */
 export function AgentActivity({ events }: { events?: IThinkEvent[] }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const [reasoningExpanded, setReasoningExpanded] = useState(false);
 
   const approvals = useMemo(
     () => (events ?? []).filter((event) => event.kind === 'approval'),
     [events],
   );
+  const reasoning = useMemo(
+    () => (events ?? []).filter((event) => event.kind === ReasoningKind),
+    [events],
+  );
   const steps = useMemo(
-    () => (events ?? []).filter((event) => event.kind !== 'approval'),
+    () =>
+      (events ?? []).filter(
+        (event) =>
+          event.kind !== 'approval' && event.kind !== ReasoningKind,
+      ),
     [events],
   );
 
@@ -132,6 +149,36 @@ export function AgentActivity({ events }: { events?: IThinkEvent[] }) {
       {approvals.map((event) => (
         <ApprovalCard key={event.request_id ?? event.summary} event={event} />
       ))}
+      {reasoning.length > 0 && (
+        <div className="rounded-md border border-border-button">
+          <button
+            type="button"
+            className="flex w-full items-center gap-2 px-3 py-2 text-xs text-text-secondary"
+            onClick={() => setReasoningExpanded((value) => !value)}
+            data-testid="agent-reasoning-toggle"
+          >
+            {reasoningExpanded ? (
+              <ChevronDown className="size-3" />
+            ) : (
+              <ChevronRight className="size-3" />
+            )}
+            <Sparkles className="size-3" />
+            {t('chat.agentReasoning', { count: reasoning.length })}
+          </button>
+          {reasoningExpanded && (
+            <div className="flex flex-col gap-2 border-t border-border-button px-3 py-2">
+              {reasoning.map((event, index) => (
+                <p
+                  key={`reasoning-${index}`}
+                  className="whitespace-pre-wrap text-xs text-text-secondary"
+                >
+                  {event.summary}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       {steps.length > 0 && (
         <div className="rounded-md border border-border-button">
           <button

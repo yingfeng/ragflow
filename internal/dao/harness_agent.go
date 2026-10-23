@@ -100,8 +100,10 @@ func (d *HarnessAgentDAO) CreateWithVersion(ctx context.Context, db *gorm.DB, ag
 	})
 }
 
-// AppendVersion stores a new version and points the agent at it.
-func (d *HarnessAgentDAO) AppendVersion(ctx context.Context, agentID string, version int, definitionBody, createdBy string) (*entity.HarnessAgentVersion, error) {
+// AppendVersion stores a new version and points the agent at it. The agent's own
+// name moves with the version, in the same transaction: a row whose name disagrees
+// with the definition it points at is two answers to one question.
+func (d *HarnessAgentDAO) AppendVersion(ctx context.Context, agentID string, version int, definitionBody, createdBy, name string) (*entity.HarnessAgentVersion, error) {
 	record := &entity.HarnessAgentVersion{
 		AgentID:    agentID,
 		Version:    version,
@@ -114,7 +116,11 @@ func (d *HarnessAgentDAO) AppendVersion(ctx context.Context, agentID string, ver
 		}
 		return tx.Model(&entity.HarnessAgent{}).
 			Where("id = ?", agentID).
-			Updates(map[string]any{"current_version_id": record.ID, "update_time": record.CreateTime}).Error
+			Updates(map[string]any{
+				"current_version_id": record.ID,
+				"name":               name,
+				"update_time":        record.CreateTime,
+			}).Error
 	})
 	if err != nil {
 		return nil, err

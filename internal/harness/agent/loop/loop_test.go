@@ -19,9 +19,14 @@ type fakeCap struct {
 	err      error
 	invoked  int
 	failOnce bool
+	// required names the tools this capability gates on; nil disables the gate.
+	required []string
 }
 
 func (f *fakeCap) Name() string { return "fake" }
+
+// RequiredTools implements toolkit.RequiredToolList when the test asks for a gate.
+func (f *fakeCap) RequiredTools() []string { return f.required }
 
 func (f *fakeCap) Tools() []model.ToolSpec {
 	return []model.ToolSpec{{
@@ -205,19 +210,36 @@ func TestLoop_StagnantRunStillAnswers(t *testing.T) {
 	if outcome.Text != "关羽斩了颜良、文丑等六将" {
 		t.Fatalf("text = %q, want the synthesized answer", outcome.Text)
 	}
-	if !strings.Contains(outcome.Stopped, "no new evidence") {
-		t.Fatalf("stopped = %q, want the stagnation verdict", outcome.Stopped)
+	// The stall is described to the run instead of ending it: the round that
+	// added no evidence is told so, and keeps the turn.
+	if outcome.FinalState.Nudges != 1 {
+		t.Fatalf("nudges = %d, want the stall reported once", outcome.FinalState.Nudges)
 	}
 	requests := mdl.Requests()
 	if len(requests) != 5 {
 		t.Fatalf("model calls = %d, want 4 rounds + 1 answer", len(requests))
 	}
-	if len(requests[4].Tools) != 0 {
-		t.Errorf("answer request carried %d tools, want none", len(requests[4].Tools))
+	if !requestMentions(requests[4], "retrieved nothing new") {
+		t.Fatalf("the nudge never reached the model: %+v", requests[4].Messages)
+	}
+	// The post-nudge round is an ordinary round: it still holds the tools, and
+	// the answer it wrote ended the run without a separate answer call.
+	if len(requests[4].Tools) == 0 {
+		t.Error("the post-nudge round was stripped of its tools")
 	}
 	if len(outcome.Errors) != 0 {
 		t.Errorf("errors = %+v", outcome.Errors)
 	}
+}
+
+// requestMentions reports whether any message in the request contains text.
+func requestMentions(request model.Request, text string) bool {
+	for _, message := range request.Messages {
+		if strings.Contains(message.Content, text) {
+			return true
+		}
+	}
+	return false
 }
 
 // freshOutputCap returns different content on every call, which is what a
@@ -246,6 +268,9 @@ func TestLoop_PlanSurvivesIntoNextPrompt(t *testing.T) {
 	}
 	mdl := model.NewFake(
 		model.CallTool("c1", "todo_write", `{"task":"count","steps":[{"id":"1","description":"检索关羽斩将","status":"in_progress"},{"id":"2","description":"核对五关六将名单","status":"pending"}]}`),
+		// The open steps keep the run alive for one grace round, so a second
+		// reply is what finally ends it (see TestLoop_OpenPlanStopsAfterOneGraceRound).
+		model.Reply("共 6 人"),
 		model.Reply("共 6 人"),
 	)
 	runner := buildRunner(t, mdl, builtinCap, Config{})
@@ -262,8 +287,8 @@ func TestLoop_PlanSurvivesIntoNextPrompt(t *testing.T) {
 	}
 
 	requests := mdl.Requests()
-	if len(requests) != 2 {
-		t.Fatalf("model calls = %d, want 2", len(requests))
+	if len(requests) != 3 {
+		t.Fatalf("model calls = %d, want 3", len(requests))
 	}
 	second := ""
 	for _, message := range requests[1].Messages {
@@ -333,5 +358,314 @@ func TestLoop_ResumeDoesNotReplayMutatingCall(t *testing.T) {
 	}
 	if !noticed {
 		t.Fatal("the model was never told the call may have taken effect")
+	}
+}
+
+// An answer written while the model's own plan still has open steps is the
+// "12 of 16" failure: it reads as a conclusion while the work is unfinished.
+// Completion gives one round of grace to reopen the steps instead of finishing.
+func TestLoop_OpenPlanStepDoesNotFinish(t *testing.T) {
+	builtinCap, err := builtin.New(context.Background())
+	if err != nil {
+		t.Fatalf("builtin: %v", err)
+	}
+	mdl := model.NewFake(
+		model.CallTool("c1", "todo_write", `{"task":"count","steps":[{"id":"1","description":"检索关羽斩将","status":"completed"},{"id":"2","description":"核对五关六将名单","status":"pending"}]}`),
+		// Terminal, but a step is still open: this must not end the run.
+		model.Reply("共 12 人"),
+		model.CallTool("c2", "todo_write", `{"task":"count","steps":[{"id":"1","description":"检索关羽斩将","status":"completed"},{"id":"2","description":"核对五关六将名单","status":"completed"}]}`),
+		model.Reply("共 16 人"),
+	)
+	runner := buildRunner(t, mdl, builtinCap, Config{})
+
+	outcome, err := runner.Invoke(context.Background(), &Input{RunID: "run-plan", UserMessage: "关羽杀了多少人"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if outcome.Text != "共 16 人" {
+		t.Fatalf("text = %q, want the answer written after the plan closed", outcome.Text)
+	}
+	if calls := mdl.Calls(); calls != 4 {
+		t.Fatalf("model calls = %d, want 4: the first answer must not have finished the run", calls)
+	}
+	if outcome.Verdict.Action != policy.ActionFinish {
+		t.Fatalf("verdict = %s (%s)", outcome.Verdict.Action, outcome.Verdict.Reason)
+	}
+	if strings.Contains(outcome.Stopped, "plan steps open") {
+		t.Fatalf("stopped = %q, want no open steps at the end", outcome.Stopped)
+	}
+}
+
+// A model that restates its answer without working on the open steps is not
+// converging. The run must end after one grace round and the stop record must
+// say how much of the plan was left, so a partial count is visible downstream.
+func TestLoop_OpenPlanStopsAfterOneGraceRound(t *testing.T) {
+	builtinCap, err := builtin.New(context.Background())
+	if err != nil {
+		t.Fatalf("builtin: %v", err)
+	}
+	mdl := model.NewFake(
+		model.CallTool("c1", "todo_write", `{"task":"count","steps":[{"id":"1","description":"检索关羽斩将","status":"completed"},{"id":"2","description":"核对五关六将名单","status":"pending"}]}`),
+		model.Reply("共 12 人"),
+		model.Reply("共 12 人"),
+	)
+	runner := buildRunner(t, mdl, builtinCap, Config{})
+
+	outcome, err := runner.Invoke(context.Background(), &Input{RunID: "run-plan-stuck", UserMessage: "关羽杀了多少人"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if calls := mdl.Calls(); calls != 3 {
+		t.Fatalf("model calls = %d, want 3 (one grace round, not a budget burn)", calls)
+	}
+	if !strings.Contains(outcome.Stopped, "1/2 plan steps open") {
+		t.Fatalf("stopped = %q, want the open plan steps reported", outcome.Stopped)
+	}
+}
+
+// A new query over the same chunks is not progress. Retrieval tools publish
+// chunk ids as evidence; when that pool stops growing the run is done searching
+// even though every round returns fresh text with a different snippet.
+type sameChunkCap struct{ calls int }
+
+func (c *sameChunkCap) Name() string { return "same-chunk" }
+
+func (c *sameChunkCap) Tools() []model.ToolSpec {
+	return []model.ToolSpec{{
+		Name:       "rag_search",
+		Parameters: toolkit.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}}, "query"),
+	}}
+}
+
+func (c *sameChunkCap) Invoke(_ context.Context, call toolkit.Call) (toolkit.Result, error) {
+	c.calls++
+	return toolkit.Result{
+		Content:  fmt.Sprintf("<chunk chunk_id=\"chunk-1\">snippet for %s</chunk>", call.Arguments),
+		Evidence: []toolkit.Evidence{{Source: "doc-1", Ref: "chunk-1"}},
+	}, nil
+}
+
+func TestLoop_SameChunksAreNotProgress(t *testing.T) {
+	capability := &sameChunkCap{}
+	mdl := model.NewFake(
+		model.CallTool("c1", "rag_search", `{"query":"a"}`),
+		model.CallTool("c2", "rag_search", `{"query":"b"}`),
+		model.CallTool("c3", "rag_search", `{"query":"c"}`),
+		model.CallTool("c4", "rag_search", `{"query":"d"}`),
+		model.Reply("共 14 人"),
+	)
+	runner := buildRunner(t, mdl, capability, Config{})
+
+	outcome, err := runner.Invoke(context.Background(), &Input{RunID: "run-stagnant", UserMessage: "关羽杀了多少人"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if calls := mdl.Calls(); calls != 5 {
+		t.Fatalf("model calls = %d, want 5: the stall is reported, not acted on", calls)
+	}
+	if outcome.FinalState.Nudges != 1 {
+		t.Fatalf("nudges = %d, want the flat round reported once", outcome.FinalState.Nudges)
+	}
+	if outcome.Verdict.Action != policy.ActionFinish {
+		t.Fatalf("verdict = %+v, want the answer to finish the run", outcome.Verdict)
+	}
+}
+
+// A stall never ends a run by itself. It is reported twice, then the answer call
+// takes the evidence that was collected; the budgets stay the only hard stop.
+func TestLoop_StallHandsOverToTheAnswerCall(t *testing.T) {
+	capability := &sameChunkCap{}
+	script := make([]model.Step, 0, 11)
+	for index := 0; index < 10; index++ {
+		script = append(script, model.CallTool(fmt.Sprintf("c%d", index), "rag_search", fmt.Sprintf(`{"query":"%d"}`, index)))
+	}
+	script = append(script, model.Reply("共 14 人"))
+	mdl := model.NewFake(script...)
+	runner := buildRunner(t, mdl, capability, Config{})
+
+	outcome, err := runner.Invoke(context.Background(), &Input{RunID: "run-stall", UserMessage: "关羽杀了多少人"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if outcome.Text != "共 14 人" {
+		t.Fatalf("text = %q, want the answer written from the evidence", outcome.Text)
+	}
+	if outcome.FinalState.Nudges != 2 {
+		t.Fatalf("nudges = %d, want the stall reported twice", outcome.FinalState.Nudges)
+	}
+	if outcome.Verdict.Code != "stalled" {
+		t.Fatalf("verdict = %+v, want the stalled hand-off", outcome.Verdict)
+	}
+	if !strings.Contains(outcome.Stopped, "stalled") {
+		t.Fatalf("stopped = %q, want the stalled cause recorded", outcome.Stopped)
+	}
+}
+
+// A terminal round that only narrates the next step is not an answer. Delivering
+// it left a real run replying "Let me see the final truncated chunk and continue
+// searching for more kills." with no result at all.
+func TestLoop_NarrationIsNotAnAnswer(t *testing.T) {
+	capability := &fakeCap{
+		tool:   "rag_search",
+		result: toolkit.Result{Content: "关羽斩颜良", Evidence: []toolkit.Evidence{{Source: "doc", Ref: "chunk-1"}}},
+	}
+	mdl := model.NewFake(
+		model.CallTool("c1", "rag_search", `{"query":"关羽 斩"}`),
+		model.Reply("Let me see the final truncated chunk and continue searching for more kills."),
+		model.Reply("已核实 14 人"),
+	)
+	runner := buildRunner(t, mdl, capability, Config{})
+
+	outcome, err := runner.Invoke(context.Background(), &Input{RunID: "run-narration", UserMessage: "关羽杀了多少人"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if outcome.Text != "已核实 14 人" {
+		t.Fatalf("text = %q, want the answer call's text, not the narration", outcome.Text)
+	}
+	if calls := mdl.Calls(); calls != 3 {
+		t.Fatalf("model calls = %d, want 3 (retrieval, narration, answer)", calls)
+	}
+}
+
+// TestLoop_QuestionIsAnchoredEveryRound pins the one injection the loop must
+// keep: every round names the turn's own question.
+//
+// A chat turn arrives with the whole thread in History, so the prompt carries
+// every earlier question too. Without the anchor the model lost track of which
+// one it was answering: a kill-count question about 三国 came back as an answer
+// to a list of 秦 and 霸王别姬 questions asked in earlier turns.
+//
+// It must not carry "Answer this question." any more: that clause is an
+// instruction to stop searching, and it tracked a run finishing in 8 rounds
+// (9 names) against the same agent finishing in 29 rounds (15 names).
+func TestLoop_QuestionIsAnchoredEveryRound(t *testing.T) {
+	capability := &fakeCap{tool: "rag_search", result: toolkit.Result{Content: "关羽斩颜良"}}
+	mdl := model.NewFake(
+		model.CallTool("c1", "rag_search", `{"query":"关羽 斩"}`),
+		model.Reply("共 14 人"),
+	)
+	runner := buildRunner(t, mdl, capability, Config{})
+
+	if _, err := runner.Invoke(context.Background(), &Input{RunID: "run-anchor", UserMessage: "关羽杀了多少人"}, nil); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	requests := mdl.Requests()
+	if len(requests) < 2 {
+		t.Fatalf("model calls = %d, want at least 2", len(requests))
+	}
+	for index, request := range requests {
+		if !requestMentions(request, "The question for this turn") {
+			t.Fatalf("request %d does not name the turn's question", index)
+		}
+		if !requestMentions(request, "关羽杀了多少人") {
+			t.Fatalf("request %d lost the question entirely", index)
+		}
+		if requestMentions(request, "Answer this question.") {
+			t.Fatalf("request %d tells the model to stop searching", index)
+		}
+	}
+}
+
+// Two prose-only rounds: the first gets a grace round, the second hands the
+// write-up to the answer call, which must still deliver something.
+func TestLoop_NarrationTwiceFallsBackToAnswer(t *testing.T) {
+	capability := &fakeCap{
+		tool:   "rag_search",
+		result: toolkit.Result{Content: "关羽斩颜良", Evidence: []toolkit.Evidence{{Source: "doc", Ref: "chunk-1"}}},
+	}
+	mdl := model.NewFake(
+		model.CallTool("c1", "rag_search", `{"query":"关羽 斩"}`),
+		model.Reply("Let me look at the next chunk."),
+		model.Reply("Let me look at the next chunk again."),
+		model.Reply("兜底：已核实 14 人"),
+	)
+	runner := buildRunner(t, mdl, capability, Config{})
+
+	outcome, err := runner.Invoke(context.Background(), &Input{RunID: "run-narration-2", UserMessage: "关羽杀了多少人"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if outcome.Text != "兜底：已核实 14 人" {
+		t.Fatalf("text = %q, want the answer call's text", outcome.Text)
+	}
+	if calls := mdl.Calls(); calls != 4 {
+		t.Fatalf("model calls = %d, want 4", calls)
+	}
+}
+
+func TestLooksLikeNarration(t *testing.T) {
+	for _, text := range []string{
+		"",
+		"Let me see the final truncated chunk and continue searching for more kills.",
+		"let's check the next window",
+		"I'll read the rest now.",
+	} {
+		if !looksLikeNarration(text) {
+			t.Errorf("looksLikeNarration(%q) = false, want true", text)
+		}
+	}
+	// Real answers must pass through: a short factual reply, a list, a CJK answer.
+	for _, text := range []string{
+		"共 16 人",
+		"关羽一共斩了十六人：颜良、文丑、华雄……",
+		"1. 颜良 2. 文丑",
+	} {
+		if looksLikeNarration(text) {
+			t.Errorf("looksLikeNarration(%q) = true, want false", text)
+		}
+	}
+}
+
+// The concluding call can fail. What the model already said this turn is the
+// only thing left to deliver, so the fallback prefers it over silence.
+func TestLastAssistantText(t *testing.T) {
+	history := []model.Message{
+		{Role: model.RoleUser, Content: "关羽杀了多少人"},
+		{Role: model.RoleAssistant, Content: ""},
+		{Role: model.RoleAssistant, Content: "共 12 人"},
+		{Role: model.RoleTool, Content: "tool output"},
+		{Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "c1", Name: "rag_search"}}},
+	}
+	if got := lastAssistantText(history); got != "共 12 人" {
+		t.Fatalf("lastAssistantText = %q, want the last assistant prose", got)
+	}
+	if got := lastAssistantText(nil); got != "" {
+		t.Fatalf("lastAssistantText(nil) = %q, want empty", got)
+	}
+}
+
+// A pause used to end the run with no text at all: the caller got an empty
+// message and no resume entry existed to continue it. The answer call must
+// still run so the operator receives what was verified plus the gap.
+func TestLoop_PauseWithoutTextStillAnswers(t *testing.T) {
+	capability := &fakeCap{
+		tool:   "rag_search",
+		result: toolkit.Result{Content: "关羽斩颜良"},
+	}
+	// Four identical calls put three repeats on record (the first occurrence is
+	// not a repeat), which is the progress policy's limit. The last script entry
+	// is the answer the pause must still produce.
+	mdl := model.NewFake(
+		model.CallTool("c1", "rag_search", `{"query":"关羽 斩将"}`),
+		model.CallTool("c2", "rag_search", `{"query":"关羽 斩将"}`),
+		model.CallTool("c3", "rag_search", `{"query":"关羽 斩将"}`),
+		model.CallTool("c4", "rag_search", `{"query":"关羽 斩将"}`),
+		model.Reply("已核实颜良、文丑；名单可能不完整。"),
+	)
+	runner := buildRunner(t, mdl, capability, Config{})
+
+	outcome, err := runner.Invoke(context.Background(), &Input{RunID: "run-pause", UserMessage: "关羽杀了多少人"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if outcome.Text == "" {
+		t.Fatal("paused run returned no answer")
+	}
+	if !outcome.Interrupted {
+		t.Fatalf("interrupted = false, verdict = %s (%s)", outcome.Verdict.Action, outcome.Verdict.Reason)
+	}
+	if !strings.Contains(outcome.Stopped, "pause") {
+		t.Fatalf("stopped = %q, want the pause reason", outcome.Stopped)
 	}
 }

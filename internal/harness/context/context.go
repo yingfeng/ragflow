@@ -9,6 +9,7 @@ package agentctx
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"ragflow/internal/harness/agent/model"
 )
@@ -24,10 +25,15 @@ type Config struct {
 	InputBudgetRatio float64
 	// OutputReserveTokens is the room kept for one completion.
 	OutputReserveTokens int
-	// KeepRecentToolResults is how many trailing tool results stay verbatim at
-	// normal pressure. Higher tiers keep fewer.
-	KeepRecentToolResults int
-	// MaxToolResultBytes truncates a single tool result.
+	// KeepToolResultBytes is the byte budget for tool output that stays verbatim
+	// at zero pressure. It is a budget, not a count: an enumeration accumulates
+	// evidence across rounds, and a count cap drops exactly the rounds carrying
+	// the names it still needs.
+	KeepToolResultBytes int
+	// MaxToolResultBytes is the rendering ceiling for a single tool result. It
+	// sits above one read_spill window on purpose: the loop's spill threshold
+	// already bounds content volume, so truncating here would only cut the window
+	// the model just asked to read.
 	MaxToolResultBytes int
 	// MaxLessons caps injected experience entries.
 	MaxLessons int
@@ -51,7 +57,11 @@ type Config struct {
 	SystemBudgetRatio float64
 	// SystemBudgetCapTokens is the absolute ceiling of that share. Astra caps
 	// identity and constraints at 10% / 2k tokens each; one combined cap is
-	// enough here because the harness has a single system section.
+	// enough here because the harness has a single system section. The default
+	// below is the window's 5%, not Astra's 2k: the harness appends its runtime
+	// rules and environment block at the END of the system section, and a 2k
+	// cap clipped them on any real operator prompt — the newest rules were the
+	// first to go.
 	SystemBudgetCapTokens int
 }
 
@@ -62,14 +72,14 @@ func DefaultConfig() Config {
 		ContextWindow:          DefaultContextWindow,
 		InputBudgetRatio:       DefaultInputBudgetRatio,
 		OutputReserveTokens:    DefaultOutputReserveTokens,
-		KeepRecentToolResults:  6,
-		MaxToolResultBytes:     16 << 10,
+		KeepToolResultBytes:    DefaultKeepToolResultBytes,
+		MaxToolResultBytes:     64 << 10,
 		MaxLessons:             5,
 		KeepRecentMessages:     8,
 		AggressiveKeepMessages: DefaultAggressiveKeepMessages,
 		CompactionRatio:        0.7,
 		SystemBudgetRatio:      0.10,
-		SystemBudgetCapTokens:  2_000,
+		SystemBudgetCapTokens:  10_000,
 	}
 }
 
@@ -85,8 +95,8 @@ func New(cfg Config) *Builder {
 	if cfg.MaxInputTokens <= 0 {
 		cfg.MaxInputTokens = defaults.MaxInputTokens
 	}
-	if cfg.KeepRecentToolResults <= 0 {
-		cfg.KeepRecentToolResults = defaults.KeepRecentToolResults
+	if cfg.KeepToolResultBytes <= 0 {
+		cfg.KeepToolResultBytes = defaults.KeepToolResultBytes
 	}
 	if cfg.MaxToolResultBytes <= 0 {
 		cfg.MaxToolResultBytes = defaults.MaxToolResultBytes
@@ -126,8 +136,21 @@ func New(cfg Config) *Builder {
 // ClearedToolPlaceholder replaces a tool result the model no longer needs.
 const ClearedToolPlaceholder = "[previous tool output cleared]"
 
+// clearedToolPlaceholder names the tool that produced the cleared result, so the
+// model knows what it lost and how to get it back instead of assuming the result
+// was empty.
+func clearedToolPlaceholder(tool string) string {
+	if tool == "" {
+		return ClearedToolPlaceholder
+	}
+	return fmt.Sprintf("[output of %s cleared to save context — call %s again if you need it]", tool, tool)
+}
+
 // PrintedPlaceholder replaces a dropped span of history at critical pressure.
 const PrunedPlaceholder = "[earlier context pruned: %d messages]"
+
+// foldSummaryPrefix marks the message a fold left in place of the older turns.
+const foldSummaryPrefix = "[earlier turns compacted: "
 
 // Build assembles the prompt: system (with lessons), then compacted history.
 func (b *Builder) Build(system string, lessons []string, history []model.Message) []model.Message {
@@ -139,6 +162,14 @@ func (b *Builder) Build(system string, lessons []string, history []model.Message
 // proved the prompt does not fit, so the next attempt compacts harder instead of
 // failing the run.
 func (b *Builder) BuildWithTier(system string, lessons []string, history []model.Message, minTier Tier) []model.Message {
+	prompt, _ := b.BuildWithFoldHint(system, lessons, history, minTier, nil)
+	return prompt
+}
+
+// BuildWithFoldHint builds with a summary that was prepared ahead of time. A nil
+// hint is the ordinary path and summarizes synchronously if a fold is due. The
+// second result reports that the hint replaced a model call.
+func (b *Builder) BuildWithFoldHint(system string, lessons []string, history []model.Message, minTier Tier, hint *FoldHint) ([]model.Message, bool) {
 	history = ensureToolOutputs(history)
 	systemContent := b.renderSystemWithinBudget(system, lessons)
 	limit := b.limit()
@@ -154,10 +185,18 @@ func (b *Builder) BuildWithTier(system string, lessons []string, history []model
 	if tier < minTier {
 		tier = minTier
 	}
-	compacted = b.clearOldToolResults(compacted, tier)
+	// A single oversized result is bounded at any pressure: that is rendering, not
+	// memory management. Losing the older results outright is memory management,
+	// and only pressure justifies it — clearing them at zero pressure made a
+	// 29-round enumeration answer from the six results it could still see.
+	compacted = b.truncateToolResults(compacted, tier)
+	if tier >= TierTrimSchemas {
+		compacted = b.clearOldToolResults(compacted, tier)
+	}
 
+	usedHint := false
 	if tier >= TierCompactHistory {
-		compacted = b.foldWithSummary(compacted, headroom)
+		compacted, usedHint = b.foldWithSummary(compacted, headroom, hint)
 	}
 	if tier >= TierAggressivePrune {
 		compacted = b.pruneToRecent(compacted)
@@ -167,12 +206,18 @@ func (b *Builder) BuildWithTier(system string, lessons []string, history []model
 	out := make([]model.Message, 0, len(compacted)+1)
 	out = append(out, model.Message{Role: model.RoleSystem, Content: systemContent})
 	out = append(out, compacted...)
-	return out
+	return out, usedHint
 }
 
 // clearOldToolResults replaces tool output the model no longer needs and
-// truncates the results that stay. Under pressure both the number of verbatim
-// results and their per-result budget shrink.
+// truncates the results that stay. Under pressure both the byte budget for
+// verbatim output and the per-result ceiling shrink.
+//
+// Retention is measured in BYTES, not in results. A fixed count is wrong for the
+// one shape that matters most here: an enumeration gathers its evidence over many
+// rounds, so "keep the last six" deletes precisely the earlier rounds that hold
+// the names it still has to account for — an observed 29-round enumeration ended
+// up answering from the six results it could still see.
 func (b *Builder) clearOldToolResults(messages []model.Message, tier Tier) []model.Message {
 	toolIndexes := make([]int, 0, len(messages))
 	for index, message := range messages {
@@ -180,17 +225,42 @@ func (b *Builder) clearOldToolResults(messages []model.Message, tier Tier) []mod
 			toolIndexes = append(toolIndexes, index)
 		}
 	}
-	keepCount := keepRecentToolResults(tier, b.cfg.KeepRecentToolResults)
-	verbatimFrom := len(toolIndexes) - keepCount
-	if verbatimFrom < 0 {
-		verbatimFrom = 0
+	budget := toolResultByteBudget(tier, b.cfg.KeepToolResultBytes)
+	// Zero means "no clearing at this pressure": the transcript keeps every tool
+	// result, exactly as the agentic loop it mirrors does. Only a real pressure
+	// tier budgets the output, and only then does the window cap below apply.
+	if budget <= 0 {
+		return messages
 	}
-	keep := make(map[int]struct{}, keepCount)
-	for _, position := range toolIndexes[verbatimFrom:] {
-		keep[position] = struct{}{}
+	// A byte budget is meaningless next to a window that cannot hold it: without
+	// this cap, pressure on a small window would keep everything and let the final
+	// fit do the cutting, which drops the wrong rounds. Three bytes per token is a
+	// conservative estimate for the mixed CJK/latin text retrieval returns.
+	if limit := b.budget.EffectiveInput(); limit > 0 {
+		windowBytes := limit * 3
+		ceiling := windowBytes / 2
+		if tier >= TierAggressivePrune {
+			ceiling = windowBytes / 4
+		}
+		if budget > ceiling {
+			budget = ceiling
+		}
+	}
+	keep := make(map[int]struct{}, len(toolIndexes))
+	used := 0
+	// Newest first: a result is kept while it fits the remaining budget. The
+	// newest is kept even when it alone exceeds the budget — clearing the output
+	// the model just received would leave it answering from nothing.
+	for position := len(toolIndexes) - 1; position >= 0; position-- {
+		index := toolIndexes[position]
+		size := len(messages[index].Content)
+		if len(keep) > 0 && used+size > budget {
+			break
+		}
+		keep[index] = struct{}{}
+		used += size
 	}
 
-	resultLimit := toolResultBudget(tier, b.cfg.MaxToolResultBytes)
 	out := make([]model.Message, len(messages))
 	copy(out, messages)
 	for index, message := range out {
@@ -198,14 +268,26 @@ func (b *Builder) clearOldToolResults(messages []model.Message, tier Tier) []mod
 			continue
 		}
 		if _, ok := keep[index]; !ok {
-			message.Content = ClearedToolPlaceholder
+			message.Content = clearedToolPlaceholder(message.Name)
 			out[index] = message
+		}
+	}
+	return out
+}
+
+// truncateToolResults bounds one result's size. Every tier does this: a single
+// 400 KB tool result is a rendering problem, not a memory-management decision,
+// and the spill capability already keeps the full text addressable.
+func (b *Builder) truncateToolResults(messages []model.Message, tier Tier) []model.Message {
+	resultLimit := toolResultBudget(tier, b.cfg.MaxToolResultBytes)
+	out := make([]model.Message, len(messages))
+	copy(out, messages)
+	for index, message := range out {
+		if message.Role != model.RoleTool || len(message.Content) <= resultLimit {
 			continue
 		}
-		if len(message.Content) > resultLimit {
-			message.Content = truncateMiddle(message.Content, resultLimit)
-			out[index] = message
-		}
+		message.Content = truncateMiddle(message.Content, resultLimit)
+		out[index] = message
 	}
 	return out
 }
@@ -214,13 +296,48 @@ func (b *Builder) clearOldToolResults(messages []model.Message, tier Tier) []mod
 // history exceeds the budget. Dropping whole turns (fitToBudget) loses the
 // question that started the work; a summary keeps the thread of the task while
 // freeing the tokens.
-func (b *Builder) foldWithSummary(messages []model.Message, limit int) []model.Message {
+func (b *Builder) foldWithSummary(messages []model.Message, limit int, hint *FoldHint) ([]model.Message, bool) {
+	cut := b.foldCut(messages, limit)
+	if cut <= 0 {
+		return messages, false
+	}
+
+	// A hint was computed a round earlier, over a shorter prefix than the fold
+	// is about to drop. Using it folds less and saves the model call; waiting
+	// for a fresh summary is the pause this whole mechanism exists to remove.
+	summary := ""
+	usedHint := false
+	if hint != nil && hint.Covered >= cut/2 && hint.Covered < len(messages) {
+		cut = hint.Covered
+		summary = strings.TrimSpace(hint.Summary)
+		usedHint = summary != ""
+	}
+	if summary == "" {
+		summary = b.summarize(messages[:cut])
+	}
+	if strings.TrimSpace(summary) == "" {
+		return messages, false
+	}
+
+	out := make([]model.Message, 0, len(messages)-cut+1)
+	out = append(out, model.Message{
+		Role:    model.RoleUser,
+		Content: foldSummaryPrefix + fmt.Sprintf("%d messages]\n%s", cut, summary),
+	})
+	out = append(out, messages[cut:]...)
+	return out, usedHint
+}
+
+// foldCut is how many leading messages a fold would replace, or zero when the
+// history still fits. Splitting it out lets speculation prepare the same span the
+// fold will later take.
+func (b *Builder) foldCut(messages []model.Message, limit int) int {
 	if b.estimate(messages) <= limit {
-		return messages
+		return 0
 	}
 	keep := b.cfg.KeepRecentMessages
 	if keep < 1 || keep >= len(messages) {
-		return messages
+		return 0
 	}
 
 	cut := len(messages) - keep
@@ -228,7 +345,7 @@ func (b *Builder) foldWithSummary(messages []model.Message, limit int) []model.M
 		cut++
 	}
 	if cut >= len(messages) {
-		return messages
+		return 0
 	}
 
 	// Tighten the retained window to the target ratio so the next turns fit
@@ -241,22 +358,9 @@ func (b *Builder) foldWithSummary(messages []model.Message, limit int) []model.M
 		}
 	}
 	if cut <= 0 || cut >= len(messages) {
-		return messages
+		return 0
 	}
-
-	dropped := messages[:cut]
-	summary := b.summarize(dropped)
-	if strings.TrimSpace(summary) == "" {
-		return messages
-	}
-
-	out := make([]model.Message, 0, len(messages)-cut+1)
-	out = append(out, model.Message{
-		Role:    model.RoleUser,
-		Content: fmt.Sprintf("[earlier turns compacted: %d messages]\n%s", len(dropped), summary),
-	})
-	out = append(out, messages[cut:]...)
-	return out
+	return cut
 }
 
 func (b *Builder) summarize(dropped []model.Message) string {
@@ -328,12 +432,28 @@ func (b *Builder) pruneToRecent(messages []model.Message) []model.Message {
 	if cut <= 0 || cut >= len(messages) {
 		return messages
 	}
-	out := make([]model.Message, 0, len(messages)-cut+1)
+	out := make([]model.Message, 0, len(messages)-cut+2)
+	// The fold summary carries the question, the decisions and what was already
+	// ruled out. Pruning it away leaves a window of recent reads with no task in
+	// it, which is how a run ends up answering the last passage it read.
+	if summary, ok := foldSummaryOf(messages[:cut]); ok {
+		out = append(out, summary)
+	}
 	out = append(out, model.Message{
 		Role:    model.RoleUser,
 		Content: fmt.Sprintf(PrunedPlaceholder, cut),
 	})
 	return append(out, messages[cut:]...)
+}
+
+// foldSummaryOf returns the newest fold summary in a dropped span.
+func foldSummaryOf(messages []model.Message) (model.Message, bool) {
+	for index := len(messages) - 1; index >= 0; index-- {
+		if strings.HasPrefix(messages[index].Content, foldSummaryPrefix) {
+			return messages[index], true
+		}
+	}
+	return model.Message{}, false
 }
 
 // fitToBudget drops the oldest turns until the estimate fits. It never drops the
@@ -380,7 +500,32 @@ func (b *Builder) renderSystemWithinBudget(system string, lessons []string) stri
 			return rendered
 		}
 	}
-	return truncate(renderSystem(system, nil, 0), budget*4)
+	return truncateHeadTail(renderSystem(system, nil, 0), budget*4)
+}
+
+// truncateHeadTail keeps the head and the tail of an over-budget system section
+// and drops the middle. The harness appends its runtime rules and environment
+// block at the tail; a head-only clip removed exactly those, so the newest
+// rules were always the first to go.
+func truncateHeadTail(text string, limitBytes int) string {
+	if limitBytes <= 0 || len(text) <= limitBytes {
+		return text
+	}
+	const marker = "\n…[system prompt truncated]…\n"
+	if limitBytes <= 128 {
+		return truncate(text, limitBytes)
+	}
+	tailBytes := limitBytes / 4
+	headBytes := limitBytes - tailBytes - len(marker)
+	if headBytes <= 0 {
+		return truncate(text, limitBytes)
+	}
+	head := truncate(text, headBytes)
+	tailStart := len(text) - tailBytes
+	for tailStart > 0 && !utf8.RuneStart(text[tailStart]) {
+		tailStart--
+	}
+	return head + marker + text[tailStart:]
 }
 
 // systemBudget resolves the token ceiling of the system section.

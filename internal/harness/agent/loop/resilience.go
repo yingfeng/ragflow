@@ -84,7 +84,18 @@ func isRetryableModelError(err error) bool {
 
 // isPromptTooLongError reports whether the prompt exceeded the model window.
 func isPromptTooLongError(err error) bool {
-	return errorContains(err, promptTooLongMarkers)
+	if errorContains(err, promptTooLongMarkers) {
+		return true
+	}
+	// MiniMax reports an over-window request as a bare provider code instead of
+	// prose ("minimax API error: ... (2064)"). Matching the number alone would
+	// catch unrelated digits, so the provider name is required with it. Without
+	// this the run failed outright where compaction could have recovered it.
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "minimax") && strings.Contains(message, "(2064)")
 }
 
 // modelBackoff doubles from modelRetryBase and stops growing at the ceiling.

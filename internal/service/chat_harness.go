@@ -234,6 +234,24 @@ func providerErrorText(message string) string {
 	return strings.TrimSpace(message[index+len(marker):])
 }
 
+// harnessReasoningLimit bounds one round's working text in the step panel. The
+// panel is a log, not the transcript: a long monologue belongs in the run's own
+// trace, and shipping it whole would grow every message payload.
+const harnessReasoningLimit = 4000
+
+// clipReasoning trims a round's working text to what the panel can show.
+func clipReasoning(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	runes := []rune(trimmed)
+	if len(runes) <= harnessReasoningLimit {
+		return trimmed
+	}
+	return string(runes[:harnessReasoningLimit]) + "…"
+}
+
 // harnessTurnResult is what one turn produced, already shaped for the chat
 // response.
 type harnessTurnResult struct {
@@ -294,6 +312,7 @@ func (harnessRuntimeExecutor) Run(ctx context.Context, req harnessTurnRequest) (
 		AgentVersionID: resolved.VersionID,
 		AgentName:      resolved.Definition.Name,
 		SystemPrompt:   prompt,
+		Sampling:       resolved.Definition.Sampling,
 		PolicyConfig:   resolved.Definition.Policy,
 		MaxRounds:      resolved.Definition.Policy.MaxRounds,
 		SkillsRoot:     harnessSettings.SkillsRoot,
@@ -408,6 +427,22 @@ func (s *ChatPipelineService) harnessTurn(
 			if stream {
 				emit(AsyncChatResult{Answer: text, Final: false})
 			}
+		})
+		// A round that ends in a tool call is the model working, not the answer:
+		// it goes to the step panel. Only the round that ends the turn writes the
+		// answer area, so no round can overwrite text a user was reading.
+		turnCtx = loop.WithReasoningSink(turnCtx, func(text string) {
+			if !stream {
+				return
+			}
+			reasoning := clipReasoning(text)
+			if reasoning == "" {
+				return
+			}
+			emit(AsyncChatResult{Final: false, ThinkEvent: &ThinkEvent{
+				Kind:    "reasoning",
+				Summary: reasoning,
+			}})
 		})
 		turnCtx = loop.WithProgressSink(turnCtx, func(progress loop.Progress) {
 			if progress.Phase != loop.ProgressStart {

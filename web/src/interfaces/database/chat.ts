@@ -60,6 +60,36 @@ export interface IThinkEvent {
   request_id?: string;
 }
 
+/**
+ * The limits one run of an agent works inside. Zero (or absent) means the limit
+ * is off, so a field the editor left blank reads as "no limit" rather than "zero".
+ */
+export interface IHarnessAgentPolicy {
+  max_rounds?: number;
+  max_tokens?: number;
+  max_tool_calls?: number;
+  max_wall_sec?: number;
+  approval?: 'auto' | 'ask';
+}
+
+/** What a user writes: the agent's instructions and its run limits. */
+export interface IHarnessAgentDefinition {
+  id?: string;
+  name: string;
+  prompt: string;
+  policy?: IHarnessAgentPolicy;
+  [key: string]: unknown;
+}
+
+/** One stored version of an agent, as the editor sees it. */
+export interface IHarnessAgentDetail {
+  agent_id: string;
+  version_id: string;
+  version: number;
+  name: string;
+  definition: IHarnessAgentDefinition;
+}
+
 /** One pending tool approval as the harness reports it. */
 export interface IHarnessApproval {
   request_id: string;

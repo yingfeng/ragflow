@@ -92,6 +92,15 @@ type Capability interface {
 	Invoke(ctx context.Context, call Call) (Result, error)
 }
 
+// RequiredToolList is an optional Capability extension. It names the tools a
+// run must call before it may do anything else with them; the loop turns them
+// into a forced tool_choice until the transcript shows one. Retrieval is the
+// use case: an agent whose whole job is evidence must start by gathering some,
+// and a round of pure planning or chatter is a wasted round.
+type RequiredToolList interface {
+	RequiredTools() []string
+}
+
 // Registry routes tool calls to the owning capability.
 //
 // A capability can be registered active or deferred. Deferred tools stay in the
@@ -253,6 +262,32 @@ func (r *Registry) Names() []string {
 		out = append(out, capability.Name())
 	}
 	sort.Strings(out)
+	return out
+}
+
+// RequiredTools collects the required-tool declarations of every registered
+// capability, in registration order, deduplicated. Empty means no gate applies.
+func (r *Registry) RequiredTools() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := make(map[string]struct{})
+	var out []string
+	for _, capability := range r.caps {
+		list, ok := capability.(RequiredToolList)
+		if !ok {
+			continue
+		}
+		for _, name := range list.RequiredTools() {
+			if _, exists := seen[name]; exists {
+				continue
+			}
+			if _, owned := r.owner[name]; !owned {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
 	return out
 }
 

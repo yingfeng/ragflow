@@ -968,7 +968,15 @@ NER：使用 spaCy NER 和基于规则的关键词提取来抽取 Entities 和 R
       agentApprovalTip: '危险工具（Shell、进程外写入）可在执行前等待你确认。',
       agentApprovalAsk: '执行前询问',
       agentApprovalAuto: '无需询问直接执行',
+      agentExecution: 'Agent 设置',
+      agentExecutionTip:
+        '保存会生成新版本：已回答的轮次仍用当时的版本，下一轮起使用新版本。',
+      agentPrompt: 'Agent 指令',
+      agentPromptTip:
+        '决定这个 agent 如何检索与作答；上面的提示词决定回复的措辞。',
+      agentVersion: '第 {{version}} 版',
       agentSteps: 'Agent 步骤（{{count}}）',
+      agentReasoning: '思考过程（{{count}} 轮）',
       approvalTitle: '需要审批工具调用',
       approvalPending: '等待你的决定',
       approvalAllow: '允许',

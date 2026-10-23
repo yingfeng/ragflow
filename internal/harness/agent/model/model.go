@@ -48,6 +48,12 @@ type Request struct {
 	Tools       []ToolSpec
 	Temperature float64
 	MaxTokens   int
+	// ToolChoice names one tool the model must call on this request ("auto"
+	// when empty). It backs the required-tool gate: a capability declares the
+	// tools a run must use before anything else, and the loop forces the first
+	// one until the transcript shows it. The agentic pipeline drives the same
+	// mechanism through its retrieval gate (agentic_rag/retrieval_model.go).
+	ToolChoice string
 }
 
 // Usage is token accounting for one completion.

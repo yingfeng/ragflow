@@ -4,13 +4,26 @@ import { buildMessageUuid } from '@/utils/chat';
 import { omit } from 'lodash';
 import { PrologueMessageIdPrefix } from './constants';
 
-/** Builds the assistant message that replaces the trailing placeholder. */
-export function buildAssistantMessageFromAnswer(answer: IAnswer): IMessage {
+/**
+ * Builds the assistant message that replaces the trailing placeholder.
+ *
+ * `fallbackId` carries the identity of the message being replaced. Stream
+ * writes that arrive without a server id (a step event before the first text
+ * chunk) would otherwise mint a fresh uuid, which changes the message's React
+ * key and remounts it — collapsing every panel the user had expanded.
+ */
+export function buildAssistantMessageFromAnswer(
+  answer: IAnswer,
+  fallbackId?: string,
+): IMessage {
   return {
     role: MessageType.Assistant,
     content: answer.answer,
     reference: answer.reference,
-    id: buildMessageUuid({ id: answer.id, role: MessageType.Assistant }),
+    id: buildMessageUuid({
+      id: answer.id ?? fallbackId,
+      role: MessageType.Assistant,
+    }),
     prompt: answer.prompt,
     audio_binary: answer.audio_binary,
     ...omit(answer, 'reference'),

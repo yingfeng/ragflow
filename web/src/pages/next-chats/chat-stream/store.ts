@@ -247,6 +247,10 @@ export const useChatStreamStore = create<ChatStreamState>()(
             // off whatever message is now last.
             if (!previous.isStreaming) return state;
             const messages = previous.messages.slice(0, -1);
+            // The message this write replaces. Its id is the local identity of
+            // the answer being streamed, kept when the payload carries none so
+            // the transcript does not remount on every step event.
+            const replacedId = previous.messages.at(-1)?.id;
             const question = messages.at(-1);
             // The server assigns the turn ID for question-only requests.
             // Keep the local question and streamed answer paired under that ID.
@@ -261,7 +265,7 @@ export const useChatStreamStore = create<ChatStreamState>()(
                 awaitingServerId: false,
               };
             }
-            messages.push(buildAssistantMessageFromAnswer(answer));
+            messages.push(buildAssistantMessageFromAnswer(answer, replacedId));
             return {
               sessions: {
                 ...state.sessions,

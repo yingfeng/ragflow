@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -9,6 +10,58 @@ import (
 // arguments at all: the model then invents an envelope such as
 // {"queries":{"item":[...]}} and every call fails to parse. The spec must carry
 // the tool's real JSON Schema.
+// TestParseEvidenceCarriesThePassage is what makes the evidence pool usable as
+// memory: the entry has to say WHAT the chunk contains, not only which document
+// it came from. A pool of "三国演义" forty times over tells a run nothing about
+// which names it has already found.
+func TestParseEvidenceCarriesThePassage(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "grep matched window",
+			content: `<search_results><chunk chunk_id="c1" doc_id="d1" doc_name="三国演义"><match_snippet>关公手起一刀，斩夏侯存于马下</match_snippet></chunk></search_results>`,
+			want:    "三国演义 · 关公手起一刀，斩夏侯存于马下",
+		},
+		{
+			name:    "list_chunks body text",
+			content: `<chunk chunk_id="c2" doc_id="d1" doc_name="三国演义"><content>云长曰：吾今斩颜良，以报曹公</content></chunk>`,
+			want:    "三国演义 · 云长曰：吾今斩颜良，以报曹公",
+		},
+		{
+			name:    "self closing element falls back to the document name",
+			content: `<chunk chunk_id="c3" doc_id="d1" doc_name="三国演义"/>`,
+			want:    "三国演义",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			evidences := ParseEvidence(testCase.content)
+			if len(evidences) != 1 {
+				t.Fatalf("evidences = %d, want 1 (%+v)", len(evidences), evidences)
+			}
+			if evidences[0].Snippet != testCase.want {
+				t.Fatalf("snippet = %q, want %q", evidences[0].Snippet, testCase.want)
+			}
+		})
+	}
+}
+
+// TestParseEvidenceTrimsLongPassages keeps one pool line bounded: the pool is
+// re-sent every round, so it cannot carry whole passages.
+func TestParseEvidenceTrimsLongPassages(t *testing.T) {
+	body := strings.Repeat("斩", evidenceExcerptRunes*2)
+	evidences := ParseEvidence(`<chunk chunk_id="c1" doc_id="d1">` + body + `</chunk>`)
+	if len(evidences) != 1 {
+		t.Fatalf("evidences = %d, want 1", len(evidences))
+	}
+	if runes := []rune(evidences[0].Snippet); len(runes) > evidenceExcerptRunes+1 {
+		t.Fatalf("snippet has %d runes, want at most %d plus the ellipsis", len(runes), evidenceExcerptRunes)
+	}
+}
+
 func TestDescribeRendersJSONSchema(t *testing.T) {
 	specs, err := describe(context.Background(), map[string]toolFactory{
 		"search_bm25_chunks": retrievalTools["search_bm25_chunks"],

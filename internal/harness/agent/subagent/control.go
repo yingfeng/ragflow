@@ -41,8 +41,12 @@ func (s *Spawner) Start(ctx context.Context, req subagent.Request) (string, erro
 
 	runID := uuid.NewString()
 	childCtx, cancel := context.WithCancel(ctx)
-	inbox := loop.NewInbox()
-	childCtx = loop.WithInbox(childCtx, inbox)
+	// The same isolation the blocking path gets: the child keeps the parent's
+	// cancellation but owns its inbox, spill store and answer stream. The inbox
+	// is read back out because Message delivers to exactly this child.
+	childCtx = loop.FreshRunContext(childCtx)
+	childCtx = s.childAudit(childCtx, runID)
+	inbox := loop.InboxFrom(childCtx)
 	childCtx = subagent.WithDepth(childCtx, req.Depth)
 	if remaining, ok := toolkit.RemainingRounds(ctx); ok {
 		childCtx = toolkit.WithRemainingRounds(childCtx, remaining)
@@ -66,7 +70,7 @@ func (s *Spawner) Start(ctx context.Context, req subagent.Request) (string, erro
 		}()
 		outcome, runErr := runner.Invoke(childCtx, &loop.Input{
 			RunID:       runID,
-			AgentName:   req.AgentID,
+			AgentName:   s.agentIdentity(),
 			UserMessage: req.Prompt,
 			Scope:       req.Scope,
 		}, nil)

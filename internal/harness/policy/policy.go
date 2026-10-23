@@ -12,10 +12,20 @@ type Action string
 
 const (
 	ActionContinue Action = "continue"
-	ActionFinish   Action = "finish"
-	ActionBlock    Action = "block"
-	ActionPause    Action = "pause"
+	// ActionNudge continues the run with one factual correction injected into
+	// the transcript. A policy that can only describe a stall has no business
+	// ending the run: what it knows is "no progress yet", not "no progress is
+	// possible", and the run may be in the middle of reading evidence it has
+	// already paid for. Ending stays with the budgets.
+	ActionNudge  Action = "nudge"
+	ActionFinish Action = "finish"
+	ActionBlock  Action = "block"
+	ActionPause  Action = "pause"
 )
+
+// CodeBudgetLimited labels a run that stopped because a configured limit ran
+// out, as opposed to one that finished its work.
+const CodeBudgetLimited = "budget_limited"
 
 // Severity is the operator-facing weight of a verdict.
 type Severity string
@@ -33,6 +43,14 @@ type Verdict struct {
 	Severity          Severity
 	Reason            string
 	RecoveryThreshold int
+	// Code is a stable machine-readable label for the terminal cause, e.g.
+	// "budget_limited". The reference runtime reports a run that ran out of
+	// budget as a distinct terminal state rather than as a generic stop, so a
+	// caller can tell "the work finished" from "the money ran out".
+	Code string
+	// Advice is the factual correction ActionNudge injects into the transcript.
+	// It describes what the run observed, never what to answer.
+	Advice string
 }
 
 // Snapshot is the read-only view policies see at verify time.
@@ -60,6 +78,9 @@ type Snapshot struct {
 	StagnantRounds int
 	// RepeatedCalls counts tool calls identical to an earlier call this run.
 	RepeatedCalls int
+	// Nudges counts the course corrections this run already received, which
+	// bounds how often a stalled run is reminded of the same fact.
+	Nudges int
 
 	HasFinalText    bool
 	Citations       int
@@ -68,6 +89,21 @@ type Snapshot struct {
 	// ThinkTerminal reports that the model ended its turn instead of asking
 	// for more tools.
 	ThinkTerminal bool
+	// PlanSteps is how many steps the model's own plan holds, and OpenPlanSteps
+	// how many of them are still pending or in progress. The plan is the model's
+	// own statement of what the answer still owes, so an open step is a
+	// completion signal policies can read instead of inferring it from prose.
+	PlanSteps     int
+	OpenPlanSteps int
+	// PlanIdleRounds counts rounds since the plan last changed. Open steps alone
+	// keep a run alive because an open step is unfinished work; a plan that stops
+	// moving is not unfinished work, it is the model holding the run open without
+	// doing any of it.
+	PlanIdleRounds int
+	// TerminalRounds counts consecutive rounds that produced prose and no tool
+	// call. It bounds how long an open plan may hold a run that has stopped
+	// working: one round to resume the steps, after that the answer is due.
+	TerminalRounds int
 }
 
 // Policy checks one snapshot.
@@ -131,10 +167,12 @@ func stronger(candidate, current Verdict) bool {
 func rank(action Action) int {
 	switch action {
 	case ActionBlock:
-		return 4
+		return 5
 	case ActionPause:
-		return 3
+		return 4
 	case ActionFinish:
+		return 3
+	case ActionNudge:
 		return 2
 	case ActionContinue:
 		return 1
@@ -171,6 +209,7 @@ func (Budget) Check(snapshot Snapshot) []Verdict {
 		out = append(out, Verdict{
 			Action:   ActionFinish,
 			Severity: SeverityWarning,
+			Code:     CodeBudgetLimited,
 			Reason:   fmt.Sprintf("round budget exhausted (%d/%d)", snapshot.Round, snapshot.MaxRounds),
 		})
 	}
@@ -178,6 +217,7 @@ func (Budget) Check(snapshot Snapshot) []Verdict {
 		out = append(out, Verdict{
 			Action:   ActionFinish,
 			Severity: SeverityWarning,
+			Code:     CodeBudgetLimited,
 			Reason:   fmt.Sprintf("token budget exhausted (%d/%d)", snapshot.TokensIn+snapshot.TokensOut, snapshot.MaxTokens),
 		})
 	}
@@ -185,6 +225,7 @@ func (Budget) Check(snapshot Snapshot) []Verdict {
 		out = append(out, Verdict{
 			Action:   ActionFinish,
 			Severity: SeverityWarning,
+			Code:     CodeBudgetLimited,
 			Reason:   fmt.Sprintf("tool-call budget exhausted (%d/%d)", snapshot.ToolCalls, snapshot.MaxToolCalls),
 		})
 	}
@@ -192,6 +233,7 @@ func (Budget) Check(snapshot Snapshot) []Verdict {
 		out = append(out, Verdict{
 			Action:   ActionFinish,
 			Severity: SeverityWarning,
+			Code:     CodeBudgetLimited,
 			Reason:   fmt.Sprintf("wall-clock budget exhausted (%s/%s)", snapshot.Elapsed.Truncate(time.Second), snapshot.MaxWall),
 		})
 	}
@@ -199,18 +241,43 @@ func (Budget) Check(snapshot Snapshot) []Verdict {
 		out = append(out, Verdict{
 			Action:   ActionFinish,
 			Severity: SeverityWarning,
+			Code:     CodeBudgetLimited,
 			Reason:   fmt.Sprintf("cost budget exhausted ($%.4f/$%.4f)", snapshot.CostUSD, snapshot.MaxCostUSD),
 		})
 	}
 	return out
 }
 
-// Progress stops a run that keeps spending calls without learning anything.
+// Progress corrects a run that keeps spending calls without learning anything.
+//
+// It never ends a run on its own. The reference runtime drives a turn to
+// completion with the model's own decision and bounds it with budgets only, and
+// the case that motivated this rule here was a run cut off in the middle of
+// reading the evidence it had just collected: a round that adds no evidence is
+// not proof the work is over. So a stall produces a nudge — the observed facts,
+// twice — and after that the answer call takes over; the budgets remain the only
+// hard stop.
 type Progress struct {
-	// StagnantRounds is how many consecutive no-new-evidence rounds are allowed.
+	// StagnantRounds is how many consecutive no-new-evidence rounds are allowed
+	// before the run is told about it.
 	StagnantRounds int
 	// RepeatedCalls is how many identical calls are allowed before pausing.
 	RepeatedCalls int
+	// MaxNudges bounds how often the same fact is restated.
+	MaxNudges int
+	// PlanIdleRounds is how long an open plan may stay unchanged before it counts
+	// as a stall. Without it an open plan is an unbounded licence to continue:
+	// a run that keeps retrieving new-but-irrelevant passages never accumulates
+	// StagnantRounds, so the plan is the only thing keeping it alive and nothing
+	// ever moves the plan.
+	PlanIdleRounds int
+	// PlanIdleRoundsWhileProgressing overrides PlanIdleRounds while the evidence
+	// pool is still growing. The default (zero) does not judge an idle plan at all
+	// in that case: a step stays open for as long as its enumeration is
+	// incomplete, so plan idleness alone says nothing while evidence keeps
+	// arriving. Set it to bound a run that keeps finding new-but-irrelevant
+	// material before the round budget does.
+	PlanIdleRoundsWhileProgressing int
 }
 
 // Name implements Policy.
@@ -229,15 +296,90 @@ func (p Progress) Check(snapshot Snapshot) []Verdict {
 	if repeats <= 0 {
 		repeats = 3
 	}
-	var out []Verdict
-	if snapshot.StagnantRounds >= limit {
-		out = append(out, Verdict{
-			Action:   ActionFinish,
-			Severity: SeverityWarning,
-			Reason:   fmt.Sprintf("no new evidence for %d consecutive rounds", snapshot.StagnantRounds),
-		})
+	nudges := p.MaxNudges
+	if nudges <= 0 {
+		nudges = 2
 	}
-	if snapshot.RepeatedCalls >= repeats {
+	planIdle := p.PlanIdleRounds
+	if planIdle <= 0 {
+		// Six rounds is long enough for a run to work through several batches
+		// against the same open steps, and short enough that a run which has
+		// stopped doing its own plan is handed to the answer call instead of
+		// burning the whole round budget.
+		planIdle = 6
+	}
+	planIdleProgressing := p.PlanIdleRoundsWhileProgressing
+	if planIdleProgressing < 0 {
+		planIdleProgressing = 0
+	}
+	var out []Verdict
+	stalled := snapshot.StagnantRounds >= limit
+	reason := ""
+	planIdleStall := false
+	if stalled {
+		reason = fmt.Sprintf("no new evidence for %d consecutive rounds", snapshot.StagnantRounds)
+	}
+	// A run whose evidence pool grew this round is making progress, whatever its
+	// plan says. An enumerating step cannot tick until its last item is found, so
+	// it is idle by construction for as long as the search keeps adding evidence;
+	// blocking it there ended runs at round 10 and round 20 while they were still
+	// pulling fresh greps and spills per round, and the list came back short.
+	//
+	// When the pool stops growing the plan is judged again at the original limit,
+	// which is the case the rule was written for; a run that finds new but
+	// irrelevant material is bounded by the round and token budgets instead.
+	planLimit := planIdle
+	if snapshot.StagnantRounds == 0 {
+		planLimit = planIdleProgressing
+	}
+	if planLimit > 0 && snapshot.OpenPlanSteps > 0 && snapshot.PlanIdleRounds >= planLimit {
+		if !stalled {
+			stalled = true
+			planIdleStall = true
+			reason = fmt.Sprintf("%d plan step(s) unchanged for %d rounds", snapshot.OpenPlanSteps, snapshot.PlanIdleRounds)
+		}
+	}
+	if stalled {
+		stalledRounds := snapshot.StagnantRounds
+		if snapshot.OpenPlanSteps > 0 && snapshot.PlanIdleRounds > stalledRounds {
+			stalledRounds = snapshot.PlanIdleRounds
+		}
+		// The two stalls need different words: one says the search stopped adding
+		// evidence, the other says the plan stopped moving while it still was.
+		observation := "retrieved nothing new"
+		if planIdleStall {
+			observation = "did not move your plan"
+		}
+		if snapshot.Nudges < nudges {
+			out = append(out, Verdict{
+				Action:   ActionNudge,
+				Severity: SeverityInfo,
+				Reason:   reason,
+				Advice: fmt.Sprintf(
+					"The last %d rounds %s; the evidence pool holds %d units. "+
+						"If those units cover the question, write the answer now. If they do not, change the search — "+
+						"different terms, a different tool, or read a passage that was retrieved but not yet read. "+
+						"An open step is not a reason to stop: keep it open while it is still adding evidence.",
+					stalledRounds, observation, snapshot.Citations),
+			})
+		} else {
+			// The fact has been restated as often as it is useful. Hand the run
+			// to the answer call instead of ending it: the evidence already
+			// collected is what the answer is written from.
+			out = append(out, Verdict{
+				Action:   ActionBlock,
+				Severity: SeverityWarning,
+				Reason:   reason,
+				Code:     "stalled",
+			})
+		}
+	}
+	// Repeated calls are only evidence of being stuck when the model has not
+	// said what is left. With open plan steps the run is not claiming to be
+	// finished, and an enumeration needs the same query more than once as it
+	// walks a list; stopping it there interrupts work that is going somewhere.
+	// A run that is genuinely spinning still ends on StagnantRounds or Budget.
+	if snapshot.RepeatedCalls >= repeats && snapshot.OpenPlanSteps == 0 {
 		out = append(out, Verdict{
 			Action:            ActionPause,
 			Severity:          SeverityWarning,
@@ -257,8 +399,8 @@ type Completion struct {
 // Name implements Policy.
 func (Completion) Name() string { return "completion" }
 
-// Check implements Policy. A final answer finishes the run; an answer-shaped
-// empty terminal state is refused.
+// Check implements Policy. A final answer finishes the run once the model's own
+// plan is closed; an answer-shaped empty terminal state is refused.
 func (c Completion) Check(snapshot Snapshot) []Verdict {
 	var out []Verdict
 	if snapshot.UnresolvedCalls > 0 {
@@ -278,6 +420,22 @@ func (c Completion) Check(snapshot Snapshot) []Verdict {
 			})
 			return out
 		}
+		// A plan is the model's own list of what the answer still needs. Writing
+		// the answer while steps of that list are open is the "12 of 16"
+		// failure: the prose reads as a conclusion while the work is unfinished.
+		//
+		// One round of grace: the model may have written the answer before reading
+		// the plan section, so it gets a single round to reopen the work. A
+		// second prose-only round is not convergence — it finishes here and the
+		// answer call is told what is still open.
+		if snapshot.OpenPlanSteps > 0 && snapshot.TerminalRounds <= 1 {
+			out = append(out, Verdict{
+				Action:   ActionContinue,
+				Severity: SeverityInfo,
+				Reason:   fmt.Sprintf("%d plan step(s) still open", snapshot.OpenPlanSteps),
+			})
+			return out
+		}
 		out = append(out, Verdict{
 			Action:   ActionFinish,
 			Severity: SeverityInfo,
@@ -285,10 +443,21 @@ func (c Completion) Check(snapshot Snapshot) []Verdict {
 		})
 		return out
 	}
-	// Only a model that ended its turn without producing anything is a
-	// refusal-worthy empty completion. A round interrupted mid-flight (tool
-	// results pending, budget exhausted) is a normal loop iteration.
+	// A model that ended its turn without an answer — it narrated the next step,
+	// or said nothing — gets one more round. That round is worth more than a
+	// summary call over the transcript: the model still holds the ReAct context
+	// that produced its best partial result, while a fresh answer call sees the
+	// same text without the thread of reasoning and tends to answer only the
+	// part it read last (a 16-name search came back as the six generals of one
+	// chapter). After that grace round the answer call takes over.
 	if snapshot.ThinkTerminal {
+		if snapshot.TerminalRounds <= 1 {
+			return []Verdict{{
+				Action:   ActionContinue,
+				Severity: SeverityInfo,
+				Reason:   "no answer written yet",
+			}}
+		}
 		out = append(out, Verdict{
 			Action:   ActionBlock,
 			Severity: SeverityError,

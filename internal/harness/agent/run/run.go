@@ -102,6 +102,9 @@ type Service struct {
 	grants      toolkit.GrantStore
 	events      events.EventLog
 	eventLayers events.LayerFilter
+	// sink is the trace sink this service chained over the caller's. It is
+	// exposed through StepSink so child runs inherit the same persistence.
+	sink func(loop.StepRecord)
 
 	mu          sync.Mutex
 	cancels     map[string]context.CancelFunc
@@ -157,13 +160,14 @@ func New(cfg Config) (*Service, error) {
 
 	// Chain the loop's trace sink so every step is both persisted and streamed.
 	originalSink := cfg.Loop.Deps.Sink
-	cfg.Loop.Deps.Sink = func(record loop.StepRecord) {
+	service.sink = func(record loop.StepRecord) {
 		if originalSink != nil {
 			originalSink(record)
 		}
 		service.persistStep(record)
 		service.broadcast(record.RunID, Event{Type: EventStep, RunID: record.RunID, Step: &record})
 	}
+	cfg.Loop.Deps.Sink = service.sink
 
 	runner, err := loop.Build(cfg.Loop)
 	if err != nil {
@@ -171,6 +175,19 @@ func New(cfg Config) (*Service, error) {
 	}
 	service.runner = runner
 	return service, nil
+}
+
+// StepSink returns the trace sink this service runs every step through.
+//
+// A sub-agent spawner built next to the service inherits it, which is what makes
+// a child's steps land in the same tables and the same stream as its parent's.
+// Without it a child would run its rounds invisibly: no step rows, no terminal
+// accounting an operator can read after the parent returned.
+func (s *Service) StepSink() func(loop.StepRecord) {
+	if s == nil {
+		return nil
+	}
+	return s.sink
 }
 
 // Invoke runs one request to completion.
@@ -275,8 +292,9 @@ func (s *Service) Resume(ctx context.Context, req Request) (loop.Outcome, error)
 }
 
 // withAudit attaches a per-run recorder to the context. The run id doubles as
-// the trace id: one run is one auditable unit, and a child run inherits the
-// parent's recorder through the context it is spawned with.
+// the trace id: one run is one auditable unit, which is why a delegated child
+// gets a recorder of its own (see subagent.Spawner.WithAudit) instead of
+// writing its events into the parent's trace.
 func (s *Service) withAudit(ctx context.Context, runID string) context.Context {
 	if s.events == nil {
 		return ctx

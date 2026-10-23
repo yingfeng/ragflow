@@ -39,6 +39,7 @@ const {
   fetchExternalChatInfo,
   listHarnessApprovals,
   resolveHarnessApproval,
+  harnessAgent,
 } = api;
 
 const methods = {
@@ -125,6 +126,16 @@ const methods = {
   resolveHarnessApproval: {
     url: resolveHarnessApproval,
     method: 'post',
+  },
+  // The agent definition is read and replaced through the same URL: reading it
+  // shows what the thread executes, replacing it stores a new version.
+  fetchHarnessAgent: {
+    url: harnessAgent,
+    method: 'get',
+  },
+  updateHarnessAgent: {
+    url: harnessAgent,
+    method: 'put',
   },
 } as const;
 

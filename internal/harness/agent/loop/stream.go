@@ -7,9 +7,17 @@ import (
 	"time"
 )
 
-// DeltaSink receives assistant text as the provider produces it. A turn that
-// decides to call a tool produces no text, so the sink simply never fires.
+// DeltaSink receives the text of the round that ends the turn, as the provider
+// produced it.
 type DeltaSink func(text string)
+
+// ReasoningSink receives the text of a round that went on to call a tool: the
+// model working out loud before it acts.
+//
+// That text is not the answer, and a chat UI shows it in its step panel. Letting
+// it into the answer area instead is what let one round print a draft the next
+// round overwrote.
+type ReasoningSink func(text string)
 
 // Progress reports one tool call starting or finishing. It is what a chat UI
 // shows as "searching…" while the loop waits on a tool, and it travels through
@@ -34,6 +42,8 @@ const progressSummaryLimit = 160
 
 type deltaSinkKey struct{}
 
+type reasoningSinkKey struct{}
+
 type progressSinkKey struct{}
 
 // WithDeltaSink installs the text sink for this run.
@@ -48,6 +58,47 @@ func WithDeltaSink(ctx context.Context, sink DeltaSink) context.Context {
 func DeltaSinkFromContext(ctx context.Context) DeltaSink {
 	sink, _ := ctx.Value(deltaSinkKey{}).(DeltaSink)
 	return sink
+}
+
+// WithReasoningSink installs the sink for a round's working text.
+func WithReasoningSink(ctx context.Context, sink ReasoningSink) context.Context {
+	if sink == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, reasoningSinkKey{}, sink)
+}
+
+// ReasoningSinkFromContext returns the installed sink, or nil.
+func ReasoningSinkFromContext(ctx context.Context) ReasoningSink {
+	sink, _ := ctx.Value(reasoningSinkKey{}).(ReasoningSink)
+	return sink
+}
+
+// flushAnswerText hands held chunks to the answer sink in the order the provider
+// produced them.
+func flushAnswerText(held []string, sink DeltaSink) {
+	if sink == nil {
+		return
+	}
+	for _, text := range held {
+		if text == "" {
+			continue
+		}
+		sink(text)
+	}
+}
+
+// emitReasoning reports one round's working text as a single step: the round is
+// the unit a step panel shows, so its chunks are joined rather than streamed.
+func emitReasoning(held []string, sink ReasoningSink) {
+	if sink == nil || len(held) == 0 {
+		return
+	}
+	text := strings.Join(held, "")
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	sink(text)
 }
 
 // WithProgressSink installs the tool-progress sink for this run.
@@ -73,19 +124,24 @@ func emitProgress(ctx context.Context, progress Progress) {
 
 // trackTool reports a tool's start and end around invoke. It returns a function
 // the caller defers so a panicking tool still closes its progress event.
-func trackTool(ctx context.Context, call toolCallView) func(error) {
+//
+// The end event takes the failure as a flag rather than an error because a tool
+// can fail by returning an error result: the call ran, the model sees a
+// <tool_error>, and a progress stream that reported success would disagree with
+// the transcript.
+func trackTool(ctx context.Context, call toolCallView) func(isError bool) {
 	emitProgress(ctx, Progress{
 		Tool:    call.tool,
 		Phase:   ProgressStart,
 		Summary: summarizeArguments(call.arguments),
 	})
 	started := time.Now()
-	return func(err error) {
+	return func(isError bool) {
 		emitProgress(ctx, Progress{
 			Tool:       call.tool,
 			Phase:      ProgressEnd,
 			Summary:    summarizeArguments(call.arguments),
-			IsError:    err != nil,
+			IsError:    isError,
 			DurationMS: time.Since(started).Milliseconds(),
 		})
 	}

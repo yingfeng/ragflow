@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"regexp"
 	"sort"
 	"strconv"
@@ -124,6 +125,24 @@ func (c *Capability) Tools() []model.ToolSpec {
 	return out
 }
 
+// RequiredTools implements toolkit.RequiredToolList. A run whose only job is
+// corpus evidence must gather some before it may plan or write: without the
+// gate, its first round can go to think/todo_write and produce nothing the
+// answer can stand on. The agentic pipeline drives the same gate through its
+// retrieval model (agentic_rag/retrieval_model.go), with the same shape: any
+// one locate tool lifts it.
+func (c *Capability) RequiredTools() []string {
+	required := make([]string, 0, len(retrievalTools))
+	for name := range retrievalTools {
+		if _, ok := c.factories[name]; !ok {
+			continue
+		}
+		required = append(required, name)
+	}
+	sort.Strings(required)
+	return required
+}
+
 // Invoke implements toolkit.Capability. The run scope narrows the dataset scope
 // the tools were built with; the tools themselves still reject dataset_ids that
 // fall outside it.
@@ -142,7 +161,18 @@ func (c *Capability) Invoke(ctx context.Context, call toolkit.Call) (toolkit.Res
 	if err != nil {
 		return toolkit.Result{}, fmt.Errorf("%s: %w", call.Tool, err)
 	}
-	return toolkit.Result{Content: content, Evidence: ParseEvidence(content)}, nil
+	// Inline is what makes a retrieval result readable at all. Every tool behind
+	// this capability already returns a bounded window (grep caps at 30 matches
+	// with a snippet per match, list_chunks at one window of chunks), so spilling
+	// it again would replace that window with a handle to itself: the model would
+	// see a preview of the preview and have to spend a read_spill round to get
+	// back to the text it already asked for. The agentic pipeline, which these
+	// tools come from, hands the model the window verbatim.
+	return toolkit.Result{
+		Content:  content,
+		Evidence: ParseEvidence(content),
+		Inline:   true,
+	}, nil
 }
 
 // describe renders the tool specs straight from each tool's own declaration.
@@ -192,16 +222,34 @@ func normalizedArgs(arguments string) string {
 	return arguments
 }
 
-// chunkPattern matches the <chunk ...> open tag of the unified search XML.
-var chunkPattern = regexp.MustCompile(`<chunk\s+([^>]*)>`)
+// chunkPattern matches one rendered chunk: the attributes plus the element body.
+// The body is what carries the text, and the text is what makes an evidence
+// entry usable later — the body is empty for a self-closing element.
+var chunkPattern = regexp.MustCompile(`(?s)<chunk\s+([^>]*?)(?:/>|>(.*?)</chunk>)`)
 
 // attrPattern extracts one attribute from a tag body.
 var attrPattern = regexp.MustCompile(`([a-z_]+)="([^"]*)"`)
+
+// matchSnippetPattern matches the matched-window element grep renders.
+var matchSnippetPattern = regexp.MustCompile(`(?s)<match_snippet>(.*?)</match_snippet>`)
+
+// tagPattern strips the remaining markup from a chunk body.
+var tagPattern = regexp.MustCompile(`(?s)<[^>]+>`)
+
+// evidenceExcerptRunes bounds one evidence line. It is short on purpose: the
+// pool is re-sent every round, so each entry has to identify its passage without
+// paying for the passage again.
+const evidenceExcerptRunes = 120
 
 // ParseEvidence extracts one citation-bearing evidence per rendered chunk.
 //
 // The chunk id is the ref because it is stable across runs and is what citation
 // markers resolve back to; the owning document id is the source.
+//
+// The snippet carries the passage's opening text (or grep's matched window), not
+// just the document name. The pool built from these entries is re-sent as the
+// run's memory after the transcript has been compacted, so a bare document name
+// would leave the model knowing only that it once read "三国演义" 40 times.
 func ParseEvidence(content string) []toolkit.Evidence {
 	if !strings.Contains(content, "<chunk") {
 		return nil
@@ -227,13 +275,33 @@ func ParseEvidence(content string) []toolkit.Evidence {
 		if evidence.Source == "" {
 			evidence.Source = chunkID
 		}
-		if name := attrs["doc_name"]; name != "" {
-			evidence.Snippet = name
-		}
+		evidence.Snippet = evidenceExcerpt(attrs["doc_name"], match[2])
 		if score, err := strconv.ParseFloat(attrs["score"], 64); err == nil {
 			evidence.Score = score
 		}
 		out = append(out, evidence)
 	}
 	return out
+}
+
+// evidenceExcerpt condenses a chunk body into the one line kept in the pool.
+func evidenceExcerpt(docName, body string) string {
+	text := body
+	if matched := matchSnippetPattern.FindStringSubmatch(body); matched != nil {
+		text = matched[1]
+	} else {
+		text = tagPattern.ReplaceAllString(body, " ")
+	}
+	text = strings.Join(strings.Fields(html.UnescapeString(text)), " ")
+	if runes := []rune(text); len(runes) > evidenceExcerptRunes {
+		text = string(runes[:evidenceExcerptRunes]) + "…"
+	}
+	switch {
+	case text == "":
+		return docName
+	case docName == "":
+		return text
+	default:
+		return docName + " · " + text
+	}
 }

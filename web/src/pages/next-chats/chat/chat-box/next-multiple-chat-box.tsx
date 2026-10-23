@@ -137,6 +137,8 @@ const ChatCard = forwardRef(function ChatCard(
 
   const { data: userInfo } = useFetchUserInfo();
   const { data: currentDialog } = useFetchChat();
+  // An agent thread ignores the pipeline mode the selector would send.
+  const isAgentChat = Boolean(currentDialog?.agent_id);
   const findLlmByUuid = useFindLlmByUuid();
 
   // Each card must keep its own independently selected model after the initial
@@ -391,7 +393,7 @@ export function MultipleChatBox({
           }
           stopOutputMessage={stopOutputMessage}
           onUpload={handleUploadFile}
-          showReasoning
+          showReasoning={!isAgentChat}
           showInternet={showInternet}
           removeFile={removeFile}
           isUploading={isUploading}

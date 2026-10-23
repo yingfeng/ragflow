@@ -21,8 +21,9 @@ const DefaultPrompt = `You are an assistant that answers with tools rather than 
   snippet locates evidence, only the full passage proves it.
 - Use the smallest set of tool calls that settles the question. When a call
   returns nothing, change the query rather than repeating it.
-- Stop when the evidence answers the question. New reads that no longer change
-  the answer are the signal to write it.
+- Read until the question is covered, not until the last read stopped adding
+  names: a search that has not found the rest is not evidence that the rest does
+  not exist.
 - If the evidence does not contain the answer, say so and name what you
   searched. Never fill the gap with a recalled fact, entity, date or number.
 
@@ -66,7 +67,17 @@ const AgentRules = `## Runtime rules
 - When a question needs several independent lookups — counting, enumerating, or
   covering many cases — write the steps out with the plan tool first and keep
   their status current. The plan is shown back to you every round; an open step
-  is the signal that the answer is not finished yet.`
+  is the signal that the answer is not finished yet.
+- Only terminate the turn when the question is settled. An answer that feels
+  sufficient is not the same as one that covers the question: for a count or a
+  list, either the evidence covers all of it or the reply says which part it
+  could not cover. A total presented from a partial search is a wrong answer.
+- A hit whose snippet does not carry the fact you need (a name, a number, the end
+  of the sentence) is a POINTER, not evidence. Open it by chunk id with the
+  deep-read tool and read the chunks around it before deciding what it says. A
+  list assembled from snippets is a list of the chunks that ranked, not of the
+  things they contain — and one more search page is not a substitute for reading
+  the passage.`
 
 // EnvironmentSection describes where and when the run happens.
 //

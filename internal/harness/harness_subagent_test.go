@@ -9,9 +9,28 @@ import (
 	"ragflow/internal/harness/agent/definition"
 	"ragflow/internal/harness/agent/loop"
 	"ragflow/internal/harness/agent/model"
+	agentsubagent "ragflow/internal/harness/agent/subagent"
 	"ragflow/internal/harness/toolkit"
 	capsubagent "ragflow/internal/harness/toolkit/subagent"
 )
+
+// anchorPrefix is how the loop restates the question at the end of a prompt.
+// prepare appends it after the transcript so compaction cannot drop it, which
+// means the freshest tool result is no longer the last element.
+const anchorPrefix = "The question for this turn"
+
+// routingTarget is the message these fixtures script against: the last one the
+// loop addressed to the model, not the anchor restating the question.
+func routingTarget(req model.Request) model.Message {
+	for index := len(req.Messages) - 1; index >= 0; index-- {
+		message := req.Messages[index]
+		if message.Role == model.RoleUser && strings.HasPrefix(message.Content, anchorPrefix) {
+			continue
+		}
+		return message
+	}
+	return req.Messages[len(req.Messages)-1]
+}
 
 // routingModel answers by inspecting the conversation instead of by call order,
 // so parallel children cannot race the script.
@@ -25,7 +44,7 @@ func (m *routingModel) Complete(_ context.Context, req model.Request) (model.Res
 	m.calls = append(m.calls, req)
 	m.mu.Unlock()
 
-	last := req.Messages[len(req.Messages)-1]
+	last := routingTarget(req)
 	switch {
 	case last.Role == model.RoleTool:
 		return response("parent:" + last.Content), nil
@@ -62,13 +81,25 @@ func toolNames(specs []model.ToolSpec) map[string]bool {
 	return names
 }
 
+// registerDelegation wires the delegation tools the way the runtime does: the
+// spawner is built from the loop deps and its capability is registered on the
+// registry the parent's graph reads.
+func registerDelegation(t *testing.T, registry *toolkit.Registry, deps loop.Deps) {
+	t.Helper()
+	spawner, err := agentsubagent.New(deps, definition.PolicyConfig{}, 0)
+	if err != nil {
+		t.Fatalf("spawner: %v", err)
+	}
+	if err := registry.Register(capsubagent.New(spawner)); err != nil {
+		t.Fatalf("register delegation: %v", err)
+	}
+}
+
 func TestRegisterSubagentToolsExposesDelegationTools(t *testing.T) {
 	registry := toolkit.NewRegistry()
 	deps := loop.Deps{Model: &routingModel{}, Registry: registry}
 
-	if err := RegisterSubagentTools(registry, deps, definition.PolicyConfig{}, 0); err != nil {
-		t.Fatalf("RegisterSubagentTools: %v", err)
-	}
+	registerDelegation(t, registry, deps)
 
 	names := toolNames(registry.ToolSpecs())
 	for _, want := range []string{capsubagent.ToolName, capsubagent.SpawnManyName} {
@@ -78,17 +109,10 @@ func TestRegisterSubagentToolsExposesDelegationTools(t *testing.T) {
 	}
 }
 
-func TestRegisterSubagentToolsRequiresRegistry(t *testing.T) {
-	err := RegisterSubagentTools(nil, loop.Deps{Model: &routingModel{}}, definition.PolicyConfig{}, 0)
-	if err == nil || !strings.Contains(err.Error(), "registry") {
-		t.Fatalf("error = %v, want a registry requirement", err)
-	}
-}
-
-func TestRegisterSubagentToolsRequiresModel(t *testing.T) {
+func TestSubagentSpawnerRequiresModel(t *testing.T) {
 	registry := toolkit.NewRegistry()
 
-	err := RegisterSubagentTools(registry, loop.Deps{Registry: registry}, definition.PolicyConfig{}, 0)
+	_, err := agentsubagent.New(loop.Deps{Registry: registry}, definition.PolicyConfig{}, 0)
 	if err == nil || !strings.Contains(err.Error(), "model is required") {
 		t.Fatalf("error = %v, want a model requirement", err)
 	}
@@ -102,12 +126,10 @@ func TestSubagentToolsRunChildrenInOneToolRound(t *testing.T) {
 		Registry:     registry,
 		SystemPrompt: "you are a test agent",
 	}
-	if err := RegisterSubagentTools(registry, deps, definition.PolicyConfig{}, 0); err != nil {
-		t.Fatalf("RegisterSubagentTools: %v", err)
-	}
-	runner, err := BuildLoop(loop.Config{Deps: deps})
+	registerDelegation(t, registry, deps)
+	runner, err := loop.Build(loop.Config{Deps: deps})
 	if err != nil {
-		t.Fatalf("BuildLoop: %v", err)
+		t.Fatalf("Build: %v", err)
 	}
 
 	outcome, err := runner.Invoke(context.Background(), &loop.Input{RunID: "run-subagent", UserMessage: "delegate"}, nil)
@@ -126,7 +148,7 @@ func TestSubagentToolsRunChildrenInOneToolRound(t *testing.T) {
 
 	var parentRequests, childRequests int
 	for _, req := range mdl.requests() {
-		last := req.Messages[len(req.Messages)-1]
+		last := routingTarget(req)
 		if last.Role == model.RoleUser && strings.HasPrefix(last.Content, "child:") {
 			childRequests++
 			if names := toolNames(req.Tools); names[capsubagent.ToolName] || names[capsubagent.SpawnManyName] {

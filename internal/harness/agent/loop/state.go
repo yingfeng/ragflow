@@ -53,6 +53,13 @@ type State struct {
 	History []model.Message `json:"history"`
 	Prompt  []model.Message `json:"prompt"`
 
+	// Question is this turn's request, unchanged. Compaction drops messages from
+	// the front of History, and the request is the first thing a long run loses;
+	// prepare re-states it every round so a run that has read forty passages
+	// still answers the question it was asked rather than the topic of the last
+	// passage it read.
+	Question string `json:"question,omitempty"`
+
 	Pending  []PendingCall      `json:"pending"`
 	Evidence []toolkit.Evidence `json:"evidence"`
 	Errors   []StepError        `json:"errors"`
@@ -61,6 +68,16 @@ type State struct {
 	// toolkit.MetaPlan and rendered into every later prompt. Keeping it out of
 	// History is what makes it survive compaction.
 	Plan []toolkit.PlanStep `json:"plan,omitempty"`
+	// PlanRound is the round the plan last changed in (a step added, closed or
+	// reworded). An open plan that stops moving is not progress: it is the model
+	// holding the run open with work it is no longer doing, which is how one run
+	// spent all 50 of its rounds with three steps open.
+	PlanRound int `json:"plan_round,omitempty"`
+	// PlanShown is the fingerprint of the plan as last rendered into Prompt.
+	// The plan is restated only when it changes: repeating an unchanged step
+	// list every round is harness-only noise, and it reads as a reminder that
+	// the list is the whole job rather than a record of what is left to do.
+	PlanShown string `json:"plan_shown,omitempty"`
 
 	// ResumeHandled records that the first act after a restart already treated
 	// its inherited batch as possibly-already-dispatched. Later rounds in the
@@ -77,10 +94,18 @@ type State struct {
 	Verdict policy.Verdict `json:"verdict"`
 	Entry   EntryMeta      `json:"entry"`
 
-	NewEvidence     int `json:"new_evidence"`
-	EvidenceBefore  int `json:"evidence_before"`
-	StagnantRounds  int `json:"stagnant_rounds"`
-	RepeatedCalls   int `json:"repeated_calls"`
+	NewEvidence int `json:"new_evidence"`
+	// EvidenceBefore is the pool size at the start of the round; NewEvidence is
+	// what the round added. EvidenceCalls counts the round's calls that returned
+	// evidence units at all, which is how observe tells "searched and found
+	// nothing new" from "did not search this round".
+	EvidenceBefore int `json:"evidence_before"`
+	EvidenceCalls  int `json:"evidence_calls"`
+	StagnantRounds int `json:"stagnant_rounds"`
+	RepeatedCalls  int `json:"repeated_calls"`
+	// Nudges counts the course corrections injected so far. A stalled run is
+	// told the facts twice; after that the answer call takes over.
+	Nudges          int `json:"nudges"`
 	ScopeViolations int `json:"scope_violations"`
 	Citations       int `json:"citations"`
 	UnresolvedCalls int `json:"unresolved_calls"`
@@ -110,6 +135,11 @@ type State struct {
 	// ThinkTerminal records that think ended the turn without tool calls, which
 	// distinguishes an empty completion from a mid-flight round.
 	ThinkTerminal bool `json:"think_terminal"`
+	// TerminalRounds counts consecutive rounds whose think produced no tool
+	// call. Completion lets one such round work on an open plan step and no
+	// more: a model that only restates its answer is not making progress, and
+	// continuing it would spend the budget on prose.
+	TerminalRounds int `json:"terminal_rounds"`
 
 	// Steers counts messages injected into the run while it was executing.
 	Steers int `json:"steers"`

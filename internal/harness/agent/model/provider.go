@@ -28,6 +28,7 @@ var _ ChatCompleter = (*providermodel.ChatModel)(nil)
 // ProviderConfig pins the sampling defaults for one deployment.
 type ProviderConfig struct {
 	Temperature *float64
+	TopP        *float64
 	MaxTokens   *int
 	Thinking    *bool
 }
@@ -134,13 +135,20 @@ func (p *Provider) buildRequest(req Request) ([]providermodel.Message, *provider
 	}
 	config := &providermodel.ChatConfig{
 		Temperature: firstFloat(p.config.Temperature, req.Temperature),
+		TopP:        p.config.TopP,
 		MaxTokens:   firstInt(p.config.MaxTokens, req.MaxTokens),
 		Thinking:    p.config.Thinking,
 	}
 	if tools := toProviderTools(req.Tools); len(tools) > 0 {
 		config.Tools = tools
-		auto := "auto"
-		config.ToolChoice = &auto
+		// An empty ToolChoice means "auto"; a named one is the required-tool
+		// gate and must survive verbatim — it is how the loop guarantees the
+		// first retrieval happens instead of a round of pure planning.
+		choice := req.ToolChoice
+		if choice == "" {
+			choice = "auto"
+		}
+		config.ToolChoice = &choice
 	}
 	return messages, config
 }

@@ -22,6 +22,12 @@ func TestErrorClassification(t *testing.T) {
 		{errors.New("invalid api key"), false, false},
 		{errors.New("prompt is too long: 210000 tokens"), false, true},
 		{errors.New("maximum context length is 128000"), false, true},
+		// MiniMax reports an over-window request as a bare provider code; it must
+		// reach the compaction path instead of failing the run outright.
+		{errors.New("minimax API error: 输入内容过长 (2064)"), false, true},
+		// The code alone is not evidence: another provider's unrelated 2064 must
+		// not be read as an over-window prompt.
+		{errors.New("openai API error: bad request (2064)"), false, false},
 		{nil, false, false},
 	}
 	for _, testCase := range cases {
