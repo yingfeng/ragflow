@@ -23,6 +23,7 @@ func setupChatAgentServiceTestDB(t *testing.T) *gorm.DB {
 	}
 	if err := db.AutoMigrate(
 		&entity.Tenant{},
+		&entity.UserTenant{},
 		&entity.Chat{},
 		&entity.HarnessAgent{},
 		&entity.HarnessAgentVersion{},
@@ -34,9 +35,21 @@ func setupChatAgentServiceTestDB(t *testing.T) *gorm.DB {
 	dao.DB = db
 	t.Cleanup(func() { dao.DB = origDB })
 
-	tenant := &entity.Tenant{ID: "tenant-1"}
+	status := string(entity.StatusValid)
+	tenant := &entity.Tenant{ID: "tenant-1", Status: &status}
 	if err := db.Create(tenant).Error; err != nil {
 		t.Fatalf("failed to seed tenant: %v", err)
+	}
+	// Creating a chat resolves the caller's current tenant and its default chat
+	// model through the membership row, so the caller has to be a member of the
+	// tenant it creates the thread in. The tenant model id is pre-resolved
+	// (TenantLLMID) so the fixture does not need a model catalogue.
+	tenantLLMID := "tenant-model-a"
+	if err := db.Create(&entity.UserTenant{
+		ID: "membership-1", UserID: "tenant-1", TenantID: "tenant-1",
+		Role: "owner", Status: &status, LLMID: "model-a", TenantLLMID: &tenantLLMID,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed membership: %v", err)
 	}
 	return db
 }
