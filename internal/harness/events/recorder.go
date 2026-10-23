@@ -255,6 +255,33 @@ func (r *EventRecorder) RecordSubAgentCall(ctx context.Context, subAgentName str
 	})
 }
 
+// RecordCompaction writes one context-management event: what the run stopped
+// seeing and why. Compaction is invisible in the transcript by design, so this
+// is the only record of it.
+func (r *EventRecorder) RecordCompaction(ctx context.Context, trigger, strategy, reason string, dropped int) {
+	r.record(ctx, EventCompaction, func(ev *Event) {
+		pl := CompactionPayload{Trigger: trigger, Strategy: strategy, Reason: reason, Dropped: dropped}
+		ev.Payload, _ = json.Marshal(pl)
+	})
+}
+
+// RecordInteractionRequest writes the question the run just asked its user.
+func (r *EventRecorder) RecordInteractionRequest(ctx context.Context, requestID, question, contextText string) {
+	r.record(ctx, EventInteractionRequest, func(ev *Event) {
+		pl := InteractionPayload{RequestID: requestID, Question: question, Context: contextText}
+		ev.Payload, _ = json.Marshal(pl)
+	})
+}
+
+// RecordInteractionResolved writes the answer that settled a question, or the
+// fact that the wait expired without one.
+func (r *EventRecorder) RecordInteractionResolved(ctx context.Context, requestID, answer string, answered bool) {
+	r.record(ctx, EventInteractionResolved, func(ev *Event) {
+		pl := InteractionPayload{RequestID: requestID, Answer: answer, Answered: answered}
+		ev.Payload, _ = json.Marshal(pl)
+	})
+}
+
 // RecordVerdict records one termination decision. Governance needs to know why a
 // run stopped, not only that it stopped.
 func (r *EventRecorder) RecordVerdict(ctx context.Context, action, reason string, round, evidence int) {

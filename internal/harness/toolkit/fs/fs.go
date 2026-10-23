@@ -75,11 +75,80 @@ func (b *EngineBackend) Cat(ctx context.Context, path string) ([]byte, error) {
 type Capability struct {
 	backend  Backend
 	writable Writable
+	// changes records every successful write so the run's review pass can see
+	// what was changed without reconstructing it from tool arguments.
+	changes *toolkit.ChangeLog
 }
 
 // New builds the capability.
 func New(backend Backend, writable Writable) *Capability {
 	return &Capability{backend: backend, writable: writable}
+}
+
+// WithChangeLog attaches the run's write journal. Without it writes still work;
+// only the review pass loses its input.
+func (c *Capability) WithChangeLog(changes *toolkit.ChangeLog) *Capability {
+	c.changes = changes
+	return c
+}
+
+// Preview implements toolkit.Previewer: it renders what fs_write / fs_edit will
+// change, without changing it. A read failure is not an error — a new file has
+// no current content, and the preview is then "everything is new".
+func (c *Capability) Preview(ctx context.Context, call toolkit.Call) (string, error) {
+	if c.writable == nil {
+		return "", nil
+	}
+	switch call.Tool {
+	case "fs_write":
+		args, err := toolkit.DecodeArgs[writeArgs](call.Arguments)
+		if err != nil {
+			return "", err
+		}
+		path, err := normalizePath(args.Path, true)
+		if err != nil {
+			return "", err
+		}
+		before := ""
+		if content, _, readErr := c.writable.Read(ctx, path); readErr == nil {
+			before = string(content)
+		}
+		return toolkit.DiffText(path, before, args.Content), nil
+	case "fs_edit":
+		args, err := toolkit.DecodeArgs[editArgs](call.Arguments)
+		if err != nil {
+			return "", err
+		}
+		path, err := normalizePath(args.Path, true)
+		if err != nil {
+			return "", err
+		}
+		content, _, readErr := c.writable.Read(ctx, path)
+		if readErr != nil {
+			return fmt.Sprintf("%s\n(file does not exist yet: %v)", path, readErr), nil
+		}
+		text := string(content)
+		switch strings.Count(text, args.OldString) {
+		case 0:
+			return fmt.Sprintf("%s\n(old_string does not occur: this edit would fail)", path), nil
+		case 1:
+			return toolkit.DiffText(path, text, strings.Replace(text, args.OldString, args.NewString, 1)), nil
+		default:
+			return fmt.Sprintf("%s\n(old_string occurs more than once: this edit would fail)", path), nil
+		}
+	}
+	return "", nil
+}
+
+func (c *Capability) recordChange(path, before, after, revision string) {
+	if c.changes == nil {
+		return
+	}
+	c.changes.Add(toolkit.FileChange{
+		Path:     path,
+		Diff:     toolkit.DiffText(path, before, after),
+		Revision: revision,
+	})
 }
 
 // Name implements toolkit.Capability.
@@ -281,10 +350,17 @@ func (c *Capability) write(ctx context.Context, raw string) (toolkit.Result, err
 	if err != nil {
 		return toolkit.Result{}, err
 	}
+	// The previous content is read for the change journal only: a failed read
+	// means a new file, and the diff is then all additions.
+	before := ""
+	if content, _, readErr := c.writable.Read(ctx, path); readErr == nil {
+		before = string(content)
+	}
 	revision, err := c.writable.Write(ctx, path, []byte(args.Content), args.BaseRevision)
 	if err != nil {
 		return toolkit.Result{}, err
 	}
+	c.recordChange(path, before, args.Content, revision)
 	return toolkit.Result{
 		Content: fmt.Sprintf("wrote %s (revision=%s)", path, revision),
 		Meta:    map[string]any{"revision": revision, "path": path},
@@ -326,6 +402,7 @@ func (c *Capability) edit(ctx context.Context, raw string) (toolkit.Result, erro
 	if err != nil {
 		return toolkit.Result{}, err
 	}
+	c.recordChange(path, text, updated, newRevision)
 	return toolkit.Result{
 		Content: fmt.Sprintf("edited %s (revision=%s)", path, newRevision),
 		Meta:    map[string]any{"revision": newRevision, "path": path},

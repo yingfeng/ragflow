@@ -70,6 +70,9 @@ type Call struct {
 	ID        string
 	Tool      string
 	Arguments string
+	// Preview is what this call will change, rendered by the capability before
+	// the approval gate sees it. A human approves a diff, not a JSON blob.
+	Preview string
 }
 
 // Result is one tool outcome.
@@ -83,6 +86,27 @@ type Result struct {
 	Inline   bool
 	Evidence []Evidence
 	Meta     map[string]any
+}
+
+// Preview renders what a write-like call will change before it runs. The
+// capability that owns the tool renders it; one without a Previewer answers
+// with an empty string, which the approval gate shows as "no preview".
+func (r *Registry) Preview(ctx context.Context, call Call) string {
+	r.mu.RLock()
+	capability, ok := r.owner[call.Tool]
+	r.mu.RUnlock()
+	if !ok {
+		return ""
+	}
+	previewer, ok := capability.(Previewer)
+	if !ok {
+		return ""
+	}
+	preview, err := previewer.Preview(ctx, call)
+	if err != nil {
+		return ""
+	}
+	return preview
 }
 
 // Capability contributes tools and executes them.
@@ -279,6 +303,27 @@ func (r *Registry) Names() []string {
 	out := make([]string, 0, len(r.caps))
 	for _, capability := range r.caps {
 		out = append(out, capability.Name())
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ToolNames returns every tool the registered capabilities declare, sorted and
+// deduplicated, including deferred tools that are not offered yet.
+//
+// Deferred tools are included because this list feeds the system prompt's
+// capability section, and a tool the run can enable is a capability it holds.
+// Building that section from the offered subset instead would rewrite the
+// cached prefix the first time the model loaded a deferred tool.
+func (r *Registry) ToolNames() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.owner))
+	for name := range r.owner {
+		out = append(out, name)
 	}
 	sort.Strings(out)
 	return out

@@ -1,6 +1,7 @@
 package agentctx
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -91,7 +92,7 @@ func TestBuildKeepsEveryToolResultAtNormalPressure(t *testing.T) {
 		history = append(history, model.Message{Role: model.RoleTool, Name: "search", Content: fmt.Sprintf("result-%d", i)})
 	}
 
-	out := builder.Build("system", nil, history)
+	out := builder.Build(context.Background(), "system", nil, history)
 
 	cleared, kept := 0, 0
 	for _, message := range out {
@@ -124,7 +125,7 @@ func TestBuildPrunesUnderCriticalPressure(t *testing.T) {
 	}
 	history = append(history, model.Message{Role: model.RoleUser, Content: "final question"})
 
-	out := builder.Build("system", nil, history)
+	out := builder.Build(context.Background(), "system", nil, history)
 
 	if len(out) > 5 {
 		t.Fatalf("pruned output = %d messages, want a small trailing window", len(out))
@@ -147,7 +148,7 @@ func TestBuildPrunesUnderCriticalPressure(t *testing.T) {
 func TestBuildTruncatesLongToolResultInTheMiddle(t *testing.T) {
 	builder := New(Config{MaxInputTokens: 100_000, MaxToolResultBytes: 200})
 	long := "HEAD-" + strings.Repeat("m", 4_000) + "-TAIL"
-	out := builder.Build("system", nil, []model.Message{
+	out := builder.Build(context.Background(), "system", nil, []model.Message{
 		{Role: model.RoleTool, Name: "cat", Content: long},
 	})
 
@@ -173,7 +174,7 @@ func TestBuildUsesInjectedTokenCounter(t *testing.T) {
 		},
 	})
 
-	out := builder.Build("system", nil, []model.Message{
+	out := builder.Build(context.Background(), "system", nil, []model.Message{
 		{Role: model.RoleUser, Content: "one"},
 		{Role: model.RoleUser, Content: "two"},
 	})
@@ -191,7 +192,7 @@ func TestBuildRecoversFromPanickingCounter(t *testing.T) {
 		CountTokens:    func(string) int { panic("tokenizer not loaded") },
 	})
 
-	out := builder.Build("system", nil, []model.Message{{Role: model.RoleUser, Content: "hello"}})
+	out := builder.Build(context.Background(), "system", nil, []model.Message{{Role: model.RoleUser, Content: "hello"}})
 	if len(out) != 2 {
 		t.Fatalf("output = %d messages, want system + user", len(out))
 	}

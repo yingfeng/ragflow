@@ -1,6 +1,7 @@
 package agentctx
 
 import (
+	"context"
 	"testing"
 
 	"ragflow/internal/harness/agent/model"
@@ -20,7 +21,7 @@ func TestBuildSynthesizesMissingToolOutputs(t *testing.T) {
 		{Role: model.RoleTool, ToolCallID: "call_1", Name: "search", Content: "first result"},
 	}
 
-	prompt := builder.Build("system", nil, history)
+	prompt := builder.Build(context.Background(), "system", nil, history)
 	outputs := map[string]string{}
 	for _, message := range prompt {
 		if message.Role == model.RoleTool {
@@ -50,7 +51,7 @@ func TestBuildLeavesCompleteTranscriptAlone(t *testing.T) {
 		{Role: model.RoleAssistant, Content: "done"},
 	}
 
-	prompt := builder.Build("system", nil, history)
+	prompt := builder.Build(context.Background(), "system", nil, history)
 	tools := 0
 	for _, message := range prompt {
 		if message.Role == model.RoleTool {

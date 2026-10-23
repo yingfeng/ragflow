@@ -23,14 +23,15 @@ import (
 // answered by an operator holding a different request; and two brokers would
 // silently split the pending approvals of one deployment in half.
 type HarnessProcess struct {
-	Store      *store.RunStore
-	Events     *store.EventStore
-	Grants     toolkit.GrantStore
-	Breakers   *harnessmodel.BreakerRegistry
-	Approvals  *toolkit.ApprovalBroker
-	Agents     *HarnessAgentService
-	Resolver   harness.ModelResolver
-	Checkpoint checkpoint.BaseCheckpointer
+	Store        *store.RunStore
+	Events       *store.EventStore
+	Grants       toolkit.GrantStore
+	Breakers     *harnessmodel.BreakerRegistry
+	Approvals    *toolkit.ApprovalBroker
+	Interactions *toolkit.InteractBroker
+	Agents       *HarnessAgentService
+	Resolver     harness.ModelResolver
+	Checkpoint   checkpoint.BaseCheckpointer
 }
 
 var harnessProcess struct {
@@ -53,8 +54,11 @@ func SharedHarnessProcess() *HarnessProcess {
 			// One broker per process: a pending approval is answered by whoever
 			// holds the API, not by the goroutine that happens to own the run.
 			Approvals: toolkit.NewApprovalBroker(0),
-			Agents:    NewHarnessAgentService(),
-			Resolver:  NewHarnessModelResolver(),
+			// Same reasoning for questions: an ask_user wait is settled through
+			// this broker by whichever client the user answers from.
+			Interactions: toolkit.NewInteractBroker(),
+			Agents:       NewHarnessAgentService(),
+			Resolver:     NewHarnessModelResolver(),
 		}
 		harnessProcess.proc = proc
 	})

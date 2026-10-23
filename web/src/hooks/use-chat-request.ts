@@ -71,6 +71,8 @@ export const enum ChatApiAction {
   CreateSharedConversation = 'createSharedConversation',
   ListPendingApprovals = 'listPendingApprovals',
   ResolveApproval = 'resolveApproval',
+  ListPendingInteractions = 'listPendingInteractions',
+  ResolveInteraction = 'resolveInteraction',
 }
 
 export const AgenticRagKeys = {
@@ -728,6 +730,66 @@ export const useResolveApproval = () => {
   });
 
   return { data, loading, resolveApproval: mutateAsync };
+};
+
+export interface IHarnessInteractionRef {
+  request_id: string;
+  run_id: string;
+  question: string;
+  context?: string;
+  tenant_id: string;
+}
+
+/** Lists the questions runs asked and are still waiting on, across this tenant. */
+export const useListPendingInteractions = (enabled: boolean) => {
+  const { data, isFetching, refetch } = useQuery<IHarnessInteractionRef[]>({
+    queryKey: [ChatApiAction.ListPendingInteractions],
+    initialData: [],
+    gcTime: 0,
+    refetchOnWindowFocus: false,
+    enabled,
+    queryFn: async () => {
+      const { data } = await chatService.listHarnessInteractions();
+      return data?.data ?? [];
+    },
+  });
+
+  return { data, loading: isFetching, refetch };
+};
+
+export interface IResolveInteractionParams {
+  requestId: string;
+  answer: string;
+}
+
+/** Answers one question the run asked. The answer also resumes the waiting run. */
+export const useResolveInteraction = () => {
+  const queryClient = useQueryClient();
+
+  const {
+    data,
+    isPending: loading,
+    mutateAsync,
+  } = useMutation({
+    mutationKey: [ChatApiAction.ResolveInteraction],
+    mutationFn: async (params: IResolveInteractionParams) => {
+      const { data } = await chatService.resolveHarnessInteraction(
+        {
+          url: api.resolveHarnessInteraction(params.requestId),
+          data: { answer: params.answer },
+        },
+        true,
+      );
+      if (data.code === 0) {
+        queryClient.invalidateQueries({
+          queryKey: [ChatApiAction.ListPendingInteractions],
+        });
+      }
+      return data.code;
+    },
+  });
+
+  return { data, loading, resolveInteraction: mutateAsync };
 };
 
 //#endregion

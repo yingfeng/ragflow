@@ -15,6 +15,7 @@ import (
 	agentctx "ragflow/internal/harness/context"
 	"ragflow/internal/harness/events"
 	"ragflow/internal/harness/graph/checkpoint"
+	"ragflow/internal/harness/hooks"
 	"ragflow/internal/harness/store"
 	"ragflow/internal/harness/toolkit"
 	"ragflow/internal/harness/toolkit/builtin"
@@ -126,12 +127,28 @@ type RuntimeConfig struct {
 	CompletionCostPerToken float64
 	// Concurrency bounds parallel read-only tool calls.
 	Concurrency int
+	// Interactor is the channel ask_user waits on. Nil leaves ask_user out of
+	// the tool list: a run with nobody to ask must not spend a round waiting for
+	// an answer that cannot arrive.
+	Interactor toolkit.Interactor
+	// Hooks is the lifecycle extension registry this run's loop dispatches
+	// through. Nil builds an empty one: the surface exists either way, and the
+	// embedding registers its policy hooks on the registry it passes here.
+	Hooks *hooks.Registry
+	// Changes collects the run's file writes and enables the review pass. Nil
+	// builds one, so a run with write tools is always reviewed.
+	Changes *toolkit.ChangeLog
+	// Retry is the deployment's retry budget. Zero fields keep the defaults.
+	Retry loop.RetryPolicy
 }
 
 // Runtime is a fully wired harness for one scope.
 type Runtime struct {
 	Service  *run.Service
 	Registry *toolkit.Registry
+	// Changes is the run's write journal, after the run: what it wrote and
+	// what the review pass made of it.
+	Changes *toolkit.ChangeLog
 	// SelfDelegation is false when the sub-agent capability could not be wired.
 	SelfDelegation bool
 	// Notes are the capabilities that degraded at wiring time. The caller logs
@@ -162,9 +179,22 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if cfg.Sampling != nil {
 		providerCfg.Temperature = cfg.Sampling.Temperature
 		providerCfg.TopP = cfg.Sampling.TopP
-		providerCfg.Thinking = cfg.Sampling.Thinking
+		// A thinking flag sent to a model that does not accept it is a failed
+		// request, not a preference: it is dropped here rather than at the
+		// provider, where the run would die on a parameter nobody needed.
+		if cfg.Sampling.Thinking != nil && model.SupportsThinking(cfg.ModelRef) {
+			providerCfg.Thinking = cfg.Sampling.Thinking
+		}
 	}
 	chatModel := NewModel(chat, providerCfg)
+
+	// The write journal exists for every run: the fs capability records into it
+	// when it is registered, and the review pass reads it at finish.
+	changes := cfg.Changes
+	if changes == nil {
+		changes = toolkit.NewChangeLog()
+	}
+	cfg.Changes = changes
 
 	registry := toolkit.NewRegistry()
 	notes, err := registerCapabilities(ctx, registry, cfg)
@@ -172,9 +202,26 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		return nil, err
 	}
 
+	hooksRegistry := cfg.Hooks
+	if hooksRegistry == nil {
+		hooksRegistry = hooks.NewRegistry()
+	}
+
+	// Compaction is invisible in the transcript by design; the event and the
+	// PostCompact hook are the only records of what the run stopped seeing.
 	builder := agentctx.New(agentctx.Config{
 		CountTokens: agentctx.DefaultCountTokens,
 		Summarize:   agentctx.NewSummarizer(chatModel, 0),
+		OnCompact: func(ctx context.Context, info agentctx.CompactInfo) {
+			if recorder := events.RecorderFromContext(ctx); recorder != nil {
+				recorder.RecordCompaction(ctx, info.Trigger, info.Strategy, info.Reason, info.Dropped)
+			}
+			hooksRegistry.PostCompact(ctx, hooks.CompactContext{
+				Trigger:  info.Trigger,
+				Strategy: info.Strategy,
+				Dropped:  info.Dropped,
+			})
+		},
 	})
 
 	approver := cfg.Approver
@@ -204,6 +251,13 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	// prompt that changes on its own, and everything before it has to stay
 	// byte-stable for the provider's prefix cache.
 	systemPrompt := definition.EffectiveSystemPrompt(cfg.SystemPrompt)
+	// The capability list sits inside the cached prefix, before the standing
+	// instructions. It is derived from the run's own tool surface, so it can only
+	// state what the model already has and only changes when that surface does:
+	// a list that tracked a policy file would rewrite the prefix on every edit.
+	if capabilities := definition.CapabilitySection(registry.ToolNames()); capabilities != "" {
+		systemPrompt += "\n\n" + capabilities
+	}
 	if note := registry.SystemNotes(ctx); note != "" {
 		systemPrompt += "\n\n" + note
 	}
@@ -223,6 +277,9 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		PromptCostPerToken:     cfg.PromptCostPerToken,
 		CompletionCostPerToken: cfg.CompletionCostPerToken,
 		Approver:               approver,
+		Hooks:                  hooksRegistry,
+		Changes:                changes,
+		Retry:                  cfg.Retry,
 	}
 
 	service, err := run.New(run.Config{
@@ -267,7 +324,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if !selfDelegation {
 		notes = append(notes, "delegation tools are unavailable: the sub-agent spawner could not be built")
 	}
-	return &Runtime{Service: service, Registry: registry, SelfDelegation: selfDelegation, Notes: notes}, nil
+	return &Runtime{Service: service, Registry: registry, Changes: changes, SelfDelegation: selfDelegation, Notes: notes}, nil
 }
 
 // registerCapabilities installs the tools this deployment actually has. A
@@ -298,7 +355,8 @@ func registerCapabilities(ctx context.Context, registry *toolkit.Registry, cfg R
 	}
 
 	if cfg.Filesystem != nil {
-		if err := registry.Register(fs.New(fs.FromEngine(cfg.Filesystem), fs.NewMemoryWritable())); err != nil {
+		capability := fs.New(fs.FromEngine(cfg.Filesystem), fs.NewMemoryWritable()).WithChangeLog(cfg.Changes)
+		if err := registry.Register(capability); err != nil {
 			return nil, err
 		}
 	}
@@ -308,6 +366,11 @@ func registerCapabilities(ctx context.Context, registry *toolkit.Registry, cfg R
 	// agent's selection narrows only that installed layer.
 	if err := registry.Register(skill.New(skillLayers(cfg))); err != nil {
 		return nil, err
+	}
+	if cfg.Interactor != nil {
+		if err := registry.Register(toolkit.NewInteractCapability(cfg.Interactor)); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.ExecRoot != "" {
 		// Shell access is only offered inside a sandbox. When none works the tool

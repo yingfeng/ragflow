@@ -34,6 +34,21 @@ const (
 // Tier is the compaction level selected from context pressure.
 type Tier int
 
+// String names the tier for compaction records.
+func (t Tier) String() string {
+	switch t {
+	case TierNormal:
+		return "normal"
+	case TierTrimSchemas:
+		return "trim_schemas"
+	case TierCompactHistory:
+		return "compact_history"
+	case TierAggressivePrune:
+		return "aggressive_prune"
+	}
+	return "unknown"
+}
+
 const (
 	// TierNormal keeps recent tool output verbatim.
 	TierNormal Tier = iota

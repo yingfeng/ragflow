@@ -29,6 +29,7 @@ import (
 	"ragflow/internal/harness/graph/checkpoint"
 	"ragflow/internal/harness/graph/constants"
 	"ragflow/internal/harness/graph/graph"
+	"ragflow/internal/harness/hooks"
 	"ragflow/internal/harness/toolkit"
 	"ragflow/internal/harness/toolkit/spill"
 	"ragflow/internal/harness/toolkit/toolsearch"
@@ -84,6 +85,14 @@ type Deps struct {
 	// Approver gates tool calls before execution. Nil runs everything the
 	// registry offers; a non-nil gate is where approvals attach.
 	Approver toolkit.Approver
+	// Hooks is the lifecycle extension surface. Nil is a no-op: every method
+	// on the registry is nil-receiver safe, so the loop calls straight through.
+	Hooks *hooks.Registry
+	// Changes is the run's write journal. Non-nil enables the review pass: what
+	// a run wrote is reviewed before the run is reported as done.
+	Changes *toolkit.ChangeLog
+	// Retry is the deployment's retry budget. Zero fields keep the defaults.
+	Retry RetryPolicy
 	// ToolSchemaBudget caps the schemas sent with each request. Zero uses
 	// toolkit.SchemaBudgetTokens.
 	ToolSchemaBudget int
@@ -191,6 +200,12 @@ func Build(cfg Config) (*Runner, error) {
 		state.Entry.Round++
 		state.Budget.ElapsedMS = start.UnixMilli() - state.StartedMS
 		state.RetryPrepare = false
+		// The run-level points fire from the loop rather than the service so
+		// a child run reports its own lifecycle to the same hooks.
+		if state.Entry.Round == 1 {
+			deps.Hooks.Notify(ctx, hooks.SessionStart, hooks.RunContext{RunID: state.RunID, Agent: state.AgentName})
+			deps.Hooks.Notify(ctx, hooks.UserPromptSubmit, hooks.RunContext{RunID: state.RunID, Agent: state.AgentName, Prompt: state.Question})
+		}
 		state.Pending = nil
 		state.NewEvidence = 0
 		state.NewOutputs = 0
@@ -227,9 +242,24 @@ func Build(cfg Config) (*Runner, error) {
 			hint = speculator.Hint()
 		}
 		var usedHint bool
-		state.Prompt, usedHint = deps.Builder.BuildWithFoldHint(deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost), hint)
+		state.Prompt, usedHint = deps.Builder.BuildWithFoldHint(ctx, deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost), hint)
 		if usedHint {
 			speculator.NoteHintAdopted()
+		}
+		// The model cannot see the window; it can only see what the harness tells
+		// it. Stated once, as a fact about the run rather than an instruction to
+		// stop: what survives a fold is what the summary kept, and knowing the
+		// pressure is what lets the model decide to write down what matters.
+		if !state.ContextNotified {
+			if window := deps.Builder.Window(); window > 0 {
+				used := estimatePromptTokens(state.Prompt)
+				if used*4 >= window*3 {
+					state.ContextNotified = true
+					state.History = append(state.History, model.Message{Role: model.RoleUser, Content: fmt.Sprintf(
+						"context note: this round's prompt is roughly %d of the %d tokens the model can hold. Older turns are folded automatically as it fills, and a fold keeps only what the summary kept — anything the answer depends on must reach a tool call, the answer, or the next message.",
+						used, window)})
+				}
+			}
 		}
 		// The plan rides after the transcript: the cacheable system prefix stays
 		// byte-identical across rounds while the model still sees what is left.
@@ -313,13 +343,27 @@ func Build(cfg Config) (*Runner, error) {
 		workingSink := ReasoningSinkFromContext(ctx)
 		var held []string
 		var response model.Response
+		deps.Hooks.PreModelRequest(ctx, hooks.ModelContext{
+			RunID:    state.RunID,
+			Round:    state.Entry.Round,
+			Model:    deps.ModelName,
+			Messages: len(request.Messages),
+		})
 		if streamer, ok := deps.Model.(model.Streamer); ok && (answerSink != nil || workingSink != nil) {
-			response, err = callModelStreaming(ctx, streamer, request, deps.Breaker, func(text string) {
+			response, err = callModelStreamingWith(ctx, streamer, request, deps.Breaker, deps.Retry.streamAttempts(), func(text string) {
 				held = append(held, text)
 			})
 		} else {
-			response, err = callModel(ctx, deps.Model, request, deps.Breaker)
+			response, err = callModelWith(ctx, deps.Model, request, deps.Breaker, deps.Retry.requestAttempts())
 		}
+		deps.Hooks.PostModelRequest(ctx, hooks.ModelResultContext{
+			RunID:     state.RunID,
+			Round:     state.Entry.Round,
+			Model:     deps.ModelName,
+			TokensIn:  response.Usage.PromptTokens,
+			TokensOut: response.Usage.CompletionTokens,
+			Error:     errorText(err),
+		})
 		if err != nil {
 			// A prompt-too-long rejection means the estimate was wrong. Shrink
 			// the prompt and try again instead of failing the run; after
@@ -472,6 +516,22 @@ func Build(cfg Config) (*Runner, error) {
 		// maxRepeatedToolCalls the same call is refused with an explanation, so a
 		// loop costs a sentence instead of the rest of the budget. Counting runs
 		// before the parallel batch so the map needs no lock.
+		// The model can ask how much room is left. The answer must be this run's
+		// own accounting — the same numbers policy enforces — so the loop binds
+		// them for the tool calls of this round.
+		toolCtx := toolkit.WithRunStats(ctx, toolkit.RunStats{
+			Round:         state.Entry.Round,
+			MaxRounds:     state.Budget.MaxRounds,
+			ToolCalls:     state.Budget.ToolCalls,
+			MaxToolCalls:  state.Budget.MaxToolCalls,
+			TokensIn:      state.Budget.TokensIn,
+			TokensOut:     state.Budget.TokensOut,
+			TokenBudget:   state.Budget.MaxTokens,
+			ContextWindow: deps.Builder.Window(),
+			ContextUsed:   estimatePromptTokens(state.Prompt),
+			CompactAt:     0.75,
+		})
+
 		if state.CallRepeats == nil {
 			state.CallRepeats = make(map[string]int)
 		}
@@ -521,7 +581,36 @@ func Build(cfg Config) (*Runner, error) {
 				return
 			}
 
+			// A PreToolUse hook fires before the approval gate, so a policy hook
+			// can stop or rewrite a dangerous call without leaving it waiting on a
+			// human. Rewriting happens on the same struct the assistant message
+			// references, so the transcript stays consistent: the arguments the
+			// model declared are the arguments that ran.
+			if mutation := deps.Hooks.PreToolUse(ctx, hooks.ToolContext{
+				RunID:     state.RunID,
+				Round:     state.Entry.Round,
+				Tool:      call.Tool,
+				Arguments: call.Arguments,
+				Risk:      deps.Registry.RiskOf(call.Tool).String(),
+			}); mutation != nil {
+				if mutation.Veto {
+					reason := mutation.VetoReason
+					if reason == "" {
+						reason = "blocked by policy"
+					}
+					failures[index] = fmt.Errorf("tool %q was blocked by a hook: %s", call.Tool, reason)
+					return
+				}
+				if mutation.Arguments != "" && mutation.Arguments != call.Arguments {
+					call.Arguments = mutation.Arguments
+				}
+			}
+
+			// A write shows what it will change: approving a diff is a decision,
+			// approving a JSON blob is a guess. Capabilities that do not implement
+			// Previewer contribute nothing here.
 			approvalCall := toolkit.Call{ID: call.ID, Tool: call.Tool, Arguments: call.Arguments}
+			approvalCall.Preview = deps.Registry.Preview(ctx, approvalCall)
 			recorder := events.RecorderFromContext(ctx)
 			if deps.Approver != nil {
 				risk := deps.Registry.RiskOf(call.Tool)
@@ -551,7 +640,29 @@ func Build(cfg Config) (*Runner, error) {
 				}
 			}
 			toolStart := time.Now()
-			result, err := deps.Registry.Invoke(ctx, approvalCall)
+			result, err := deps.Registry.Invoke(toolCtx, approvalCall)
+			// PostToolUse sees the raw result before it is rendered into history:
+			// this is where a sanitizer replaces content and a compliance hook
+			// discards an output that must not reach the model.
+			if mutation := deps.Hooks.PostToolUse(ctx, hooks.ToolResultContext{
+				RunID:     state.RunID,
+				Round:     state.Entry.Round,
+				Tool:      call.Tool,
+				Arguments: call.Arguments,
+				Content:   result.Content,
+				IsError:   err != nil,
+			}); mutation != nil {
+				if mutation.Veto {
+					reason := mutation.VetoReason
+					if reason == "" {
+						reason = "removed by policy"
+					}
+					result = toolkit.ErrorResult(fmt.Errorf("output of %q was removed by a hook: %s", call.Tool, reason))
+					err = nil
+				} else if mutation.Content != "" {
+					result.Content = mutation.Content
+				}
+			}
 			results[index] = result
 			failures[index] = err
 			if recorder != nil {
@@ -667,6 +778,11 @@ func Build(cfg Config) (*Runner, error) {
 		}
 		state.Pending = nil
 		state.UnresolvedCalls = 0
+		if ctx.Err() != nil {
+			// The batch was cut short by cancellation: the results loop above
+			// already recorded which calls did not return.
+			deps.Hooks.Notify(ctx, hooks.Interrupt, hooks.RunContext{RunID: state.RunID, Round: state.Entry.Round, Reason: "tool batch interrupted"})
+		}
 		record(deps, StepRecord{
 			RunID:      state.RunID,
 			Phase:      "act_batch",
@@ -783,7 +899,7 @@ func Build(cfg Config) (*Runner, error) {
 		if deps.Lessons != nil {
 			lessons = deps.Lessons(ctx)
 		}
-		messages := deps.Builder.BuildWithTier(deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost))
+		messages := deps.Builder.BuildWithTier(ctx, deps.SystemPrompt, lessons, state.History, compactionTierFor(state.CompactionBoost))
 		if plan := renderPlan(state.Plan, true); plan != "" {
 			messages = append(messages, model.Message{Role: model.RoleUser, Content: plan})
 		}
@@ -808,11 +924,25 @@ func Build(cfg Config) (*Runner, error) {
 			MaxTokens: deps.MaxOutputTokens,
 		}
 		var response model.Response
+		deps.Hooks.PreModelRequest(ctx, hooks.ModelContext{
+			RunID:    state.RunID,
+			Round:    state.Entry.Round,
+			Model:    deps.ModelName,
+			Messages: len(request.Messages),
+		})
 		if streamer, ok := deps.Model.(model.Streamer); ok && DeltaSinkFromContext(ctx) != nil {
-			response, err = callModelStreaming(ctx, streamer, request, deps.Breaker, DeltaSinkFromContext(ctx))
+			response, err = callModelStreamingWith(ctx, streamer, request, deps.Breaker, deps.Retry.streamAttempts(), DeltaSinkFromContext(ctx))
 		} else {
-			response, err = callModel(ctx, deps.Model, request, deps.Breaker)
+			response, err = callModelWith(ctx, deps.Model, request, deps.Breaker, deps.Retry.requestAttempts())
 		}
+		deps.Hooks.PostModelRequest(ctx, hooks.ModelResultContext{
+			RunID:     state.RunID,
+			Round:     state.Entry.Round,
+			Model:     deps.ModelName,
+			TokensIn:  response.Usage.PromptTokens,
+			TokensOut: response.Usage.CompletionTokens,
+			Error:     errorText(err),
+		})
 		if err != nil {
 			// The evidence is already paid for; failing the run here would throw
 			// it away. Record the failure and let finish report what it has.
@@ -898,6 +1028,17 @@ func Build(cfg Config) (*Runner, error) {
 			// stopped record can be told apart from a complete one.
 			Reason: clip(state.Stopped, 400),
 		})
+		// A run that wrote files is reviewed before it is reported as done: the
+		// writer already believes the change is right, which is exactly why the
+		// check has to come from a fresh call.
+		state.Review = reviewChanges(ctx, state, deps)
+		if state.Review != "" {
+			state.Stopped += "; review: issues found"
+		}
+		// The two run-level terminal points: Stop carries the decision, SessionEnd
+		// closes the lifecycle for hooks that aggregate per run.
+		deps.Hooks.Notify(ctx, hooks.Stop, hooks.RunContext{RunID: state.RunID, Agent: state.AgentName, Round: state.Entry.Round, Reason: state.Stopped})
+		deps.Hooks.Notify(ctx, hooks.SessionEnd, hooks.RunContext{RunID: state.RunID, Agent: state.AgentName, Round: state.Entry.Round})
 		return state, nil
 	})
 
@@ -1072,6 +1213,9 @@ func registerRuntimeCapabilities(registry *toolkit.Registry) {
 	if !registry.Has("read_spill") {
 		_ = registry.Register(spill.NewCapability())
 	}
+	if !registry.Has("context_remaining") {
+		_ = registry.Register(toolkit.NewBudgetCapability())
+	}
 }
 
 // seedHistory builds the turn's conversation from the caller's history.
@@ -1189,6 +1333,7 @@ func outcomeOf(state *State) Outcome {
 		Citations:      state.Citations,
 		PrefixRebuilds: state.PrefixRebuilds,
 		BlockedCalls:   state.BlockedCalls,
+		Review:         state.Review,
 		Verdict:        state.Verdict,
 		Stopped:        state.Stopped,
 		Interrupted:    state.Verdict.Action == policy.ActionPause,
@@ -1637,6 +1782,21 @@ const (
 	aggregateSoftLimitBytes = 64 << 10
 	aggregateFloorBytes     = 1 << 10
 )
+
+// estimatePromptTokens approximates a prompt's size without running the
+// tokenizer. Four bytes per token is the rule the builder's default counter
+// uses, and the two numbers the model sees only need to agree in magnitude with
+// the pressure tiers that decide when to fold.
+func estimatePromptTokens(messages []model.Message) int {
+	total := 0
+	for _, message := range messages {
+		total += len(message.Content) + len(message.Name) + 16
+		for _, call := range message.ToolCalls {
+			total += len(call.Name) + len(call.Arguments) + 16
+		}
+	}
+	return total/4 + 1
+}
 
 func aggregateInlineBudget(results []toolkit.Result, perCall int) int {
 	if perCall <= 0 {

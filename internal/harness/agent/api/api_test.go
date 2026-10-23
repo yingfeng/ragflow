@@ -15,6 +15,7 @@ import (
 	"ragflow/internal/harness/agent/loop"
 	"ragflow/internal/harness/agent/run"
 	"ragflow/internal/harness/events"
+	"ragflow/internal/harness/toolkit"
 )
 
 // Events records the query it received and returns the canned result.
@@ -37,6 +38,9 @@ type fakeRuns struct {
 	approvalKeyPending bool
 	approvalItems      []ApprovalRef
 	approvalsForTenant string
+	interactionItems   []toolkit.InteractRef
+	interactionTenant  string
+	interactionAnswer  string
 	eventQuery         EventQuery
 	eventItems         []*events.Event
 	eventErr           error
@@ -86,6 +90,16 @@ func (f *fakeRuns) ResolveApprovalKey(requestID, tenantID string, allow bool, re
 	f.approvalResolved = requestID + ":" + reason
 	f.approvalsForTenant = tenantID
 	return f.approvalKeyPending
+}
+
+func (f *fakeRuns) PendingInteractions(tenantID string) []toolkit.InteractRef {
+	f.interactionTenant = tenantID
+	return f.interactionItems
+}
+
+func (f *fakeRuns) ResolveInteractionKey(requestID, tenantID, answer string) bool {
+	f.interactionAnswer = requestID + ":" + tenantID + ":" + answer
+	return true
 }
 
 func (f *fakeRuns) Steps(context.Context, string) ([]entity.HarnessAgentStep, error) {
@@ -359,5 +373,67 @@ func TestResolveApprovalKeyRejectsAnUnknownRequest(t *testing.T) {
 
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+}
+
+// The interaction list carries the same tenant filter as approvals: one tenant
+// must not read another tenant's questions, and a client that missed the
+// announcement still finds the question here.
+func TestListInteractionsScopesToTheCallerTenant(t *testing.T) {
+	runs := newFakeRuns()
+	runs.interactionItems = []toolkit.InteractRef{{
+		Key: "run-1:ask-1", RunID: "run-1", Question: "which year?", TenantID: "t1",
+	}}
+	router := newTestServer(t, runs)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/interactions", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	if runs.interactionTenant != "t1" {
+		t.Fatalf("tenant filter = %q, want the caller's tenant", runs.interactionTenant)
+	}
+	if !strings.Contains(recorder.Body.String(), `"request_id":"run-1:ask-1"`) {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestResolveInteractionAnswersByRequestID(t *testing.T) {
+	runs := newFakeRuns()
+	router := newTestServer(t, runs)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/interactions/run-1:ask-1",
+		strings.NewReader(`{"answer":"1976"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if runs.interactionAnswer != "run-1:ask-1:t1:1976" {
+		t.Fatalf("answer = %q, want the request id, the caller's tenant and the answer", runs.interactionAnswer)
+	}
+}
+
+// An empty answer would resume the run with nothing while the UI shows the
+// question as answered, so it is rejected before it reaches the broker.
+func TestResolveInteractionRejectsAnEmptyAnswer(t *testing.T) {
+	runs := newFakeRuns()
+	router := newTestServer(t, runs)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/interactions/run-1:ask-1",
+		strings.NewReader(`{"answer":"   "}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	if runs.interactionAnswer != "" {
+		t.Fatalf("an empty answer reached the broker: %q", runs.interactionAnswer)
 	}
 }

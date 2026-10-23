@@ -324,6 +324,10 @@ export default {
   listHarnessApprovals: `${restAPIv1}/harness/approvals`,
   resolveHarnessApproval: (requestId: string) =>
     `${restAPIv1}/harness/approvals/${encodeURIComponent(requestId)}`,
+  // harness interactions (questions an agent asked and is waiting on)
+  listHarnessInteractions: `${restAPIv1}/harness/interactions`,
+  resolveHarnessInteraction: (requestId: string) =>
+    `${restAPIv1}/harness/interactions/${encodeURIComponent(requestId)}`,
   // the agent that runs a thread: its definition is read and replaced as a version
   harnessAgent: (agentId: string) =>
     `${restAPIv1}/harness/agents/${encodeURIComponent(agentId)}`,

@@ -37,7 +37,8 @@ func LayerOf(typ EventType) Layer {
 		EventInterrupt, EventResume, EventFork:
 		return LayerControl
 
-	case EventSessionValueSet, EventSessionTransfer:
+	case EventSessionValueSet, EventSessionTransfer,
+		EventInteractionRequest, EventInteractionResolved:
 		return LayerTranscript
 
 	case EventToolCallStart, EventToolCallResult, EventToolCallError,
@@ -49,7 +50,7 @@ func LayerOf(typ EventType) Layer {
 
 	case EventLLMCallStart, EventLLMCallEnd,
 		EventRetry, EventStateRead, EventStateWrite,
-		EventMemoryRead, EventVerdict:
+		EventMemoryRead, EventVerdict, EventCompaction:
 		return LayerTrace
 
 	case EventLLMCallChunk:

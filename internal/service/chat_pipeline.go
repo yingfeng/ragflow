@@ -163,9 +163,25 @@ type ThinkEvent struct {
 	// Summary is the human sentence for this step, exactly what the think
 	// block shows.
 	Summary string `json:"summary"`
-	// RequestID addresses a waiting approval (kind "approval"). The client posts
-	// it back to settle the call; a wait and its verdict carry the same id.
+	// RequestID addresses a waiting approval (kind "approval") or a question
+	// (kind "interaction"). The client posts it back to settle it; a wait and
+	// its verdict carry the same id.
 	RequestID string `json:"request_id,omitempty"`
+	// Diff is what a pending write will change. A reviewer decides on the
+	// change, not on the arguments that produced it.
+	Diff string `json:"diff,omitempty"`
+	// The remaining fields carry a turn's own accounting, sent once as a step
+	// with kind "usage". No individual tool call owns these numbers and the run
+	// table stores none of them, so this event is the only place a client can
+	// show what the turn cost. PrefixRebuilds is the layering signal: it counts
+	// how often the cached prompt prefix changed, and with a fixed tool surface
+	// it must stay at zero — a number that grows means something is rewriting
+	// the prefix every round.
+	Rounds         int     `json:"rounds,omitempty"`
+	TokensIn       int     `json:"tokens_in,omitempty"`
+	TokensOut      int     `json:"tokens_out,omitempty"`
+	CostUSD        float64 `json:"cost_usd,omitempty"`
+	PrefixRebuilds int     `json:"prefix_rebuilds,omitempty"`
 }
 
 // AsyncChat is the Go equivalent of Python's async_chat() in

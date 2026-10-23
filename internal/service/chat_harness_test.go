@@ -60,7 +60,14 @@ func collectChatResults(t *testing.T, out <-chan AsyncChatResult) []AsyncChatRes
 func TestHarnessTurnStreamsDeltasThenAuthoritativeAnswer(t *testing.T) {
 	executor := &fakeHarnessTurn{
 		deltas: []string{"Apple ", "Inc."},
-		result: harnessTurnResult{Answer: "Apple Inc. was founded in 1976."},
+		result: harnessTurnResult{
+			Answer:         "Apple Inc. was founded in 1976.",
+			Rounds:         3,
+			TokensIn:       1200,
+			TokensOut:      80,
+			CostUSD:        0.002,
+			PrefixRebuilds: 1,
+		},
 	}
 	svc := &ChatPipelineService{harness: executor}
 
@@ -96,13 +103,25 @@ func TestHarnessTurnStreamsDeltasThenAuthoritativeAnswer(t *testing.T) {
 		t.Errorf("user = %q, want the turn's actor", req.UserID)
 	}
 
-	if len(results) != 3 {
-		t.Fatalf("results = %d, want two deltas and one final", len(results))
+	if len(results) != 4 {
+		t.Fatalf("results = %d, want two deltas, one usage step and one final", len(results))
 	}
 	for i, want := range []string{"Apple ", "Inc."} {
 		if results[i].Answer != want || results[i].Final {
 			t.Errorf("delta %d = %+v", i, results[i])
 		}
+	}
+	// The turn's accounting rides the step stream: rounds, tokens, cost and
+	// prefix rebuilds are not owned by any tool call, so the client would have
+	// no way to show what the turn cost without this event.
+	usage := results[2]
+	if usage.ThinkEvent == nil || usage.ThinkEvent.Kind != "usage" {
+		t.Fatalf("third result = %+v, want the usage step", usage)
+	}
+	if usage.ThinkEvent.Rounds != 3 || usage.ThinkEvent.TokensIn != 1200 ||
+		usage.ThinkEvent.TokensOut != 80 || usage.ThinkEvent.CostUSD != 0.002 ||
+		usage.ThinkEvent.PrefixRebuilds != 1 {
+		t.Errorf("usage step = %+v, want the turn's accounting", usage.ThinkEvent)
 	}
 	final := results[len(results)-1]
 	if !final.Final || !final.AnswerIsAuthoritative {

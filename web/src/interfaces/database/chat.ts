@@ -82,6 +82,15 @@ export interface IThinkEvent {
   duration_ms?: number;
   summary: string;
   request_id?: string;
+  /** What a pending write will change: the reviewer approves the diff. */
+  diff?: string;
+  /** Turn accounting, sent once as a step with kind "usage". */
+  rounds?: number;
+  tokens_in?: number;
+  tokens_out?: number;
+  cost_usd?: number;
+  /** Prompt-prefix rebuilds this turn; 0 with a fixed tool surface. */
+  prefix_rebuilds?: number;
 }
 
 /**

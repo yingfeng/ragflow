@@ -57,6 +57,12 @@ const (
 	// outliving the run that created it, so its creation is durable audit.
 	EventGrantPersisted EventType = "approval.grant.persisted"
 
+	// Model→user questions. Transcript class, not audit: the question is part
+	// of the conversation the user had with the agent, and the answer arrives
+	// through the same channel the user's own messages do.
+	EventInteractionRequest  EventType = "interaction.request"
+	EventInteractionResolved EventType = "interaction.resolved"
+
 	// Checkpoint.
 	EventCheckpointCreated  EventType = "checkpoint.created"
 	EventCheckpointRestored EventType = "checkpoint.restored"
@@ -71,6 +77,12 @@ const (
 
 	// Verdict is one termination decision taken by the policy engine.
 	EventVerdict EventType = "verdict"
+
+	// Compaction is one context-management action that actually dropped
+	// material: a fold, a prune, or a clear of old tool results. Analytics reads
+	// these to answer "what did the run stop seeing" — the compaction itself is
+	// invisible in the transcript, which is the point of compacting.
+	EventCompaction EventType = "compaction"
 
 	// Fork — branch from an existing event.
 	EventFork EventType = "fork"
@@ -207,6 +219,17 @@ type MemoryWritePayload struct {
 	Score     float64 `json:"score,omitempty"`
 }
 
+// InteractionPayload is the payload for model→user question events.
+type InteractionPayload struct {
+	RequestID string `json:"request_id"`
+	Question  string `json:"question"`
+	Context   string `json:"context,omitempty"`
+	// Answer is empty while the question waits; Answered=false on the resolved
+	// event records a wait that expired without one.
+	Answer   string `json:"answer,omitempty"`
+	Answered bool   `json:"answered,omitempty"`
+}
+
 // ApprovalPayload is the payload for approval events.
 type ApprovalPayload struct {
 	RequestID string `json:"request_id"`
@@ -232,6 +255,18 @@ type VerdictPayload struct {
 	Reason   string `json:"reason,omitempty"`
 	Round    int    `json:"round"`
 	Evidence int    `json:"evidence,omitempty"`
+}
+
+// CompactionPayload is the payload for context-management events.
+type CompactionPayload struct {
+	// Trigger is the pressure tier that forced the action (fold, prune, clear).
+	Trigger string `json:"trigger"`
+	// Strategy is what was dropped: fold | prune | clear.
+	Strategy string `json:"strategy"`
+	// Reason is the human-readable cause, for compaction analytics.
+	Reason string `json:"reason,omitempty"`
+	// Dropped counts messages or results removed from view.
+	Dropped int `json:"dropped"`
 }
 
 // SessionValuePayload is the payload for session value events.

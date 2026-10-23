@@ -152,6 +152,13 @@ type State struct {
 	// RetryPrepare asks the graph to rebuild the prompt before calling the model
 	// again. It is set by think after a prompt-too-long rejection.
 	RetryPrepare bool `json:"retry_prepare"`
+	// ContextNotified records that the run was told how full its window is, so
+	// the reminder is stated once instead of every round: a restated threshold
+	// reads as an instruction to stop early.
+	ContextNotified bool `json:"context_notified,omitempty"`
+	// Review is the independent reviewer's verdict on the run's file writes.
+	// Empty means either nothing was written or the review found no issues.
+	Review string `json:"review,omitempty"`
 }
 
 // Outcome is what a finished run reports.
@@ -175,5 +182,8 @@ type Outcome struct {
 	// BlockedCalls how many repeated calls the breaker refused.
 	PrefixRebuilds int
 	BlockedCalls   int
-	FinalState     *State
+	// Review is the independent reviewer's verdict on this run's file writes:
+	// empty when nothing was written or the review found no issues.
+	Review     string
+	FinalState *State
 }

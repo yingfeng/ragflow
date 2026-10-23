@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -41,6 +42,9 @@ type ApprovalRef struct {
 	Args      string `json:"args"`
 	Risk      string `json:"risk"`
 	TenantID  string `json:"tenant_id"`
+	// Diff is what the call will change, for a write: a reviewer approves a
+	// diff, not a JSON argument blob. Empty for calls with no preview.
+	Diff string `json:"diff,omitempty"`
 }
 
 // Runs is the executor the handler drives.
@@ -63,6 +67,12 @@ type Runs interface {
 	// ResolveApprovalKey settles one request by the id PendingApprovals returned.
 	// A request belonging to another tenant is not answerable here.
 	ResolveApprovalKey(requestID, tenantID string, allow bool, reason string, remember bool) bool
+	// PendingInteractions lists one tenant's questions still waiting for a
+	// human answer, so a client that missed the announcement can still show them.
+	PendingInteractions(tenantID string) []toolkit.InteractRef
+	// ResolveInteractionKey answers one question by the id the interaction list
+	// handed out. A question another tenant's run asked is not answerable here.
+	ResolveInteractionKey(requestID, tenantID, answer string) bool
 	// Events reads the run's append-only audit log.
 	Events(ctx context.Context, runID string, query EventQuery) ([]*events.Event, error)
 }
@@ -87,6 +97,52 @@ func (h *Handler) Register(group *gin.RouterGroup) {
 	group.POST("/runs/:run_id/approvals/:request_id", h.resolveApproval)
 	group.GET("/approvals", h.listApprovals)
 	group.POST("/approvals/:request_id", h.resolveApprovalKey)
+	group.GET("/interactions", h.listInteractions)
+	group.POST("/interactions/:request_id", h.resolveInteraction)
+}
+
+// interactionAnswer is the accepted body of an interaction answer.
+type interactionAnswer struct {
+	Answer string `json:"answer"`
+}
+
+// listInteractions returns the questions waiting for this tenant's users. The
+// same strict tenant filter as approvals applies: one tenant must not read
+// another tenant's questions.
+func (h *Handler) listInteractions(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "tenant is required"})
+		return
+	}
+	items := h.runs.PendingInteractions(tenantID)
+	if items == nil {
+		items = []toolkit.InteractRef{}
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": items})
+}
+
+// resolveInteraction answers one waiting question by its request id.
+func (h *Handler) resolveInteraction(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "tenant is required"})
+		return
+	}
+	var body interactionAnswer
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Answer) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "answer is required"})
+		return
+	}
+	if !h.runs.ResolveInteractionKey(c.Param("request_id"), tenantID, body.Answer) {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "question is not waiting"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0})
 }
 
 // listApprovals returns the approvals waiting in this process. The tenant of an

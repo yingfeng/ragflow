@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -35,7 +36,38 @@ const (
 	// maxRepeatedToolCalls is how often one identical call may run before act
 	// refuses it. One repeat is a retry; three is a loop.
 	maxRepeatedToolCalls = 3
+	// maxAttemptsCeiling bounds a configured attempt count. A deployment may
+	// raise the number of retries; nothing may raise it into a long stall.
+	maxAttemptsCeiling = 20
 )
+
+// RetryPolicy is the deployment's retry budget. A zero field keeps the default;
+// the distinction matters because "0 retries" is a legitimate operator choice
+// and "unset" is not the same configuration.
+type RetryPolicy struct {
+	// Request bounds a non-streaming completion.
+	Request int
+	// Stream bounds a streaming completion. It can differ: a stream that has
+	// not emitted yet is cheap to replay, and some deployments want fewer
+	// retries once text may already be on screen.
+	Stream int
+}
+
+// requestAttempts resolves the configured value against the defaults.
+func (p RetryPolicy) requestAttempts() int { return boundedAttempts(p.Request) }
+
+// streamAttempts resolves the configured value against the defaults.
+func (p RetryPolicy) streamAttempts() int { return boundedAttempts(p.Stream) }
+
+func boundedAttempts(configured int) int {
+	if configured <= 0 {
+		return modelAttempts
+	}
+	if configured > maxAttemptsCeiling {
+		return maxAttemptsCeiling
+	}
+	return configured
+}
 
 var retryableMarkers = []string{
 	"rate limit",
@@ -80,6 +112,56 @@ func errorContains(err error, markers []string) bool {
 // isRetryableModelError reports whether the provider failure is transient.
 func isRetryableModelError(err error) bool {
 	return errorContains(err, retryableMarkers)
+}
+
+// contentFilterMarkers name a provider rejection for content, not for load. It
+// is retried once with guidance because the model can phrase the same answer
+// differently; retrying the identical request would be rejected identically.
+var contentFilterMarkers = []string{
+	"content filter",
+	"content_filter",
+	"content policy",
+	"content_policy",
+	"content management policy",
+	"flagged",
+	"responsible ai",
+}
+
+// authMarkers name a credential failure. It is never retried: the same key
+// fails the same way, and retrying spends the run's budget on a fix that only
+// a human can make.
+var authMarkers = []string{
+	"invalid api key",
+	"invalid_api_key",
+	"incorrect api key",
+	"unauthorized",
+	"authentication",
+	"401",
+}
+
+// isContentFilterError reports a provider-side content rejection.
+func isContentFilterError(err error) bool {
+	return errorContains(err, contentFilterMarkers)
+}
+
+// isAuthError reports a credential failure.
+func isAuthError(err error) bool {
+	return errorContains(err, authMarkers)
+}
+
+// contentFilterGuidance is appended once when a provider rejects an answer for
+// content. A bare retry reproduces the rejection; naming the constraint is what
+// lets the model answer the question another way.
+const contentFilterGuidance = "The provider rejected the previous answer for content policy. Answer the same question again without the material that was rejected, keeping the factual content the user asked for."
+
+// withContentFilterGuidance appends the guidance once per request. The struct is
+// copied wholesale so a field added to Request later is carried over too.
+func withContentFilterGuidance(request model.Request) model.Request {
+	updated := request
+	messages := make([]model.Message, len(request.Messages), len(request.Messages)+1)
+	copy(messages, request.Messages)
+	updated.Messages = append(messages, model.Message{Role: model.RoleUser, Content: contentFilterGuidance})
+	return updated
 }
 
 // isPromptTooLongError reports whether the prompt exceeded the model window.
@@ -138,23 +220,37 @@ func modelRetryDelay(err error, attempt int) time.Duration {
 // once per attempt: three attempts against a dead provider are one failure for
 // the purpose of failing other runs fast.
 func callModel(ctx context.Context, mdl model.Model, request model.Request, breaker *model.Breaker) (model.Response, error) {
+	return callModelWith(ctx, mdl, request, breaker, 0)
+}
+
+// callModelWith is callModel with an explicit attempt budget. Zero means the
+// default, so a caller that has no policy to apply does not have to name one.
+func callModelWith(ctx context.Context, mdl model.Model, request model.Request, breaker *model.Breaker, attempts int) (model.Response, error) {
+	attempts = boundedAttempts(attempts)
 	if remaining, ok := breaker.Allow(time.Now()); !ok {
 		return model.Response{}, &model.ErrProviderCoolingDown{Key: "provider", Remaining: remaining}
 	}
 
 	var lastErr error
-	for attempt := 1; attempt <= modelAttempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		response, err := mdl.Complete(ctx, request)
 		if err == nil {
 			breaker.Success()
 			return response, nil
 		}
 		lastErr = err
-		if !isRetryableModelError(err) || attempt == modelAttempts {
+		// A content rejection is the one failure where replaying the request is
+		// pointless and replaying it with a constraint is not: the model has to
+		// know what was rejected to phrase the answer differently.
+		if isContentFilterError(err) && attempt < attempts {
+			request = withContentFilterGuidance(request)
+			continue
+		}
+		if !isRetryableModelError(err) || attempt == attempts {
 			if isRetryableModelError(err) {
 				breaker.Failure(time.Now())
 			}
-			return model.Response{}, err
+			return model.Response{}, explainModelError(err)
 		}
 		timer := time.NewTimer(modelRetryDelay(err, attempt))
 		select {
@@ -164,7 +260,18 @@ func callModel(ctx context.Context, mdl model.Model, request model.Request, brea
 		case <-timer.C:
 		}
 	}
-	return model.Response{}, lastErr
+	return model.Response{}, explainModelError(lastErr)
+}
+
+// explainModelError turns a credential failure into something an operator can
+// act on. The provider's own text says what broke; what it does not say is that
+// retrying cannot help, which is the fact the caller needs before spending the
+// run's remaining budget on it.
+func explainModelError(err error) error {
+	if err == nil || !isAuthError(err) {
+		return err
+	}
+	return fmt.Errorf("%w (the model provider rejected the credentials; retrying will not help — check the tenant's provider key for this model)", err)
 }
 
 // callModelStreaming retries a streaming call.
@@ -173,6 +280,12 @@ func callModel(ctx context.Context, mdl model.Model, request model.Request, brea
 // twice. So a retry is only allowed before the first delta reached the sink; once
 // text was shown the error is final and the caller decides what to tell the user.
 func callModelStreaming(ctx context.Context, streamer model.Streamer, request model.Request, breaker *model.Breaker, sink func(string)) (model.Response, error) {
+	return callModelStreamingWith(ctx, streamer, request, breaker, 0, sink)
+}
+
+// callModelStreamingWith is callModelStreaming with an explicit attempt budget.
+func callModelStreamingWith(ctx context.Context, streamer model.Streamer, request model.Request, breaker *model.Breaker, attempts int, sink func(string)) (model.Response, error) {
+	attempts = boundedAttempts(attempts)
 	if remaining, ok := breaker.Allow(time.Now()); !ok {
 		return model.Response{}, &model.ErrProviderCoolingDown{Key: "provider", Remaining: remaining}
 	}
@@ -188,19 +301,23 @@ func callModelStreaming(ctx context.Context, streamer model.Streamer, request mo
 	}
 
 	var lastErr error
-	for attempt := 1; attempt <= modelAttempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		response, err := streamer.Stream(ctx, request, sender)
 		if err == nil {
 			breaker.Success()
 			return response, nil
 		}
 		lastErr = err
+		if isContentFilterError(err) && !emitted && attempt < attempts {
+			request = withContentFilterGuidance(request)
+			continue
+		}
 		retryable := isRetryableModelError(err) && !emitted
-		if !retryable || attempt == modelAttempts {
+		if !retryable || attempt == attempts {
 			if isRetryableModelError(err) {
 				breaker.Failure(time.Now())
 			}
-			return model.Response{}, err
+			return model.Response{}, explainModelError(err)
 		}
 		timer := time.NewTimer(modelRetryDelay(err, attempt))
 		select {
@@ -210,7 +327,7 @@ func callModelStreaming(ctx context.Context, streamer model.Streamer, request mo
 		case <-timer.C:
 		}
 	}
-	return model.Response{}, lastErr
+	return model.Response{}, explainModelError(lastErr)
 }
 
 // boostTier maps the number of prompt-too-long recoveries onto the compaction

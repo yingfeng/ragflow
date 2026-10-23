@@ -7,6 +7,7 @@
 package agentctx
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -63,6 +64,22 @@ type Config struct {
 	// cap clipped them on any real operator prompt — the newest rules were the
 	// first to go.
 	SystemBudgetCapTokens int
+	// OnCompact observes every compaction that actually dropped material. It
+	// fires from inside Build, so it runs on the caller's context and must not
+	// call back into the builder. Nil is a no-op.
+	OnCompact func(ctx context.Context, info CompactInfo)
+}
+
+// CompactInfo describes one compaction action that changed what the model sees.
+type CompactInfo struct {
+	// Trigger is the pressure tier that forced the action.
+	Trigger string
+	// Strategy is what was dropped: fold | prune | clear.
+	Strategy string
+	// Dropped counts the messages (fold, prune) or tool results (clear) removed.
+	Dropped int
+	// Reason is the human-readable cause, for compaction analytics.
+	Reason string
 }
 
 // DefaultConfig returns production defaults.
@@ -153,23 +170,23 @@ const PrunedPlaceholder = "[earlier context pruned: %d messages]"
 const foldSummaryPrefix = "[earlier turns compacted: "
 
 // Build assembles the prompt: system (with lessons), then compacted history.
-func (b *Builder) Build(system string, lessons []string, history []model.Message) []model.Message {
-	return b.BuildWithTier(system, lessons, history, TierNormal)
+func (b *Builder) Build(ctx context.Context, system string, lessons []string, history []model.Message) []model.Message {
+	return b.BuildWithTier(ctx, system, lessons, history, TierNormal)
 }
 
 // BuildWithTier forces at least minTier. A prompt-too-long rejection from the
 // provider is the one signal that must override the estimate: the provider just
 // proved the prompt does not fit, so the next attempt compacts harder instead of
 // failing the run.
-func (b *Builder) BuildWithTier(system string, lessons []string, history []model.Message, minTier Tier) []model.Message {
-	prompt, _ := b.BuildWithFoldHint(system, lessons, history, minTier, nil)
+func (b *Builder) BuildWithTier(ctx context.Context, system string, lessons []string, history []model.Message, minTier Tier) []model.Message {
+	prompt, _ := b.BuildWithFoldHint(ctx, system, lessons, history, minTier, nil)
 	return prompt
 }
 
 // BuildWithFoldHint builds with a summary that was prepared ahead of time. A nil
 // hint is the ordinary path and summarizes synchronously if a fold is due. The
 // second result reports that the hint replaced a model call.
-func (b *Builder) BuildWithFoldHint(system string, lessons []string, history []model.Message, minTier Tier, hint *FoldHint) ([]model.Message, bool) {
+func (b *Builder) BuildWithFoldHint(ctx context.Context, system string, lessons []string, history []model.Message, minTier Tier, hint *FoldHint) ([]model.Message, bool) {
 	history = ensureToolOutputs(history)
 	systemContent := b.renderSystemWithinBudget(system, lessons)
 	limit := b.limit()
@@ -191,15 +208,15 @@ func (b *Builder) BuildWithFoldHint(system string, lessons []string, history []m
 	// 29-round enumeration answer from the six results it could still see.
 	compacted = b.truncateToolResults(compacted, tier)
 	if tier >= TierTrimSchemas {
-		compacted = b.clearOldToolResults(compacted, tier)
+		compacted = b.notifyClear(ctx, tier, compacted)
 	}
 
 	usedHint := false
 	if tier >= TierCompactHistory {
-		compacted, usedHint = b.foldWithSummary(compacted, headroom, hint)
+		compacted, usedHint = b.notifyFold(ctx, tier, compacted, headroom, hint)
 	}
 	if tier >= TierAggressivePrune {
-		compacted = b.pruneToRecent(compacted)
+		compacted = b.notifyPrune(ctx, tier, compacted)
 	}
 	compacted = b.fitToBudget(compacted, headroom)
 
@@ -207,6 +224,54 @@ func (b *Builder) BuildWithFoldHint(system string, lessons []string, history []m
 	out = append(out, model.Message{Role: model.RoleSystem, Content: systemContent})
 	out = append(out, compacted...)
 	return out, usedHint
+}
+
+// notifyClear wraps clearOldToolResults with observation. How many results were
+// cleared is the fact compaction analytics needs: the model that answers from
+// the six results it can still see is the failure mode this exists to surface.
+func (b *Builder) notifyClear(ctx context.Context, tier Tier, messages []model.Message) []model.Message {
+	before := 0
+	for _, message := range messages {
+		if message.Role == model.RoleTool {
+			before++
+		}
+	}
+	out := b.clearOldToolResults(messages, tier)
+	after := 0
+	for _, message := range out {
+		if message.Role == model.RoleTool && message.Content != "" &&
+			!strings.HasPrefix(message.Content, "[output of ") {
+			after++
+		}
+	}
+	if dropped := before - after; dropped > 0 {
+		b.notifyCompact(ctx, CompactInfo{Trigger: tier.String(), Strategy: "clear", Dropped: dropped, Reason: "tool result byte budget under pressure"})
+	}
+	return out
+}
+
+// notifyFold wraps foldWithSummary with observation.
+func (b *Builder) notifyFold(ctx context.Context, tier Tier, messages []model.Message, headroom int, hint *FoldHint) ([]model.Message, bool) {
+	out, usedHint := b.foldWithSummary(messages, headroom, hint)
+	if len(out) < len(messages) {
+		b.notifyCompact(ctx, CompactInfo{Trigger: tier.String(), Strategy: "fold", Dropped: len(messages) - len(out), Reason: "older turns folded into a summary"})
+	}
+	return out, usedHint
+}
+
+// notifyPrune wraps pruneToRecent with observation.
+func (b *Builder) notifyPrune(ctx context.Context, tier Tier, messages []model.Message) []model.Message {
+	out := b.pruneToRecent(messages)
+	if len(out) < len(messages) {
+		b.notifyCompact(ctx, CompactInfo{Trigger: tier.String(), Strategy: "prune", Dropped: len(messages) - len(out), Reason: "critical pressure: only the trailing window kept"})
+	}
+	return out
+}
+
+func (b *Builder) notifyCompact(ctx context.Context, info CompactInfo) {
+	if b.cfg.OnCompact != nil {
+		b.cfg.OnCompact(ctx, info)
+	}
 }
 
 // clearOldToolResults replaces tool output the model no longer needs and
@@ -562,6 +627,16 @@ func renderSystem(system string, lessons []string, maxLessons int) string {
 }
 
 // limit is the token ceiling for the assembled prompt.
+// Window is the model's full context window. The loop reports it to the model
+// through context_remaining, so the number the model sees is the same one the
+// builder compacts against.
+func (b *Builder) Window() int {
+	if b.cfg.ContextWindow > 0 {
+		return b.cfg.ContextWindow
+	}
+	return DefaultContextWindow
+}
+
 func (b *Builder) limit() int {
 	return b.budget.EffectiveInput()
 }

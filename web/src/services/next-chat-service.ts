@@ -40,6 +40,8 @@ const {
   fetchExternalChatInfo,
   listHarnessApprovals,
   resolveHarnessApproval,
+  listHarnessInteractions,
+  resolveHarnessInteraction,
   harnessAgent,
   harnessSkills,
 } = api;
@@ -131,6 +133,14 @@ const methods = {
   },
   resolveHarnessApproval: {
     url: resolveHarnessApproval,
+    method: 'post',
+  },
+  listHarnessInteractions: {
+    url: listHarnessInteractions,
+    method: 'get',
+  },
+  resolveHarnessInteraction: {
+    url: resolveHarnessInteraction,
     method: 'post',
   },
   // The agent definition is read and replaced through the same URL: reading it

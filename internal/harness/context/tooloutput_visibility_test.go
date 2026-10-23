@@ -1,6 +1,7 @@
 package agentctx
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -33,7 +34,7 @@ func TestBuild_KeepsToolOutputWhileTheWindowHasRoom(t *testing.T) {
 	})
 	history := toolHistory(12)
 
-	prompt := builder.Build("system", nil, history)
+	prompt := builder.Build(context.Background(), "system", nil, history)
 
 	for _, message := range prompt {
 		if message.Role != model.RoleTool {
@@ -57,7 +58,7 @@ func TestBuild_ClearsOldToolOutputOnlyUnderPressure(t *testing.T) {
 	})
 	history := toolHistory(12)
 
-	prompt := builder.Build("system", nil, history)
+	prompt := builder.Build(context.Background(), "system", nil, history)
 
 	cleared := 0
 	verbatim := 0
@@ -102,7 +103,7 @@ func TestBuild_PruneKeepsTheFoldSummary(t *testing.T) {
 	summary := model.Message{Role: model.RoleUser, Content: foldSummaryPrefix + "4 messages]\nthe question is a count of generals"}
 	history := append([]model.Message{summary}, toolHistory(24)...)
 
-	prompt := builder.Build("system", nil, history)
+	prompt := builder.Build(context.Background(), "system", nil, history)
 
 	if len(prompt) < 2 {
 		t.Fatalf("prompt = %+v", prompt)

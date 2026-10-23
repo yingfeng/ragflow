@@ -108,6 +108,8 @@ func (m *harnessManager) buildRuntime(ctx context.Context, req run.Request) (*ha
 		Approvals:      approvals,
 		Grants:         m.proc.Grants,
 		Breakers:       m.proc.Breakers,
+		Interactor:     m.proc.Interactions,
+		Retry:          m.settings.RetryPolicy(),
 		EventLog:       m.proc.Events,
 		EventLayers:    service.EventLayers(),
 	})
@@ -270,6 +272,7 @@ func (m *harnessManager) PendingApprovals(tenantID string) []harnessapi.Approval
 			Args:      ref.Call.Arguments,
 			Risk:      ref.Risk.String(),
 			TenantID:  ref.TenantID,
+			Diff:      ref.Call.Preview,
 		})
 	}
 	return out
@@ -299,6 +302,31 @@ func (m *harnessManager) ResolveApprovalKey(requestID, tenantID string, allow bo
 
 // recoverTask names the sweep in the leader lease table.
 const recoverTask = "run-recovery"
+
+// PendingInteractions lists one tenant's waiting questions through the
+// process-wide broker: whoever holds the API can answer a chat turn's question.
+func (m *harnessManager) PendingInteractions(tenantID string) []toolkit.InteractRef {
+	refs := m.proc.Interactions.List()
+	out := make([]toolkit.InteractRef, 0, len(refs))
+	for _, ref := range refs {
+		if ref.TenantID != tenantID {
+			continue
+		}
+		runID, _, _ := strings.Cut(ref.Key, ":")
+		ref.RunID = runID
+		out = append(out, ref)
+	}
+	return out
+}
+
+// ResolveInteractionKey answers one question after checking it belongs to the
+// caller's tenant.
+func (m *harnessManager) ResolveInteractionKey(requestID, tenantID, answer string) bool {
+	if ref, ok := m.proc.Interactions.Pending("", requestID); !ok || ref.TenantID != tenantID {
+		return false
+	}
+	return m.proc.Interactions.Resolve(requestID, answer)
+}
 
 // recoverAll resumes the runs a previous worker left behind.
 //

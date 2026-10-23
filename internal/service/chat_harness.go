@@ -58,6 +58,9 @@ type harnessApprovalEvent struct {
 	Tool       string
 	Args       string
 	Risk       string
+	// Diff is what a pending write will change: the reviewer decides on the
+	// change, not on the arguments that produced it.
+	Diff string
 	// Decided is false for the wait, true once a verdict (or a timeout) arrived.
 	Decided bool
 	Allowed bool
@@ -86,6 +89,7 @@ func (a harnessApprover) Approve(ctx context.Context, call toolkit.Call, risk to
 		Tool:       call.Tool,
 		Args:       call.Arguments,
 		Risk:       risk.String(),
+		Diff:       call.Preview,
 	}
 	if a.report != nil {
 		a.report(event)
@@ -98,6 +102,20 @@ func (a harnessApprover) Approve(ctx context.Context, call toolkit.Call, risk to
 		a.report(event)
 	}
 	return decision
+}
+
+// harnessInteractionEvent is one question the run asked the user and what came
+// back. The chat is the interactive surface: every wait and every answer is a
+// think event, so the client can render the question and post the answer.
+type harnessInteractionEvent struct {
+	// RequestKey settles the question on the process broker.
+	RequestKey string
+	Question   string
+	Context    string
+	// Answered is false while the question waits, and true only when the user
+	// replied in time; a timeout is reported with Answered=false and empty text.
+	Answered bool
+	Answer   string
 }
 
 // harnessTurnRequest is one agent turn inside a chat thread. The thread supplies
@@ -121,6 +139,10 @@ type harnessTurnRequest struct {
 	// OnApproval reports a tool call that needs a human. The run blocks while the
 	// verdict is outstanding, so the callback must return immediately.
 	OnApproval func(event harnessApprovalEvent)
+	// OnInteraction reports a question the run asked the user, and the answer
+	// when one arrives. The run blocks while the question waits, so the callback
+	// must return immediately.
+	OnInteraction func(event harnessInteractionEvent)
 }
 
 // failoverCompleter tries each model in order and answers from the first one that
@@ -264,6 +286,14 @@ type harnessTurnResult struct {
 	TokensOut int
 	CostUSD   float64
 	Stopped   string
+	// PrefixRebuilds counts how often the cached prompt prefix changed in this
+	// turn. It is the one measurable outcome of prompt layering: with a fixed
+	// tool surface it stays at zero, and a number that grows with rounds means
+	// something in the run is rewriting the prefix every round.
+	PrefixRebuilds int
+	// Review is the independent reviewer's verdict on the turn's file writes.
+	// Empty means nothing was written or the review found no issues.
+	Review string
 }
 
 // harnessTurnExecutor runs one turn. It is an interface so a test can drive the
@@ -333,8 +363,34 @@ func (harnessRuntimeExecutor) Run(ctx context.Context, req harnessTurnRequest) (
 			report: req.OnApproval,
 			auto:   resolved.Definition.Policy.Approval == definition.ApprovalAuto,
 		},
+		// The chat is the surface a question is actually asked on: the wrapper
+		// reports the wait to the stream, the process broker settles it, and a
+		// client answers by the request id through the harness interaction API.
+		Interactor: toolkit.ReportInteractor{
+			Next: proc.Interactions,
+			OnAsk: func(requestID, question, contextText string) {
+				if req.OnInteraction != nil {
+					req.OnInteraction(harnessInteractionEvent{
+						RequestKey: requestID,
+						Question:   question,
+						Context:    contextText,
+					})
+				}
+			},
+			OnAnswer: func(requestID, question, answer string, answered bool) {
+				if req.OnInteraction != nil {
+					req.OnInteraction(harnessInteractionEvent{
+						RequestKey: requestID,
+						Question:   question,
+						Answered:   answered,
+						Answer:     answer,
+					})
+				}
+			},
+		},
 		Grants:      proc.Grants,
 		Breakers:    proc.Breakers,
+		Retry:       harnessSettings.RetryPolicy(),
 		EventLog:    proc.Events,
 		EventLayers: EventLayers(),
 	})
@@ -360,12 +416,14 @@ func (harnessRuntimeExecutor) Run(ctx context.Context, req harnessTurnRequest) (
 		Scope:          scope,
 	})
 	result := harnessTurnResult{
-		Answer:    outcome.Text,
-		Rounds:    outcome.Rounds,
-		TokensIn:  outcome.TokensIn,
-		TokensOut: outcome.TokensOut,
-		CostUSD:   outcome.CostUSD,
-		Stopped:   outcome.Stopped,
+		Answer:         outcome.Text,
+		Rounds:         outcome.Rounds,
+		TokensIn:       outcome.TokensIn,
+		TokensOut:      outcome.TokensOut,
+		CostUSD:        outcome.CostUSD,
+		Stopped:        outcome.Stopped,
+		Review:         outcome.Review,
+		PrefixRebuilds: outcome.PrefixRebuilds,
 	}
 	if runErr != nil {
 		return result, runErr
@@ -511,6 +569,9 @@ func (s *ChatPipelineService) harnessTurn(
 			OnApproval: func(event harnessApprovalEvent) {
 				emit(AsyncChatResult{Final: false, ThinkEvent: approvalThinkEvent(event)})
 			},
+			OnInteraction: func(event harnessInteractionEvent) {
+				emit(AsyncChatResult{Final: false, ThinkEvent: interactionThinkEvent(event)})
+			},
 		})
 		if err != nil {
 			// A failed turn still spent tokens; log them so the cost of a timeout
@@ -524,6 +585,22 @@ func (s *ChatPipelineService) harnessTurn(
 			postHarnessGeneration(ctx, lfClient, lfTraceID, chat, turnStarted, result, "error: "+err.Error())
 			emit(AsyncChatResult{Answer: fmt.Sprintf("**ERROR**: %s", harnessTurnErrorMessage(err)), Final: true})
 			return
+		}
+		if result.Review != "" {
+			// The review is a fact about the turn, not part of the answer: it lands
+			// in the step panel so the answer stays the answer.
+			emit(AsyncChatResult{Final: false, ThinkEvent: &ThinkEvent{
+				Kind:    "review",
+				Status:  "flagged",
+				Summary: result.Review,
+			}})
+		}
+		// The turn's own accounting, once, after the work is done: rounds, tokens,
+		// cost, and how often the prompt prefix was rebuilt. Before this, only the
+		// log carried them, so "why was this turn expensive" could not be answered
+		// from the conversation.
+		if stream {
+			emit(AsyncChatResult{Final: false, ThinkEvent: usageThinkEvent(result)})
 		}
 
 		answer := result.Answer
@@ -547,6 +624,7 @@ func (s *ChatPipelineService) harnessTurn(
 			zap.Bool("stream", stream),
 			zap.Int64("elapsed_ms", time.Since(turnStarted).Milliseconds()),
 			zap.Int("rounds", result.Rounds),
+			zap.Int("prefix_rebuilds", result.PrefixRebuilds),
 			zap.Int("tokens_in", result.TokensIn),
 			zap.Int("tokens_out", result.TokensOut),
 			zap.Float64("cost_usd", result.CostUSD),
@@ -583,10 +661,11 @@ func postHarnessGeneration(ctx context.Context, client *LangfuseClient, traceID 
 			TotalTokens:      result.TokensIn + result.TokensOut,
 		},
 		Metadata: map[string]interface{}{
-			"rounds":   result.Rounds,
-			"stopped":  result.Stopped,
-			"cost_usd": result.CostUSD,
-			"agent_id": chat.AgentID,
+			"rounds":          result.Rounds,
+			"stopped":         result.Stopped,
+			"cost_usd":        result.CostUSD,
+			"prefix_rebuilds": result.PrefixRebuilds,
+			"agent_id":        chat.AgentID,
 		},
 	})
 }
@@ -594,6 +673,34 @@ func postHarnessGeneration(ctx context.Context, client *LangfuseClient, traceID 
 // approvalThinkEvent renders one approval state for the chat SSE stream. The
 // request_id is what the client posts back; a wait and its verdict carry the
 // same id so a UI can replace the card instead of stacking two.
+// usageThinkEvent renders a turn's accounting as a step the client can show
+// beside the work. Summary stays a plain fallback for clients that render only
+// text; the structured fields are what a UI should format, so the line can be
+// localized and can omit numbers that do not apply.
+//
+// Cost and prefix rebuilds are omitted when zero: a turn that cost nothing to
+// account for should not print "$0.0000", and a zero rebuild count is the
+// healthy case, not a number worth a row.
+func usageThinkEvent(result harnessTurnResult) *ThinkEvent {
+	summary := fmt.Sprintf("%d rounds · %d in / %d out tokens", result.Rounds, result.TokensIn, result.TokensOut)
+	if result.CostUSD > 0 {
+		summary += fmt.Sprintf(" · $%.4f", result.CostUSD)
+	}
+	if result.PrefixRebuilds > 0 {
+		summary += fmt.Sprintf(" · prefix rebuilt %d time(s)", result.PrefixRebuilds)
+	}
+	return &ThinkEvent{
+		Kind:           "usage",
+		Stage:          "usage",
+		Summary:        summary,
+		Rounds:         result.Rounds,
+		TokensIn:       result.TokensIn,
+		TokensOut:      result.TokensOut,
+		CostUSD:        result.CostUSD,
+		PrefixRebuilds: result.PrefixRebuilds,
+	}
+}
+
 func approvalThinkEvent(event harnessApprovalEvent) *ThinkEvent {
 	status := "pending"
 	switch {
@@ -610,8 +717,31 @@ func approvalThinkEvent(event harnessApprovalEvent) *ThinkEvent {
 		Kind:      "approval",
 		Tool:      event.Tool,
 		Args:      event.Args,
+		Diff:      event.Diff,
 		Status:    status,
 		Reason:    event.Reason,
+		RequestID: event.RequestKey,
+		Summary:   summary,
+	}
+}
+
+// interactionThinkEvent renders one model→user question for the chat SSE
+// stream. Pending carries the question; answered carries what came back — or
+// nothing, when the wait expired. The request_id is the handle the client posts
+// the answer with, and the same id on both events lets a UI replace the card.
+func interactionThinkEvent(event harnessInteractionEvent) *ThinkEvent {
+	status := "pending"
+	summary := event.Question
+	if event.Answered {
+		status = "answered"
+		summary = fmt.Sprintf("%s → %s", event.Question, event.Answer)
+	} else if event.Context != "" {
+		summary = fmt.Sprintf("%s (%s)", event.Question, event.Context)
+	}
+	return &ThinkEvent{
+		Kind:      "interaction",
+		Status:    status,
+		Reason:    event.Context,
 		RequestID: event.RequestKey,
 		Summary:   summary,
 	}

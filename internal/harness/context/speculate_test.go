@@ -1,6 +1,7 @@
 package agentctx
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -61,7 +62,7 @@ func TestSpeculator_SummaryIsReadyBeforeTheFold(t *testing.T) {
 		t.Fatalf("summarizer calls = %d, want 1 in the background", calls)
 	}
 
-	prompt, used := builder.BuildWithFoldHint("system", nil, history, TierCompactHistory, hint)
+	prompt, used := builder.BuildWithFoldHint(context.Background(), "system", nil, history, TierCompactHistory, hint)
 	if !used {
 		t.Fatal("the fold ignored the prepared summary")
 	}
@@ -80,7 +81,7 @@ func TestSpeculator_IgnoresAHintThatCoversTooLittle(t *testing.T) {
 	builder := speculationBuilder(&calls)
 	history := speculationHistory()
 
-	prompt, used := builder.BuildWithFoldHint("system", nil, history, TierCompactHistory, &FoldHint{Covered: 1, Summary: "briefing"})
+	prompt, used := builder.BuildWithFoldHint(context.Background(), "system", nil, history, TierCompactHistory, &FoldHint{Covered: 1, Summary: "briefing"})
 	if used {
 		t.Fatal("a one-message hint was adopted for a six-message fold")
 	}
