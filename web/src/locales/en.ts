@@ -772,6 +772,8 @@ Example: A 1 KB message with 1024-dim embedding uses ~9 KB. The 5 MB default lim
       parsingMode: 'Parsing mode',
       manualSetup: 'Custom ingestion pipeline',
       builtIn: 'Built-in parsing template',
+      parserSettingsChangeWarning:
+        'Updated parser settings apply only to newly uploaded files. To apply these settings to existing files, update their parser settings and re-parse them.',
       noConfigChunkerHint:
         'The built-in {{name}} parser handles chunking automatically, so no additional configuration is required.',
       titleDescription:
@@ -2928,6 +2930,7 @@ Best for: Documents with flowing, contextually connected content — such as boo
         'Output the variable content of the upstream component or the text entered by yourself.',
       messagePlaceholder: `Please enter your message content, use '/' to quickly insert variables.`,
       messageMsg: 'Message cannot be empty',
+      aggregationIncomplete: 'Complete every aggregation group and variable',
       inputOptionsIncomplete: 'Dropdown options cannot contain empty entries',
       dataOperationsEntriesIncomplete:
         'Complete all data operation entries before running',
@@ -3447,7 +3450,7 @@ This delimiter is used to split the input text into several text pieces echo of 
       userPrompt: 'User prompt',
       tagFile: 'Tag file',
       tagFileTip:
-        'Automatically extracts up to N relevant tags for each chunk based on the selected tag file to improve retrieval accuracy. Tag extraction may invoke a model and consume additional tokens. If extraction fails, the original chunk will be preserved. For details, see https://ragflow.io/docs/dataset_configuration#content-enhancement-configuration.',
+        'Automatically extracts up to N relevant tags per chunk to improve retrieval accuracy. Supports XLSX, XLS, CSV, and TXT files, with two columns for text and tags. Separate multiple tags with commas. No header required. Tag extraction may consume additional tokens. The original chunk is preserved if extraction fails. For details, see https://ragflow.io/docs/dataset_configuration#content-enhancement-configuration.',
       addCategory: 'Add category',
       categoryName: 'Category name',
       nextStep: 'Next step',
@@ -3848,6 +3851,20 @@ Important structured information may include: names, dates, locations, events, k
       variableAssignerParameterMissing: 'Parameter is required',
       webhook: {
         name: 'Webhook',
+        endpoint: 'Endpoint',
+        testEndpoint: 'Test endpoint',
+        personalUrl: 'Personal webhook URL',
+        credentialDescription:
+          'Anyone with this URL can run the agent as you. Keep it secret; creating a new URL invalidates the old one.',
+        createCredential: 'Create or rotate URL',
+        revokeCredential: 'Revoke my URL',
+        credentialCreated:
+          'Webhook URL created. Copy and store it now; it will not be shown again after you leave this page.',
+        credentialRevoked: 'Webhook URL revoked.',
+        credentialRequestFailed: 'Unable to update the webhook URL.',
+        revokeCredentialTitle: 'Revoke your webhook URL?',
+        revokeCredentialDescription:
+          'Requests using this URL will stop working. You can create a new URL at any time.',
         methods: 'Methods',
         contentTypes: 'Content types',
         security: 'Security',

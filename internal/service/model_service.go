@@ -72,6 +72,8 @@ func NewModelProviderService() *ModelProviderService {
 		modelInstanceDAO: dao.NewTenantModelInstanceDAO(),
 		modelDAO:         dao.NewTenantModelDAO(),
 		tenantDAO:        dao.NewTenantDAO(),
+		modelGroupDAO:    dao.NewTenantModelGroupDAO(),
+		modelGroupMapDAO: dao.NewTenantModelGroupMapDAO(),
 	}
 }
 
@@ -80,6 +82,8 @@ type ModelProviderService struct {
 	modelInstanceDAO *dao.TenantModelInstanceDAO
 	modelDAO         *dao.TenantModelDAO
 	tenantDAO        *dao.TenantDAO
+	modelGroupDAO    *dao.TenantModelGroupDAO
+	modelGroupMapDAO *dao.TenantModelGroupMapDAO
 }
 
 // CheckConnectionModelInfo CheckConnectionRequest carries the credentials and optional instance selector
@@ -1648,16 +1652,18 @@ func (m *ModelProviderService) ListTenantAddedModels(ctx context.Context, userID
 			rank = 500
 		}
 		added = append(added, map[string]interface{}{
-			"model_id":      modelRecord.ID,
-			"tenant_id":     provInfo.TenantID,
-			"tenant_name":   tenantName,
-			"model_type":    entity.ModelType(modelRecord.ModelType).HumanReadable(),
-			"name":          modelRecord.ModelName,
-			"provider_id":   modelRecord.ProviderID,
-			"provider_name": provInfo.ProviderName,
-			"instance_id":   modelRecord.InstanceID,
-			"instance_name": instInfo.InstanceName,
-			"rank":          rank,
+			"model_id":        modelRecord.ID,
+			"status":          modelRecord.Status,
+			"instance_status": instInfo.Status,
+			"tenant_id":       provInfo.TenantID,
+			"tenant_name":     tenantName,
+			"model_type":      entity.ModelType(modelRecord.ModelType).HumanReadable(),
+			"name":            modelRecord.ModelName,
+			"provider_id":     modelRecord.ProviderID,
+			"provider_name":   provInfo.ProviderName,
+			"instance_id":     modelRecord.InstanceID,
+			"instance_name":   instInfo.InstanceName,
+			"rank":            rank,
 		})
 	}
 
@@ -2363,6 +2369,7 @@ func (m *ModelProviderService) ListInstanceModels(ctx context.Context, providerN
 		}
 
 		modelList = append(modelList, map[string]interface{}{
+			"id":         model.ID,
 			"name":       model.ModelName,
 			"model_type": entity.ModelType(model.ModelType).HumanReadable(),
 			"max_tokens": maxTokens,

@@ -177,6 +177,7 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 		&entity.InvitationCode{},
 		&entity.Document{},
 		&entity.UserCanvas{},
+		&entity.AgentWebhookCredential{},
 		&entity.CanvasTemplate{},
 		&entity.UserCanvasVersion{},
 		&entity.LLMFactories{},
@@ -250,9 +251,6 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 				return fmt.Errorf("failed to migrate model %T: %w", m, err)
 			}
 		}
-		if err = migrateKnowledgeCompileQueues(ctx, DB); err != nil {
-			return fmt.Errorf("failed to split knowledge compilation queues: %w", err)
-		}
 
 		// Split the conversation message and reference payloads out of their
 		// parent tables. It has to run after AutoMigrate, which unlike
@@ -277,6 +275,9 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 		}
 		if err = migrateTenantModelProviderUserUniqueIndex(ctx, DB); err != nil {
 			return fmt.Errorf("failed to migrate tenant model provider unique index: %w", err)
+		}
+		if err = migrateKnowledgeCompileQueues(ctx, DB); err != nil {
+			return fmt.Errorf("failed to split knowledge compilation queues: %w", err)
 		}
 		common.Info("Database schema migrated successfully")
 	} else {

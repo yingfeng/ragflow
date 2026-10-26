@@ -103,14 +103,14 @@ export default function ChatList() {
 
   return (
     <>
-      {loading && !data.chats?.length ? (
+      {loading && !data?.chats?.length ? (
         <article
           className="size-full flex items-center justify-center"
           data-testid="chats-list"
         >
           <Spin size="large" />
         </article>
-      ) : data.chats?.length || searchString ? (
+      ) : data?.chats?.length || searchString ? (
         <article
           className="size-full min-w-0 flex flex-col"
           data-testid="chats-list"
@@ -132,10 +132,10 @@ export default function ChatList() {
             </ListFilterBar>
           </header>
 
-          {data.chats?.length ? (
+          {data?.chats?.length ? (
             <>
               <CardContainer className="flex-1 overflow-auto px-5">
-                {data.chats.map((x) => (
+                {data?.chats.map((x) => (
                   <ChatCard
                     key={x.id}
                     data={x}

@@ -708,6 +708,8 @@ export default {
       parsingMode: '解析方式',
       manualSetup: '自定义Ingestion pipeline',
       builtIn: '内置解析模板',
+      parserSettingsChangeWarning:
+        '更新后的解析设置仅对新上传的文件生效。如需对现有文件生效，请修改这些文件的解析设置并重新解析。',
       noConfigChunkerHint:
         '内置的 {{name}} 解析器会自动处理分块，因此无需额外配置。',
       titleDescription: '在这里更新知识库配置，特别是大语言模型和提示词。',
@@ -3036,7 +3038,7 @@ NER：使用 spaCy NER 和基于规则的关键词提取来抽取 Entities 和 R
       userPrompt: '用户提示词',
       tagFile: '标签文件',
       tagFileTip:
-        '根据所选标签文件，为每个文本块自动提取最多 N 个相关标签，以提高检索准确性。标签提取可能调用模型并产生额外的 Token 消耗。如果提取失败，原始文本块仍会保留。详情请见 https://ragflow.io/docs/dataset_configuration#content-enhancement-configuration。',
+        '根据所选标签文件，为每个文本块自动提取最多 N 个相关标签，以提高检索准确性。标签文件支持 XLSX、XLS、CSV、TXT 格式，每行包含文本和标签两列，多个标签用英文逗号分隔，无需表头。标签提取可能产生额外的 Token 消耗。提取失败时，原始文本块仍会保留。详情请见 https://ragflow.io/docs/dataset_configuration#content-enhancement-configuration。',
       prompt: '提示词',
       promptMessage: '提示词是必填项',
       promptTip:
@@ -3337,6 +3339,20 @@ Tokenizer 会根据所选方式将内容存储为对应的数据结构。`,
       variableAssignerParameterMissing: '请填写参数',
       webhook: {
         name: '网络钩子',
+        endpoint: '接口地址',
+        testEndpoint: '测试接口地址',
+        personalUrl: '个人 Webhook URL',
+        credentialDescription:
+          '持有此链接即可按你的权限运行 Agent，请妥善保管；重新生成会使旧链接失效。',
+        createCredential: '生成或轮换 URL',
+        revokeCredential: '撤销我的 URL',
+        credentialCreated:
+          'Webhook URL 已生成，请立即复制保存；离开页面后将无法再次查看。',
+        credentialRevoked: 'Webhook URL 已撤销。',
+        credentialRequestFailed: '更新 Webhook URL 失败。',
+        revokeCredentialTitle: '撤销 Webhook URL？',
+        revokeCredentialDescription:
+          '使用此 URL 的请求将立即失效。你可以随时重新生成 URL。',
         methods: '方法',
         contentTypes: '内容类型',
         security: '安全配置',
