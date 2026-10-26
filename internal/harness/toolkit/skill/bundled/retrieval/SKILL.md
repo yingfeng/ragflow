@@ -29,7 +29,7 @@ These are moves, not a script. **Independent lookups go out in ONE round**: two 
 - Deep-read corpus evidence that arrives without claims: a snippet locates, only the full text proves. When a claim is missing the exact figure the answer needs, read the document and take the figure from it.
 - Run at least one web query before answering when `web_search` is available, even if corpus retrieval succeeded; the two sources supplement each other.
 - Consume what you search: a query whose hits never reach your reading did not happen. When a query returns nothing, rephrase — shorter, rarer, more literal — instead of repeating it. Retrieve fresh for every new question: the corpus may have changed.
-- Stop when the evidence answers the question; reads that no longer change the answer are the signal. For a counting or enumerating question, coverage decides, not the number of lookups: either the evidence covers all of it or the reply says which part it could not cover.
+- Stop when the evidence answers the question; reads that no longer change the answer are the signal. A counting or enumerating question is not exempt from that: keep going only while a read is still adding an item, and say which part the evidence could not cover instead of scanning for it.
 
 ## Numbers and dates
 

@@ -221,6 +221,7 @@ func Build(cfg Config) (*Runner, error) {
 				state.Steers++
 			}
 		}
+
 		// Budget pressure is reported as fact, once. What the model does with the
 		// fact is the model's decision: the limits themselves are already
 		// enforced by policy, and restating them as instructions only teaches a
@@ -342,7 +343,7 @@ func Build(cfg Config) (*Runner, error) {
 			// tool call after the turn's last user message, the model is told
 			// which tool to use instead of asked. Without it, the first round
 			// can go to pure planning and produce no evidence at all.
-			ToolChoice: requiredToolChoice(tools, deps.Registry.RequiredTools(), state.History),
+			ToolChoice: requiredToolChoice(tools, deps.Registry.RequiredTools(), state.History, state.TurnStart),
 		}
 		// A round's text is held until the round is over, because only then does
 		// the loop know what it was. A round that ends the turn produced the
@@ -1323,12 +1324,16 @@ func seedHistory(input Input) []model.Message {
 }
 
 func newState(input Input, policyConfig definition.PolicyConfig, maxRounds int) *State {
+	history := seedHistory(input)
 	state := &State{
-		RunID:       input.RunID,
-		AgentName:   input.AgentName,
-		StartedMS:   time.Now().UnixMilli(),
-		History:     seedHistory(input),
-		Question:    turnQuestion(input),
+		RunID:     input.RunID,
+		AgentName: input.AgentName,
+		StartedMS: time.Now().UnixMilli(),
+		History:   history,
+		Question:  turnQuestion(input),
+		// The required-tool gate is scoped to this turn: everything the run
+		// appends after this index belongs to the work it is asked to do.
+		TurnStart:   len(history),
 		SeenCalls:   make(map[string]struct{}),
 		SeenOutputs: make(map[string]struct{}),
 		CallRepeats: make(map[string]int),
@@ -1534,7 +1539,7 @@ func turnQuestion(input Input) string {
 // after it, force the first required tool that is visible in this request. One
 // real call lifts the gate — after that the model chooses freely again, and a
 // turn that already used one is never re-forced.
-func requiredToolChoice(tools []model.ToolSpec, required []string, history []model.Message) string {
+func requiredToolChoice(tools []model.ToolSpec, required []string, history []model.Message, roundStart int) string {
 	if len(required) == 0 || len(tools) == 0 {
 		return ""
 	}
@@ -1546,11 +1551,15 @@ func requiredToolChoice(tools []model.ToolSpec, required []string, history []mod
 	for _, name := range required {
 		needed[name] = true
 	}
-	for index := len(history) - 1; index >= 0; index-- {
+	if roundStart < 0 || roundStart > len(history) {
+		roundStart = 0
+	}
+	// The edge of the round is an index, not "the nearest user message": the
+	// harness appends user-role notes of its own (plan, context note, search
+	// log), and stopping at one of those hid the retrieval call the round had
+	// already made, so the gate forced another one.
+	for index := len(history) - 1; index >= roundStart; index-- {
 		message := history[index]
-		if message.Role == model.RoleUser {
-			break // the turn's question; nothing before it counts
-		}
 		if message.Role != model.RoleAssistant {
 			continue
 		}

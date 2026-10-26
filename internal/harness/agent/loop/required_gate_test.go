@@ -75,8 +75,8 @@ func TestRequiredToolGateSilentWithoutDeclaration(t *testing.T) {
 }
 
 // TestRequiredToolChoiceUnit covers the scan itself: satisfaction is scoped to
-// the turn's last user message, and a required name the request does not carry
-// is never forced.
+// the round's start index, and a required name the request does not carry is
+// never forced.
 func TestRequiredToolChoiceUnit(t *testing.T) {
 	tools := []model.ToolSpec{{Name: "grep_chunks"}, {Name: "search_bm25_chunks"}}
 	required := []string{"grep_chunks", "search_bm25_chunks"}
@@ -85,20 +85,29 @@ func TestRequiredToolChoiceUnit(t *testing.T) {
 		{Role: model.RoleAssistant, Content: "old", ToolCalls: []model.ToolCall{{ID: "a", Name: "grep_chunks"}}},
 		{Role: model.RoleTool, Content: "old result"},
 	}
+	thisTurn := append(append([]model.Message{}, base...), model.Message{Role: model.RoleUser, Content: "this turn"})
+	thisTurnWithCall := append(append([]model.Message{}, thisTurn...),
+		model.Message{Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "b", Name: "search_bm25_chunks"}}})
+	// The harness appends user-role notes of its own after the model has already
+	// searched. The nearest user message is then the note, not the question, and
+	// reading it as the turn's edge forced another retrieval call every time a
+	// note was injected.
+	withInjectedNote := append(append([]model.Message{}, thisTurnWithCall...),
+		model.Message{Role: model.RoleUser, Content: "## Plan\n- step one"})
+
 	cases := []struct {
 		name    string
 		history []model.Message
+		start   int
 		want    string
 	}{
-		{"empty history", nil, "grep_chunks"},
-		{"prior turn's call does not satisfy this turn", append(append([]model.Message{}, base...),
-			model.Message{Role: model.RoleUser, Content: "this turn"}), "grep_chunks"},
-		{"this turn's call satisfies", append(append(append([]model.Message{}, base...),
-			model.Message{Role: model.RoleUser, Content: "this turn"}),
-			model.Message{Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "b", Name: "search_bm25_chunks"}}}), ""},
+		{"empty history", nil, 0, "grep_chunks"},
+		{"prior turn's call does not satisfy this turn", thisTurn, 3, "grep_chunks"},
+		{"this turn's call satisfies", thisTurnWithCall, 3, ""},
+		{"an injected note does not restart the round", withInjectedNote, 3, ""},
 		{"required tool missing from request", []model.Message{
 			{Role: model.RoleUser, Content: "q"},
-		}, ""},
+		}, 0, ""},
 	}
 	for _, tc := range cases {
 		var visible []model.ToolSpec
@@ -107,7 +116,7 @@ func TestRequiredToolChoiceUnit(t *testing.T) {
 		} else {
 			visible = tools
 		}
-		if got := requiredToolChoice(visible, required, tc.history); got != tc.want {
+		if got := requiredToolChoice(visible, required, tc.history, tc.start); got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}

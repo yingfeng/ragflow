@@ -180,6 +180,14 @@ type State struct {
 	// Steers counts messages injected into the run while it was executing.
 	Steers int `json:"steers"`
 
+	// TurnStart is the history index this turn's question sits at. The
+	// required-tool gate reads it as the edge of the turn, because prepare
+	// appends user messages of its own (the plan, the context note, a search
+	// log) and scanning back to the nearest user message would find one of
+	// those instead of the question — making every injected note look like a
+	// fresh turn that still owes a retrieval call.
+	TurnStart int `json:"turn_start"`
+
 	// CompactionBoost is the compaction tier for the retry of a prompt the
 	// provider just refused; prepare uses it to force a harder one. It is reset
 	// as soon as a call is accepted (see acceptPrompt): a refusal is a fact
