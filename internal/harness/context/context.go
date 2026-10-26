@@ -9,6 +9,7 @@ package agentctx
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"unicode/utf8"
 
@@ -83,9 +84,20 @@ type CompactInfo struct {
 }
 
 // DefaultConfig returns production defaults.
+//
+// MaxInputTokens is deliberately zero: the ceiling is the model's own window
+// times InputBudgetRatio, and an absolute cap is only meaningful when a caller
+// knows the provider's limit. The 96k cap that used to live here was measured
+// against no particular model, and it inverted the whole budget: pressure
+// started at 57.6k tokens, so the loop cleared the results of the second search
+// round it had just paid for, and the model — unable to see the passages any
+// more — re-issued the same grep under a new intent until the turn was
+// cancelled. The agentic pipeline these tools come from keeps every result
+// until the provider itself refuses the prompt; the compaction tiers exist for
+// the point where that is about to happen, not for a number picked in advance.
 func DefaultConfig() Config {
 	return Config{
-		MaxInputTokens:         96000,
+		MaxInputTokens:         0,
 		ContextWindow:          DefaultContextWindow,
 		InputBudgetRatio:       DefaultInputBudgetRatio,
 		OutputReserveTokens:    DefaultOutputReserveTokens,
@@ -104,14 +116,46 @@ func DefaultConfig() Config {
 type Builder struct {
 	cfg    Config
 	budget Budget
+
+	// scale converts a locally counted token into the provider's token, learned
+	// from the prompt size the provider reported for the last call (see
+	// ObservePromptTokens). Zero means "not calibrated yet".
+	//
+	// The local counter is a general-purpose tokenizer and the provider is not:
+	// on the counted Chinese corpus enumeration the two differed by ~4x (a 30k
+	// prompt measured ~120k locally), so every budget here fired at a quarter of
+	// the real fill. The loop then folded and pruned turns whose results the
+	// provider still had room for, the model could no longer see what it had
+	// already retrieved, and it re-ran the same searches until the turn was
+	// cancelled. The provider reports the exact number on every response, so the
+	// estimate only has to track growth; the magnitude comes from that report.
+	scale float64
+
+	// lastRaw is the locally counted size of the last prompt built, in the
+	// provider-independent units ObservePromptTokens divides by.
+	lastRaw int
+
+	// compacted records that the last build dropped history: folded turns,
+	// pruned turns, or cleared tool results. Sections that exist to repair what
+	// compaction destroys have nothing to repair when it did not run.
+	//
+	// Cleared tool results are tracked separately from the message count: a
+	// clear replaces a result's content in place, so the transcript has the same
+	// length while 23 of 24 passages are gone. Deriving the flag from the length
+	// alone reported "nothing was compacted" for exactly the build that dropped
+	// the most.
+	compacted bool
+	// cleared records that the last build replaced tool output with a
+	// placeholder. It is reset at the start of every build.
+	cleared bool
 }
 
 // New builds a builder, filling zero fields with defaults.
 func New(cfg Config) *Builder {
 	defaults := DefaultConfig()
-	if cfg.MaxInputTokens <= 0 {
-		cfg.MaxInputTokens = defaults.MaxInputTokens
-	}
+	// MaxInputTokens is not filled from the defaults: zero means "no absolute
+	// cap", which is the production setting. A caller that knows the provider's
+	// limit sets it explicitly.
 	if cfg.KeepToolResultBytes <= 0 {
 		cfg.KeepToolResultBytes = defaults.KeepToolResultBytes
 	}
@@ -133,7 +177,7 @@ func New(cfg Config) *Builder {
 	if cfg.ContextWindow <= 0 {
 		cfg.ContextWindow = defaults.ContextWindow
 	}
-	if cfg.InputBudgetRatio <= 0 || cfg.InputBudgetRatio >= 1 {
+	if cfg.InputBudgetRatio <= 0 || cfg.InputBudgetRatio > 1 {
 		cfg.InputBudgetRatio = defaults.InputBudgetRatio
 	}
 	if cfg.OutputReserveTokens <= 0 {
@@ -187,6 +231,7 @@ func (b *Builder) BuildWithTier(ctx context.Context, system string, lessons []st
 // hint is the ordinary path and summarizes synchronously if a fold is due. The
 // second result reports that the hint replaced a model call.
 func (b *Builder) BuildWithFoldHint(ctx context.Context, system string, lessons []string, history []model.Message, minTier Tier, hint *FoldHint) ([]model.Message, bool) {
+	b.cleared = false
 	history = ensureToolOutputs(history)
 	systemContent := b.renderSystemWithinBudget(system, lessons)
 	limit := b.limit()
@@ -197,11 +242,33 @@ func (b *Builder) BuildWithFoldHint(ctx context.Context, system string, lessons 
 
 	compacted := make([]model.Message, len(history))
 	copy(compacted, history)
+	// rejectedEstimate is the size of the prompt as it was rejected, before any
+	// compression touched it.
+	rejectedEstimate := b.estimate(compacted)
 
-	tier := b.budget.TierFor(b.tokens(systemContent) + b.estimate(compacted))
-	if tier < minTier {
-		tier = minTier
-	}
+	// The tier comes from the provider, not from an estimate of it.
+	//
+	// minTier is argued by a prompt-too-long rejection: the provider just proved
+	// this prompt does not fit, so the retry compacts harder. Nothing else
+	// escalates it. Deriving a tier from a token estimate decided to fold at a
+	// guess of the fill, and a fold is destructive — it replaces the turns with a
+	// summary, and a run that had eight rounds of retrieval behind it read the
+	// summary as a fresh start. Measured: a 129,725-token prompt folded to 23,526
+	// and the next round began "Starting with locating the key passages" again.
+	// The pipeline these tools come from carries no compaction at all: it keeps
+	// filling until the provider refuses, which is the signal this uses.
+	tier := minTier
+	// The estimate gets no say in this either, and that includes the ceiling.
+	//
+	// Keeping one preemptive escalation ("estimate above the window minus the
+	// output reserve") looked harmless because it uses the real bound instead of
+	// a fraction of it, but the estimate carries its own error: a prompt the
+	// provider accepted at 176,810 tokens read as ~205k locally, crossed the
+	// 183,616 ceiling, and was folded. Ten rounds of retrieval became a summary
+	// and the run started searching again. The estimate is a tokenizer
+	// difference away from the truth, so it may only report; the provider
+	// decides. The price is one rejected call, which resumes at a higher tier.
+	//
 	// A single oversized result is bounded at any pressure: that is rendering, not
 	// memory management. Losing the older results outright is memory management,
 	// and only pressure justifies it — clearing them at zero pressure made a
@@ -211,19 +278,52 @@ func (b *Builder) BuildWithFoldHint(ctx context.Context, system string, lessons 
 		compacted = b.notifyClear(ctx, tier, compacted)
 	}
 
+	// A refusal is also the one case where the estimate loses its veto in the
+	// other direction: the provider rejected a prompt this builder believes
+	// fits, so the estimate is optimistic and cannot argue that nothing needs
+	// to be dropped. Compaction then targets a fraction of the REJECTED prompt,
+	// measured before anything was freed — anchoring to what the first pass
+	// already released would slice the smaller prompt again and throw away the
+	// placeholders that tell the model what it lost.
+	compactionLimit := headroom
+	if tier >= TierCompactHistory {
+		if cap := int(float64(rejectedEstimate) * b.cfg.CompactionRatio); cap < compactionLimit {
+			compactionLimit = cap
+		}
+	}
+
 	usedHint := false
 	if tier >= TierCompactHistory {
-		compacted, usedHint = b.notifyFold(ctx, tier, compacted, headroom, hint)
+		compacted, usedHint = b.notifyFold(ctx, tier, compacted, compactionLimit, hint)
 	}
 	if tier >= TierAggressivePrune {
 		compacted = b.notifyPrune(ctx, tier, compacted)
 	}
-	compacted = b.fitToBudget(compacted, headroom)
+	// The final fit is a last resort, and it only runs on a prompt the provider
+	// already refused: it slices messages off the front, which deletes whole
+	// rounds AND the question that started them. Applying it whenever an
+	// estimate exceeded the headroom deleted the transcript of a prompt the
+	// provider still had room for.
+	if tier >= TierCompactHistory {
+		compacted = b.fitToBudget(compacted, compactionLimit)
+	}
 
 	out := make([]model.Message, 0, len(compacted)+1)
 	out = append(out, model.Message{Role: model.RoleSystem, Content: systemContent})
 	out = append(out, compacted...)
+	// Remember this prompt's local size: it is the denominator the provider's
+	// reported count is compared against, and it must not itself be scaled.
+	b.lastRaw = b.estimateRaw(out)
+	b.compacted = b.cleared || len(compacted) < len(history)
 	return out, usedHint
+}
+
+// Compacted reports whether the last build dropped any of the history. Callers
+// use it to decide whether a prompt section that repairs lost history is worth
+// its cost: injected into a run that lost nothing, such a section is a standing
+// reminder that the work is unfinished.
+func (b *Builder) Compacted() bool {
+	return b != nil && b.compacted
 }
 
 // notifyClear wraps clearOldToolResults with observation. How many results were
@@ -245,6 +345,7 @@ func (b *Builder) notifyClear(ctx context.Context, tier Tier, messages []model.M
 		}
 	}
 	if dropped := before - after; dropped > 0 {
+		b.cleared = true
 		b.notifyCompact(ctx, CompactInfo{Trigger: tier.String(), Strategy: "clear", Dropped: dropped, Reason: "tool result byte budget under pressure"})
 	}
 	return out
@@ -699,8 +800,26 @@ func tailRunes(value string, limit int) string {
 	return value[start:]
 }
 
-// tokens counts one string, preferring the injected tokenizer.
-func (b *Builder) tokens(text string) (count int) {
+// tokens counts one string in the provider's units. Until the run has been
+// calibrated against a reported prompt size, the local counter is all there is.
+func (b *Builder) tokens(text string) int {
+	return b.scaled(b.rawTokens(text))
+}
+
+// scaled converts a local count into the provider's units.
+func (b *Builder) scaled(count int) int {
+	if b.scale <= 0 || count <= 0 {
+		return count
+	}
+	scaled := int(math.Round(float64(count) * b.scale))
+	if scaled < 1 {
+		return 1
+	}
+	return scaled
+}
+
+// rawTokens counts one string with the local tokenizer, before calibration.
+func (b *Builder) rawTokens(text string) (count int) {
 	if b.cfg.CountTokens != nil {
 		defer func() {
 			if recover() != nil || count <= 0 {
@@ -714,6 +833,39 @@ func (b *Builder) tokens(text string) (count int) {
 	return len(text)/4 + 1
 }
 
+// ObservePromptTokens learns how the provider counts the prompt this builder
+// just produced. The loop calls it with the usage of every model response.
+//
+// It is the only measurement in the budget that comes from the provider rather
+// than from a guess, and the guess is off by a wide margin on non-English
+// corpora: a 30k-token Chinese prompt measured ~120k with the local tokenizer.
+// Compacting on that number discarded tool results the provider still had room
+// for, and the model re-ran the searches whose results had been dropped.
+func (b *Builder) ObservePromptTokens(promptTokens int) {
+	if promptTokens <= 0 || b.lastRaw <= 0 {
+		return
+	}
+	ratio := float64(promptTokens) / float64(b.lastRaw)
+	// A report outside this band is not a tokenizer difference: it means the
+	// prompt sent was not the one this builder produced (a provider that only
+	// reports the uncached prefix, or a retry after a rewrite). Ignoring it
+	// keeps one bad report from re-scaling the whole run.
+	if ratio <= 0.02 || ratio > 4 {
+		return
+	}
+	b.scale = ratio
+}
+
+// EstimateTokens reports a message list's size in the provider's units, using
+// the calibration learned from ObservePromptTokens. Callers outside the builder
+// that report context pressure to the model must use this rather than a byte
+// heuristic: bytes/4 over-counts Chinese by ~1.6x, and telling a run its context
+// is 88% full when it is 55% full is what made it spend five rounds on "one
+// final verification".
+func (b *Builder) EstimateTokens(messages []model.Message) int {
+	return b.estimate(messages)
+}
+
 // estimate is the token estimate for a message list, about four bytes per token
 // plus per-message framing when no real tokenizer is injected.
 func (b *Builder) estimate(messages []model.Message) int {
@@ -723,6 +875,20 @@ func (b *Builder) estimate(messages []model.Message) int {
 		total += b.tokens(message.Content)
 		for _, call := range message.ToolCalls {
 			total += b.tokens(call.Name) + b.tokens(call.Arguments) + 4
+		}
+	}
+	return total
+}
+
+// estimateRaw is estimate in the local tokenizer's units, used as the
+// denominator when calibrating against a reported prompt size.
+func (b *Builder) estimateRaw(messages []model.Message) int {
+	total := 0
+	for _, message := range messages {
+		total += 4
+		total += b.rawTokens(message.Content)
+		for _, call := range message.ToolCalls {
+			total += b.rawTokens(call.Name) + b.rawTokens(call.Arguments) + 4
 		}
 	}
 	return total

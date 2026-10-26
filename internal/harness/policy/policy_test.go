@@ -23,16 +23,19 @@ func TestProgress_RepeatsPauseOnlyWithoutOpenPlan(t *testing.T) {
 	}
 }
 
-func TestCompletion_OpenPlanStepDefersFinish(t *testing.T) {
-	// One prose-only round is grace for the model to reopen the steps.
-	if got := decide(Snapshot{HasFinalText: true, OpenPlanSteps: 1, TerminalRounds: 1}); got.Action != ActionContinue {
-		t.Fatalf("verdict = %+v, want continue while the plan has an open step", got)
+// TestCompletion_OpenPlanDoesNotHoldTheRun: a plan is a map, not a gate. An
+// open step used to defer the finish, which a model that could not tell what it
+// had already covered would keep open forever — the run then never answered.
+// The answer call is told about the open step instead (stoppingNote).
+func TestCompletion_OpenPlanDoesNotHoldTheRun(t *testing.T) {
+	got := decide(Snapshot{HasFinalText: true, OpenPlanSteps: 1, TerminalRounds: 1})
+	if got.Action != ActionFinish {
+		t.Fatalf("verdict = %+v, want finish even with an open step", got)
 	}
-	// A second prose-only round is not convergence: the answer is due now.
-	if got := decide(Snapshot{HasFinalText: true, OpenPlanSteps: 1, TerminalRounds: 2}); got.Action != ActionFinish {
-		t.Fatalf("verdict = %+v, want finish after the grace round", got)
+	if !strings.Contains(got.Reason, "open") {
+		t.Fatalf("reason = %q, want the open step named for the answer call", got.Reason)
 	}
-	// A closed plan finishes immediately.
+	// A closed plan finishes the same way.
 	if got := decide(Snapshot{HasFinalText: true, TerminalRounds: 1}); got.Action != ActionFinish {
 		t.Fatalf("verdict = %+v, want finish for a closed plan", got)
 	}
@@ -148,39 +151,22 @@ func TestProgress_KeepsAPlanIdleOnlyWhileThePoolGrows(t *testing.T) {
 	}
 }
 
-// TestProgress_KeepsAnEnumerationAlive: the nudges are spent and the search is
-// flat, but the run's own plan still lists open steps. That is an enumeration
-// whose last item has not been found, not a run that is finished — handing it
-// to the answer call is how a long list comes back short by one name per stall.
-func TestProgress_KeepsAnEnumerationAlive(t *testing.T) {
+// TestProgress_OpenPlanDoesNotExtendTheHandOff: with the nudges spent and a flat
+// search, an open plan must not buy more rounds. It used to, on the theory that
+// the last item is what closes the step; in practice the model kept the step
+// open forever because it could not see what it had already covered, and the run
+// never reached the answer call. The answer call is told about the open step
+// instead (stoppingNote), so the hand-off no longer truncates the list silently.
+func TestProgress_OpenPlanDoesNotExtendTheHandOff(t *testing.T) {
 	verdicts := Progress{}.Check(Snapshot{
 		Round:          20,
 		StagnantRounds: 3,
 		OpenPlanSteps:  1,
-		// A plan that is merely not moving fast is not the idle case here: the
-		// flat pool is what triggered the stall.
 		PlanIdleRounds: 1,
 		Nudges:         2, // the base allowance is already spent
 	})
-	if len(verdicts) != 1 || verdicts[0].Action != ActionNudge {
-		t.Fatalf("verdicts = %+v, want a nudge, not a hand-off to the answer call", verdicts)
-	}
-	if !strings.Contains(verdicts[0].Advice, "open step") {
-		t.Fatalf("advice = %q, want the open-step wording", verdicts[0].Advice)
-	}
-}
-
-// TestProgress_EndsAnEnumerationThatNeverClosesItsPlan: the extension is bounded,
-// so a plan the model never closes still ends on the policy rather than on hope.
-func TestProgress_EndsAnEnumerationThatNeverClosesItsPlan(t *testing.T) {
-	verdicts := Progress{}.Check(Snapshot{
-		Round:          40,
-		StagnantRounds: 3,
-		OpenPlanSteps:  1,
-		Nudges:         2 + planKeepingNudges,
-	})
 	if len(verdicts) != 1 || verdicts[0].Action != ActionBlock {
-		t.Fatalf("verdicts = %+v, want the bounded hand-off", verdicts)
+		t.Fatalf("verdicts = %+v, want the hand-off even with an open plan", verdicts)
 	}
 }
 

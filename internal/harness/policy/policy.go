@@ -280,18 +280,16 @@ type Progress struct {
 	PlanIdleRoundsWhileProgressing int
 }
 
-// planKeepingNudges extends the nudge allowance while the model's own plan still
-// has open steps.
-//
-// An enumeration's last item is what closes its step, so an open step is the
-// run's own statement that the list is incomplete. Each extra correction is one
-// stall cycle (the counter resets after a nudge, so this is not four extra
-// rounds but four extra stalls); the bound exists so a plan the model never
-// closes still ends on a budget rather than on a promise.
-const planKeepingNudges = 4
-
 // Name implements Policy.
 func (Progress) Name() string { return "progress" }
+
+// DefaultStagnantRounds is the flat-round count Progress tolerates before it
+// nudges.
+//
+// Exported because the loop needs the same threshold in the one case where it
+// can prove a round was flat without waiting for the count: the model re-issued
+// a query it had already run, under a new wording of its intent.
+const DefaultStagnantRounds = 3
 
 // Check implements Policy.
 func (p Progress) Check(snapshot Snapshot) []Verdict {
@@ -300,7 +298,7 @@ func (p Progress) Check(snapshot Snapshot) []Verdict {
 		// Three flat rounds, not two: one flat round is normal while a tool's
 		// output is being digested, and the budget policies already bound the
 		// total spend of a run that never converges.
-		limit = 3
+		limit = DefaultStagnantRounds
 	}
 	repeats := p.RepeatedCalls
 	if repeats <= 0 {
@@ -372,32 +370,6 @@ func (p Progress) Check(snapshot Snapshot) []Verdict {
 						"An open step is not a reason to stop: keep it open while it is still adding evidence.",
 					stalledRounds, observation, snapshot.Citations),
 			})
-		} else if snapshot.OpenPlanSteps > 0 && !planIdleStall && snapshot.Nudges < nudges+planKeepingNudges {
-			// The nudges are spent, but the run's own plan still lists open
-			// steps — and for an enumeration the last item is exactly the one
-			// that closes them. Handing such a run to the answer call is how a
-			// long enumeration comes back one name short per stalled round: the
-			// plan said "enumerate all" the whole time.
-			//
-			// So keep it running and restate the correction instead. It costs
-			// one injected message per stall cycle (the counter resets, so this
-			// fires about every StagnantRounds rounds), and the round and token
-			// budgets remain the hard stop — planKeepingNudges only bounds how
-			// long a plan can hold a run open without evidence.
-			//
-			// A plan that stopped moving is different: there the run is not
-			// enumerating, it is holding itself open (see planIdleStall), and
-			// that still goes to the answer call.
-			out = append(out, Verdict{
-				Action:   ActionNudge,
-				Severity: SeverityInfo,
-				Reason:   reason,
-				Advice: fmt.Sprintf(
-					"Your plan still lists %d open step(s) and the last %d rounds %s. "+
-						"If every item is now found, close the steps and answer. If not, change the axis of the search — "+
-						"another chapter, another set of names, a wider read — not the same query again.",
-					snapshot.OpenPlanSteps, stalledRounds, observation),
-			})
 		} else {
 			// The fact has been restated as often as it is useful, and the plan
 			// no longer claims anything is left. Hand the run to the answer
@@ -457,26 +429,21 @@ func (c Completion) Check(snapshot Snapshot) []Verdict {
 			})
 			return out
 		}
-		// A plan is the model's own list of what the answer still needs. Writing
-		// the answer while steps of that list are open is the "12 of 16"
-		// failure: the prose reads as a conclusion while the work is unfinished.
-		//
-		// One round of grace: the model may have written the answer before reading
-		// the plan section, so it gets a single round to reopen the work. A
-		// second prose-only round is not convergence — it finishes here and the
-		// answer call is told what is still open.
-		if snapshot.OpenPlanSteps > 0 && snapshot.TerminalRounds <= 1 {
-			out = append(out, Verdict{
-				Action:   ActionContinue,
-				Severity: SeverityInfo,
-				Reason:   fmt.Sprintf("%d plan step(s) still open", snapshot.OpenPlanSteps),
-			})
-			return out
+		// A plan is the model's own list of what the answer still needs, and it
+		// used to hold the run here. That made the plan a gate rather than a map:
+		// a model that could not tell what it had already covered kept its steps
+		// open forever, so this branch never ran and the run never answered. The
+		// plan still reaches the answer call — the plan section and stoppingNote
+		// carry it — so the reply names what is left open instead of the run
+		// being held hostage by it.
+		reason := "final answer produced"
+		if snapshot.OpenPlanSteps > 0 {
+			reason = fmt.Sprintf("final answer produced with %d plan step(s) open", snapshot.OpenPlanSteps)
 		}
 		out = append(out, Verdict{
 			Action:   ActionFinish,
 			Severity: SeverityInfo,
-			Reason:   "final answer produced",
+			Reason:   reason,
 		})
 		return out
 	}

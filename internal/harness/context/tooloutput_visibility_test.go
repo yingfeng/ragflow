@@ -49,16 +49,26 @@ func TestBuild_KeepsToolOutputWhileTheWindowHasRoom(t *testing.T) {
 	}
 }
 
-// Under pressure the oldest results go, and the placeholder names the tool so
-// the model can fetch the result again instead of assuming it was empty.
-func TestBuild_ClearsOldToolOutputOnlyUnderPressure(t *testing.T) {
+// Once the transcript has to shrink (a prompt-too-long rejection escalated the
+// tier, which is now the only thing that does), the oldest results go, and the
+// placeholder names the tool so the model can fetch the result again instead of
+// assuming it was empty.
+func TestBuild_ClearsOldToolOutputWhenTheTranscriptMustShrink(t *testing.T) {
 	builder := New(Config{
-		MaxInputTokens: 120,
-		CountTokens:    func(text string) int { return len(text)/4 + 1 },
+		MaxInputTokens:      60_000,
+		KeepToolResultBytes: 8 << 10,
+		CountTokens:         func(text string) int { return len(text)/4 + 1 },
 	})
 	history := toolHistory(12)
+	// Real-size results: the byte budget only bites on output that is actually
+	// large, which is what a retrieval result is.
+	for index := range history {
+		if history[index].Role == model.RoleTool {
+			history[index].Content = strings.Repeat("关羽提刀出阵，斩了颜良文丑。", 200)
+		}
+	}
 
-	prompt := builder.Build(context.Background(), "system", nil, history)
+	prompt := builder.BuildWithTier(context.Background(), "system", nil, history, TierCompactHistory)
 
 	cleared := 0
 	verbatim := 0

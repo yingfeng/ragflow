@@ -14,21 +14,19 @@ const (
 	// DefaultContextWindow is the fallback window when the caller does not know
 	// the model's real one.
 	DefaultContextWindow = 200_000
-	// DefaultInputBudgetRatio is the share of the window spent on input. The
-	// rest covers the generated answer and protocol framing.
-	DefaultInputBudgetRatio = 0.80
+	// DefaultInputBudgetRatio is the share of the window spent on input. It is
+	// 1.0 because DefaultOutputReserveTokens already subtracts the room one
+	// completion needs: a ratio below 1 is a second reserve over the same gap,
+	// and on a 200k window the two together capped input at 143k while the
+	// provider had accepted 130k and still had room. Trimming the transcript at a
+	// number nobody measured is what made a run fold eight rounds of retrieval
+	// into a summary and start over.
+	DefaultInputBudgetRatio = 1.0
 	// DefaultOutputReserveTokens is the room kept for one completion.
 	DefaultOutputReserveTokens = 16_384
 	// DefaultAggressiveKeepMessages is the trailing window kept once pressure is
 	// critical.
 	DefaultAggressiveKeepMessages = 6
-
-	// PressureTrimSchemas starts clearing old tool output.
-	PressureTrimSchemas = 0.60
-	// PressureCompactHistory folds older turns into a summary.
-	PressureCompactHistory = 0.75
-	// PressureAggressivePrune keeps only the trailing turns.
-	PressureAggressivePrune = 0.90
 )
 
 // Tier is the compaction level selected from context pressure.
@@ -79,7 +77,7 @@ func (b Budget) EffectiveInput() int {
 		window = DefaultContextWindow
 	}
 	ratio := b.InputBudgetRatio
-	if ratio <= 0 || ratio >= 1 {
+	if ratio <= 0 || ratio > 1 {
 		ratio = DefaultInputBudgetRatio
 	}
 	reserve := b.OutputReserveTokens
@@ -96,27 +94,6 @@ func (b Budget) EffectiveInput() int {
 		return b.MaxInputTokens
 	}
 	return limit
-}
-
-// TierFor maps the current input size onto a compaction tier. Pressure is
-// measured against the effective input ceiling, so a model with a small window
-// compacts earlier for the same transcript.
-func (b Budget) TierFor(usedTokens int) Tier {
-	limit := b.EffectiveInput()
-	if limit <= 0 {
-		return TierNormal
-	}
-	pressure := float64(usedTokens) / float64(limit)
-	switch {
-	case pressure >= PressureAggressivePrune:
-		return TierAggressivePrune
-	case pressure >= PressureCompactHistory:
-		return TierCompactHistory
-	case pressure >= PressureTrimSchemas:
-		return TierTrimSchemas
-	default:
-		return TierNormal
-	}
 }
 
 // DefaultKeepToolResultBytes is the byte budget for verbatim tool output kept in
@@ -140,16 +117,23 @@ const DefaultKeepToolResultBytes = 160 << 10
 // toolResultByteBudget is the adaptive counterpart of Astra's microcompact: the
 // more pressure, the fewer bytes of tool output stay verbatim.
 //
-// Zero pressure clears NOTHING, and the zero is deliberate rather than an
-// unlimited setting. The agentic loop these tools come from keeps every tool
-// result in the transcript until the window itself fills, and it answers a
-// counting question in a few rounds because of it: one broad search returns
-// thirty passages at once, and every later round still sees all thirty. Clearing
-// on the normal path removes exactly that advantage — the older passages are the
-// ones holding the first names found, so the answer gets shorter the longer the
-// run searches.
+// Zero clears NOTHING, and the zero is deliberate rather than an unlimited
+// setting. The agentic loop these tools come from keeps every tool result in the
+// transcript until the window itself fills, and it answers a counting question in
+// a few rounds because of it: one broad search returns thirty passages at once,
+// and every later round still sees all thirty. Clearing on a lower tier removes
+// exactly that advantage — the older passages are the ones holding the first
+// names found, so the answer gets shorter the longer the run searches.
+//
+// TrimSchemas also clears nothing now. It used to halve the budget at 60%
+// pressure, which on a live enumeration meant that the second search round
+// replaced the first one's passages with a placeholder; the model, which can
+// only see what the prompt holds, then re-issued the same grep under a new
+// intent instead of reading what it already had. Dropping evidence while the
+// transcript still fits does not buy room, it buys a re-search. Clearing starts
+// at the tier that also folds turns away, where the space is actually needed.
 func toolResultByteBudget(tier Tier, base int) int {
-	if tier <= TierNormal {
+	if tier <= TierTrimSchemas {
 		return 0
 	}
 	if base <= 0 {
@@ -165,10 +149,8 @@ func toolResultByteBudget(tier Tier, base int) int {
 	switch tier {
 	case TierAggressivePrune:
 		return shrink(8, 8<<10)
-	case TierCompactHistory:
-		return shrink(4, 16<<10)
 	default:
-		return shrink(2, 24<<10)
+		return shrink(4, 16<<10)
 	}
 }
 

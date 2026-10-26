@@ -252,7 +252,7 @@ func Build(cfg Config) (*Runner, error) {
 		// pressure is what lets the model decide to write down what matters.
 		if !state.ContextNotified {
 			if window := deps.Builder.Window(); window > 0 {
-				used := estimatePromptTokens(state.Prompt)
+				used := promptTokens(deps, state.Prompt)
 				if used*4 >= window*3 {
 					state.ContextNotified = true
 					state.History = append(state.History, model.Message{Role: model.RoleUser, Content: fmt.Sprintf(
@@ -282,16 +282,26 @@ func Build(cfg Config) (*Runner, error) {
 		// The pool belongs to the answer call, where a list is what the output
 		// needs (see the answer node).
 		//
-		// The question is re-stated every round, and it has to be. A chat turn
-		// arrives with the whole thread in History, so the prompt carries every
-		// earlier question too; without this line the model lost track of which
-		// one it was answering and answered an older turn's question instead
-		// (observed: a question about 三国 answered a list of 秦 and 霸王别姬
-		// questions from earlier turns). The wording names the turn's question and
-		// says the passages are evidence for it — it does NOT say "answer now",
-		// which is what made runs stop searching after a few rounds.
-		if anchor := questionAnchor(state.Question); anchor != "" {
-			state.Prompt = append(state.Prompt, model.Message{Role: model.RoleUser, Content: anchor})
+		// Both of the next two sections repair damage compaction did: the
+		// question, which a fold drops from the front of the transcript, and the
+		// queries already paid for, which a fold replaces with a summary. They
+		// are injected only when the builder actually dropped something.
+		//
+		// Injecting them every round was measured: a ten-round enumeration over
+		// one document read, after the fifth search round, "I have comprehensive
+		// coverage. Let me run one final scan across the whole text" — and then
+		// three more single-call rounds of the same, each one restarted by a
+		// section whose whole subject is what has not been covered yet. The
+		// pipeline these tools come from carries neither: its per-round request is
+		// the system prompt and the transcript, so the last thing the model reads
+		// is the result it just asked for.
+		if trimmed := deps.Builder.Compacted(); trimmed {
+			if log := renderSearchLog(state); log != "" {
+				state.Prompt = append(state.Prompt, model.Message{Role: model.RoleUser, Content: log})
+			}
+			if anchor := questionAnchor(state.Question); anchor != "" {
+				state.Prompt = append(state.Prompt, model.Message{Role: model.RoleUser, Content: anchor})
+			}
 		}
 		// Speculate now, on the same transcript this prompt was built from: the
 		// summary is written while think and act do their work, so the round
@@ -342,6 +352,10 @@ func Build(cfg Config) (*Runner, error) {
 		answerSink := DeltaSinkFromContext(ctx)
 		workingSink := ReasoningSinkFromContext(ctx)
 		var held []string
+		// Reasoning is held per round and flushed with the round's working text:
+		// the panel shows one block per round, not one per token, and the answer
+		// area must never receive it.
+		var thoughtHeld []string
 		var response model.Response
 		deps.Hooks.PreModelRequest(ctx, hooks.ModelContext{
 			RunID:    state.RunID,
@@ -352,6 +366,8 @@ func Build(cfg Config) (*Runner, error) {
 		if streamer, ok := deps.Model.(model.Streamer); ok && (answerSink != nil || workingSink != nil) {
 			response, err = callModelStreamingWith(ctx, streamer, request, deps.Breaker, deps.Retry.streamAttempts(), func(text string) {
 				held = append(held, text)
+			}, func(thought string) {
+				thoughtHeld = append(thoughtHeld, thought)
 			})
 		} else {
 			response, err = callModelWith(ctx, deps.Model, request, deps.Breaker, deps.Retry.requestAttempts())
@@ -372,7 +388,7 @@ func Build(cfg Config) (*Runner, error) {
 				// The round is about to be replayed on a smaller prompt, so what
 				// it streamed is a draft: sending it to the answer area would
 				// leave it in front of the text the replay writes there.
-				emitReasoning(held, workingSink)
+				emitReasoning(append(thoughtHeld, held...), workingSink)
 				state.PtLErrors++
 				state.CompactionBoost++
 				state.RetryPrepare = true
@@ -395,7 +411,20 @@ func Build(cfg Config) (*Runner, error) {
 			}
 			return nil, fmt.Errorf("loop: model call failed: %w", err)
 		}
+		// The compaction boost belongs to the retry, not to the rest of the run.
+		//
+		// A refusal says THIS prompt does not fit; it says nothing about the next
+		// one. Leaving the boost raised kept every later round at the compaction
+		// tier, and clearing at that tier runs on every build — measured on run
+		// 140e27ad: from round 11 on, each round replaced 29 to 53 tool results
+		// with placeholders, so the model re-searched what it had already read.
+		state.acceptPrompt()
 		recordModelCall(ctx, deps, response, prefix, time.Since(start))
+		// The provider's count of the prompt just sent is the only exact measure
+		// of how full the window is. The budget calibrates against it, so a
+		// tokenizer that counts Chinese at four times the provider's rate cannot
+		// make the loop discard results the window still holds.
+		deps.Builder.ObservePromptTokens(response.Usage.PromptTokens)
 
 		state.Budget.TokensIn += response.Usage.PromptTokens
 		state.Budget.TokensOut += response.Usage.CompletionTokens
@@ -458,9 +487,13 @@ func Build(cfg Config) (*Runner, error) {
 		// check that" in the answer area, where the grace round or the answer
 		// call then streams the real reply underneath it.
 		if state.ThinkTerminal && state.FinalText != "" {
+			// The reasoning that produced the answer is still work, not answer:
+			// it belongs in the step panel so the answer area holds only the
+			// reply.
+			emitReasoning(thoughtHeld, workingSink)
 			flushAnswerText(held, answerSink)
 		} else {
-			emitReasoning(held, workingSink)
+			emitReasoning(append(thoughtHeld, held...), workingSink)
 		}
 
 		record(deps, StepRecord{
@@ -528,7 +561,7 @@ func Build(cfg Config) (*Runner, error) {
 			TokensOut:     state.Budget.TokensOut,
 			TokenBudget:   state.Budget.MaxTokens,
 			ContextWindow: deps.Builder.Window(),
-			ContextUsed:   estimatePromptTokens(state.Prompt),
+			ContextUsed:   promptTokens(deps, state.Prompt),
 			CompactAt:     0.75,
 		})
 
@@ -754,6 +787,11 @@ func Build(cfg Config) (*Runner, error) {
 				}
 			}
 			state.Evidence = append(state.Evidence, result.Evidence...)
+			// The retrieval log is what survives compaction: it records that the
+			// query ran, not what it found, so it can be re-sent every round
+			// without letting the model answer from it.
+			recordSearch(state, call, result)
+			noteReadChunks(state, result.Evidence)
 			if len(result.Evidence) > 0 {
 				state.EvidenceCalls++
 			}
@@ -827,15 +865,32 @@ func Build(cfg Config) (*Runner, error) {
 		// output-based signal, and a run that has never produced evidence has no
 		// pool to judge by.
 		switch {
-		case state.NewEvidence > 0:
-			state.StagnantRounds = 0
-		case state.EvidenceCalls > 0:
-			// Searched and the pool did not grow. This is the round that stops a
-			// run grinding through rewrite after rewrite of the same query.
-			state.StagnantRounds++
 		case state.NewOutputs > 0 && len(state.Evidence) == 0:
 			// No evidence model at all (shell, files): output is the only signal.
 			state.StagnantRounds = 0
+		case state.NewEvidence > 0 || state.EvidenceCalls > 0:
+			// Judge the window, not the round. One productive round means
+			// nothing: a reworded query returns one more snippet of the same
+			// passage, so a run can "grow" its pool every round while learning
+			// nothing — that is how a count question spent sixty rounds.
+			state.RecentEvidence = append(state.RecentEvidence, state.NewEvidence)
+			if len(state.RecentEvidence) > evidenceWindowRounds {
+				state.RecentEvidence = state.RecentEvidence[len(state.RecentEvidence)-evidenceWindowRounds:]
+			}
+			switch {
+			case repeatedSearch(state):
+				// Same tool, same query, new wording: the model believes it is
+				// trying something else, and the round counts as flat at once
+				// rather than waiting for the window to admit it.
+				state.StagnantRounds = policy.DefaultStagnantRounds
+			case len(state.RecentEvidence) < evidenceWindowRounds:
+				// Too few rounds to judge: a fresh run must not look stagnant.
+				state.StagnantRounds = 0
+			case sumEvidence(state.RecentEvidence) < evidenceWindowMinGain:
+				state.StagnantRounds++
+			default:
+				state.StagnantRounds = 0
+			}
 		default:
 			// read_spill and planning: reading what was already retrieved is
 			// neither progress nor stagnation, so the counter stays put.
@@ -862,6 +917,17 @@ func Build(cfg Config) (*Runner, error) {
 		}
 		if recorder := events.RecorderFromContext(ctx); recorder != nil {
 			recorder.RecordVerdict(ctx, string(state.Verdict.Action), state.Verdict.Reason, state.Entry.Round, len(state.Evidence))
+		}
+		// Finishing with steps open used to be impossible (the plan held the run
+		// open); with the plan demoted to a map it becomes possible, and it must
+		// not be silent. The reply has to name what the evidence did not cover,
+		// and only the answer call can write that sentence — so the text the loop
+		// already holds is dropped once and rewritten with the coverage note in
+		// front of it. This costs one call, only when steps are open.
+		if state.Verdict.Action == policy.ActionFinish {
+			if _, open := planCounts(state.Plan); open > 0 {
+				state.FinalText = ""
+			}
 		}
 		record(deps, StepRecord{
 			RunID:    state.RunID,
@@ -931,7 +997,11 @@ func Build(cfg Config) (*Runner, error) {
 			Messages: len(request.Messages),
 		})
 		if streamer, ok := deps.Model.(model.Streamer); ok && DeltaSinkFromContext(ctx) != nil {
-			response, err = callModelStreamingWith(ctx, streamer, request, deps.Breaker, deps.Retry.streamAttempts(), DeltaSinkFromContext(ctx))
+			var thoughtHeld []string
+			response, err = callModelStreamingWith(ctx, streamer, request, deps.Breaker, deps.Retry.streamAttempts(), DeltaSinkFromContext(ctx), func(thought string) {
+				thoughtHeld = append(thoughtHeld, thought)
+			})
+			emitReasoning(thoughtHeld, ReasoningSinkFromContext(ctx))
 		} else {
 			response, err = callModelWith(ctx, deps.Model, request, deps.Breaker, deps.Retry.requestAttempts())
 		}
@@ -967,6 +1037,7 @@ func Build(cfg Config) (*Runner, error) {
 			return state, nil
 		}
 		recordModelCall(ctx, deps, response, state.PrefixHash, time.Since(start))
+		deps.Builder.ObservePromptTokens(response.Usage.PromptTokens)
 
 		state.Budget.TokensIn += response.Usage.PromptTokens
 		state.Budget.TokensOut += response.Usage.CompletionTokens
@@ -1520,17 +1591,24 @@ func stoppingNote(state *State) string {
 	cutShort := state.Verdict.Action == policy.ActionPause ||
 		strings.Contains(reason, "exhausted") ||
 		strings.Contains(reason, "no result")
-	if !cutShort {
+	total, open := planCounts(state.Plan)
+	// An open plan no longer holds the run, so it has to be said out loud in
+	// the answer call instead: the reply names the part of the question the
+	// evidence did not reach. That sentence is what keeps "finish with steps
+	// open" from reading as "the list is complete".
+	if !cutShort && open == 0 {
 		return ""
 	}
-	if reason == "" {
-		reason = string(state.Verdict.Action)
-	}
 	var b strings.Builder
-	b.WriteString("The search ended early: " + reason + ".\n")
-	b.WriteString("Answer from everything already collected and cover all of it — do not drop items found earlier just because the search stopped. Add one sentence saying the list may not be complete.\n")
-	if total, open := planCounts(state.Plan); open > 0 {
-		fmt.Fprintf(&b, "%d of %d plan step(s) were left open.\n", open, total)
+	if cutShort {
+		if reason == "" {
+			reason = string(state.Verdict.Action)
+		}
+		b.WriteString("The search ended early: " + reason + ".\n")
+		b.WriteString("Answer from everything already collected and cover all of it — do not drop items found earlier just because the search stopped. Add one sentence saying the list may not be complete.\n")
+	}
+	if open > 0 {
+		fmt.Fprintf(&b, "%d of %d plan step(s) are still open. Say which part of the question the evidence does not cover instead of filling the gap from memory.\n", open, total)
 	}
 	return b.String()
 }
@@ -1746,6 +1824,180 @@ func renderEvidencePool(evidence []toolkit.Evidence) string {
 	return b.String()
 }
 
+const (
+	// searchLogMaxEntries bounds what the run remembers about its own searches;
+	// searchLogShown bounds what it is told each round. The log is re-sent every
+	// round, so the cost is paid per round.
+	searchLogMaxEntries = 40
+	searchLogShown      = 12
+	searchLogMaxQuery   = 160
+	// readChunksStored and readChunksShown bound the chunk-id record the same
+	// way: stored once per run, shown as the most recent window.
+	readChunksStored = 120
+	readChunksShown  = 24
+
+	// evidenceWindowRounds is how many rounds the progress judgement spans, and
+	// evidenceWindowMinGain is the new-evidence total that counts as progress
+	// across that window. Two units in three rounds: below that the run is
+	// re-reading material it already has, whatever the round itself returned.
+	evidenceWindowRounds  = 3
+	evidenceWindowMinGain = 2
+	// repeatedQueryLimit is how often the same tool+query may be issued before
+	// the round counts as flat. intent is deliberately not part of the key: it
+	// is the model's own narration, and rewording it is the exact way a repeat
+	// disguised itself as a new attempt.
+	repeatedQueryLimit = 3
+)
+
+// renderSearchLog turns the run's own retrieval history into a prompt section.
+//
+// It exists because History is lossy in the direction that hurts most:
+// compaction drops the oldest tool results first, so the searches a long run
+// already paid for are the first thing it forgets — and the model then re-runs
+// them in new words, which is how a run spends sixty rounds on the same passage.
+// Naming the queries is what breaks that loop.
+//
+// What it must NOT do is list findings. A section that summarises "already
+// found" was measured to stop a run early (29 rounds to 8, and 15 names to 9):
+// the model answered from the summary instead of finishing the search. Queries
+// and chunk ids are work already done, not answers already known.
+func renderSearchLog(state *State) string {
+	if len(state.Searches) == 0 && len(state.ReadChunks) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Search log\n")
+	b.WriteString("Retrievals this run already executed. The same query returns the same passages, so do not run one again: if none of these covers the question, change the axis — another name, another chapter, another leg.\n")
+	start := 0
+	if len(state.Searches) > searchLogShown {
+		start = len(state.Searches) - searchLogShown
+	}
+	if start > 0 {
+		fmt.Fprintf(&b, "(%d earlier queries not shown)\n", start)
+	}
+	for _, entry := range state.Searches[start:] {
+		fmt.Fprintf(&b, "- %s: %s", entry.Tool, clip(entry.Query, searchLogMaxQuery))
+		if entry.Count > 1 {
+			fmt.Fprintf(&b, " (ran %d times)", entry.Count)
+		}
+		if entry.Hits > 0 {
+			fmt.Fprintf(&b, " — %d hit(s)", entry.Hits)
+		}
+		b.WriteString("\n")
+	}
+	if len(state.ReadChunks) > 0 {
+		chunks := state.ReadChunks
+		if len(chunks) > readChunksShown {
+			chunks = chunks[len(chunks)-readChunksShown:]
+		}
+		fmt.Fprintf(&b, "Chunk ids already retrieved (%d, showing the latest %d): %s\n",
+			len(state.ReadChunks), len(chunks), strings.Join(chunks, ", "))
+	}
+	return b.String()
+}
+
+// recordSearch logs one retrieval call. Repeats update the existing entry
+// instead of appending, so the model sees "ran 4 times" rather than four
+// identical lines that read like four different attempts.
+func recordSearch(state *State, call PendingCall, result toolkit.Result) {
+	query := searchQuery(call.Arguments)
+	if query == "" {
+		return
+	}
+	for index := range state.Searches {
+		entry := &state.Searches[index]
+		if entry.Tool != call.Tool || entry.Query != query {
+			continue
+		}
+		entry.Count++
+		entry.Round = state.Entry.Round
+		if len(result.Evidence) > 0 {
+			entry.Hits = len(result.Evidence)
+		}
+		return
+	}
+	state.Searches = append(state.Searches, SearchLog{
+		Tool:  call.Tool,
+		Query: query,
+		Hits:  len(result.Evidence),
+		Count: 1,
+		Round: state.Entry.Round,
+	})
+	if len(state.Searches) > searchLogMaxEntries {
+		state.Searches = state.Searches[len(state.Searches)-searchLogMaxEntries:]
+	}
+}
+
+// searchQuery extracts the text a retrieval call asked with. Anchor-based reads
+// carry no query, so their identity is the document plus the chunk ids: two
+// calls that read different windows of one document are different work.
+func searchQuery(arguments string) string {
+	var payload struct {
+		Query          string   `json:"query"`
+		Queries        []string `json:"queries"`
+		DocID          string   `json:"doc_id"`
+		AnchorChunkIDs []string `json:"anchor_chunk_ids"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &payload); err != nil {
+		return ""
+	}
+	switch {
+	case strings.TrimSpace(payload.Query) != "":
+		return normalizeQuery(payload.Query)
+	case len(payload.Queries) > 0:
+		return normalizeQuery(strings.Join(payload.Queries, " | "))
+	case payload.DocID != "" && len(payload.AnchorChunkIDs) > 0:
+		return payload.DocID + " chunks " + strings.Join(payload.AnchorChunkIDs, ",")
+	}
+	return ""
+}
+
+// normalizeQuery collapses whitespace so a re-issued query with different
+// spacing is recognised as the same query.
+func normalizeQuery(query string) string {
+	return strings.Join(strings.Fields(query), " ")
+}
+
+// repeatedSearch reports whether any single tool+query has been issued often
+// enough to count as flat work. intent is excluded: the model rewords it on
+// every attempt, and a reworded intent is not a different search.
+func repeatedSearch(state *State) bool {
+	for _, entry := range state.Searches {
+		if entry.Count >= repeatedQueryLimit {
+			return true
+		}
+	}
+	return false
+}
+
+func sumEvidence(values []int) int {
+	total := 0
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+// noteReadChunks records the passages a call returned, ids only.
+func noteReadChunks(state *State, evidence []toolkit.Evidence) {
+	for _, item := range evidence {
+		ref := strings.TrimSpace(item.Ref)
+		if ref == "" || len(state.ReadChunks) >= readChunksStored {
+			continue
+		}
+		duplicate := false
+		for _, existing := range state.ReadChunks {
+			if existing == ref {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			state.ReadChunks = append(state.ReadChunks, ref)
+		}
+	}
+}
+
 // describeCall records what a call actually asked for and how much came back.
 //
 // The step log otherwise keeps only a tool name and an argument hash, which is
@@ -1782,6 +2034,22 @@ const (
 	aggregateSoftLimitBytes = 64 << 10
 	aggregateFloorBytes     = 1 << 10
 )
+
+// promptTokens is how full this prompt is, in the provider's own units.
+//
+// Everything the model is told about context pressure goes through here. The
+// byte heuristic below assumes four bytes per token, which is a guess about a
+// tokenizer the harness does not own: the same corpus measures at ~2.1 bytes per
+// token in cl100k, so the guess can be off by nearly half the real fill in either
+// direction. A number the model is shown as fact — "roughly N of the M tokens the
+// model can hold" — has to be the number the provider charges, which is why the
+// builder calibrates against ObservePromptTokens and this function defers to it.
+func promptTokens(deps Deps, messages []model.Message) int {
+	if deps.Builder != nil {
+		return deps.Builder.EstimateTokens(messages)
+	}
+	return estimatePromptTokens(messages)
+}
 
 // estimatePromptTokens approximates a prompt's size without running the
 // tokenizer. Four bytes per token is the rule the builder's default counter

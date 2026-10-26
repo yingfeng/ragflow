@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ragflow/internal/harness/agent/model"
+	agentctx "ragflow/internal/harness/context"
 )
 
 func TestErrorClassification(t *testing.T) {
@@ -149,6 +150,30 @@ func TestCompactionTierForBoost(t *testing.T) {
 	}
 	if got := compactionTierFor(9); got != 3 {
 		t.Errorf("boost 9 = %v, want aggressive prune", got)
+	}
+}
+
+// The tier a refusal raises is spent by the retry it caused.
+//
+// Leaving it raised turned one refusal into a per-round policy: measured on run
+// 140e27ad, every round from the eleventh replaced 29 to 53 tool results with
+// placeholders, so the model kept searching what it had already read. The run
+// was not looping on its own — it was being erased 40 results at a time.
+func TestCompactionBoostIsSpentByTheRetry(t *testing.T) {
+	state := &State{}
+	state.PtLErrors++
+	state.CompactionBoost++
+	if got := compactionTierFor(state.CompactionBoost); got < agentctx.TierCompactHistory {
+		t.Fatalf("tier after a refusal = %v, want the retry to compact", got)
+	}
+
+	state.acceptPrompt()
+
+	if state.CompactionBoost != 0 || state.PtLErrors != 0 {
+		t.Fatalf("boost = %d, ptl = %d, want both spent by the accepted call", state.CompactionBoost, state.PtLErrors)
+	}
+	if got := compactionTierFor(state.CompactionBoost); got != agentctx.TierNormal {
+		t.Fatalf("tier after acceptance = %v, want normal: the next prompt is judged on its own", got)
 	}
 }
 

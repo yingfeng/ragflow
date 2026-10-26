@@ -20,6 +20,23 @@ type StepError struct {
 	Message string `json:"message"`
 }
 
+// SearchLog is one retrieval the run already executed, keyed by the query it
+// sent rather than by what came back.
+//
+// It carries no result text: the log exists to stop repeated work, and a list of
+// findings here is what makes a model answer from the log instead of finishing
+// the search (see renderSearchLog).
+type SearchLog struct {
+	Tool  string `json:"tool"`
+	Query string `json:"query"`
+	// Hits is how many passages the call returned; Count is how often the run
+	// issued the same query. A count above one is the repetition the log is
+	// there to make visible to the model.
+	Hits  int `json:"hits,omitempty"`
+	Count int `json:"count,omitempty"`
+	Round int `json:"round,omitempty"`
+}
+
 // EntryMeta is the serializable loop position. Recovery reads this instead of
 // inferring position from message content.
 type EntryMeta struct {
@@ -78,6 +95,25 @@ type State struct {
 	// list every round is harness-only noise, and it reads as a reminder that
 	// the list is the whole job rather than a record of what is left to do.
 	PlanShown string `json:"plan_shown,omitempty"`
+
+	// Searches is the run's own retrieval log: which queries already ran, and
+	// how much each returned. It lives on State rather than in History because
+	// compaction drops the tool messages it is derived from — and a model that
+	// cannot see what it already searched re-runs the same query in new words
+	// until the round budget runs out.
+	Searches []SearchLog `json:"searches,omitempty"`
+	// ReadChunks lists chunk ids the run already retrieved, in first-seen
+	// order. Ids only: this is a record of work done, not of findings, because
+	// a list of findings is what made a model answer from the list instead of
+	// finishing the search.
+	ReadChunks []string `json:"read_chunks,omitempty"`
+
+	// RecentEvidence holds the new-evidence count of the last few rounds. A
+	// single productive round is not progress: a reworded query returns one more
+	// snippet of the same passage, so the pool creeps up every round while
+	// nothing new is learned. Judging a window instead of a round is what lets a
+	// run that keeps "finding" the same material be called stagnant.
+	RecentEvidence []int `json:"recent_evidence,omitempty"`
 
 	// ResumeHandled records that the first act after a restart already treated
 	// its inherited batch as possibly-already-dispatched. Later rounds in the
@@ -144,10 +180,14 @@ type State struct {
 	// Steers counts messages injected into the run while it was executing.
 	Steers int `json:"steers"`
 
-	// CompactionBoost is how many prompt-too-long recoveries this run has
-	// already spent; prepare uses it to force a harder compaction tier.
+	// CompactionBoost is the compaction tier for the retry of a prompt the
+	// provider just refused; prepare uses it to force a harder one. It is reset
+	// as soon as a call is accepted (see acceptPrompt): a refusal is a fact
+	// about one prompt, and keeping the tier raised turned it into a fact about
+	// every later round.
 	CompactionBoost int `json:"compaction_boost"`
-	// PtLErrors counts prompt-too-long rejections, bounded by ptlAttempts.
+	// PtLErrors counts consecutive prompt-too-long rejections, bounded by
+	// ptlAttempts, and is reset by the same accepted call.
 	PtLErrors int `json:"ptl_errors"`
 	// RetryPrepare asks the graph to rebuild the prompt before calling the model
 	// again. It is set by think after a prompt-too-long rejection.
@@ -159,6 +199,19 @@ type State struct {
 	// Review is the independent reviewer's verdict on the run's file writes.
 	// Empty means either nothing was written or the review found no issues.
 	Review string `json:"review,omitempty"`
+}
+
+// acceptPrompt records that the provider accepted a call, so the compaction
+// state that belongs to a refusal is spent.
+//
+// The tier a refusal raises is what makes the retry smaller. It is not a
+// property of the run: a prompt that fits now may not fit twenty rounds later,
+// and the round that discovers that will raise the tier again. Keeping it
+// raised made every later build compact, which on a retrieval run meant every
+// round erased the tool output the model had just read.
+func (s *State) acceptPrompt() {
+	s.CompactionBoost = 0
+	s.PtLErrors = 0
 }
 
 // Outcome is what a finished run reports.

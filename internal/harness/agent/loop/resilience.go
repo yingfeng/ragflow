@@ -274,24 +274,33 @@ func explainModelError(err error) error {
 	return fmt.Errorf("%w (the model provider rejected the credentials; retrying will not help — check the tenant's provider key for this model)", err)
 }
 
-// callModelStreaming retries a streaming call.
+// callModelStreamingWith retries a streaming call.
 //
-// A retry replays the request, which means the user would see the answer text
-// twice. So a retry is only allowed before the first delta reached the sink; once
-// text was shown the error is final and the caller decides what to tell the user.
-func callModelStreaming(ctx context.Context, streamer model.Streamer, request model.Request, breaker *model.Breaker, sink func(string)) (model.Response, error) {
-	return callModelStreamingWith(ctx, streamer, request, breaker, 0, sink)
-}
-
-// callModelStreamingWith is callModelStreaming with an explicit attempt budget.
-func callModelStreamingWith(ctx context.Context, streamer model.Streamer, request model.Request, breaker *model.Breaker, attempts int, sink func(string)) (model.Response, error) {
+// A retry replays the request, which means the user would see the same output
+// twice. So a retry is only allowed before the first delta reached either sink;
+// once text was shown the error is final and the caller decides what to tell the
+// user.
+//
+// sink receives visible text, thought receives reasoning. They are separate
+// because the two have different homes in the UI: text becomes either the answer
+// or the step panel's working note, while reasoning is always working material.
+// Dropping thought — which this function used to do by accepting only the first
+// sender argument — is why a run could search for twenty rounds with nothing
+// shown about why.
+func callModelStreamingWith(ctx context.Context, streamer model.Streamer, request model.Request, breaker *model.Breaker, attempts int, sink, thought func(string)) (model.Response, error) {
 	attempts = boundedAttempts(attempts)
 	if remaining, ok := breaker.Allow(time.Now()); !ok {
 		return model.Response{}, &model.ErrProviderCoolingDown{Key: "provider", Remaining: remaining}
 	}
 
 	emitted := false
-	sender := func(answer, _ *string) error {
+	sender := func(answer, reasoning *string) error {
+		if reasoning != nil && *reasoning != "" && thought != nil {
+			// Reasoning already reached the UI: a retry would print it twice, so
+			// it counts as emitted exactly like answer text does.
+			emitted = true
+			thought(*reasoning)
+		}
 		if answer == nil || *answer == "" || sink == nil {
 			return nil
 		}

@@ -16,6 +16,7 @@ import (
 type streamingModel struct {
 	mu       sync.Mutex
 	chunks   []string
+	thoughts []string
 	failNext error
 	failWith error
 	calls    int
@@ -39,6 +40,16 @@ func (m *streamingModel) Stream(ctx context.Context, req model.Request, sender m
 			_ = sender(&partial, nil)
 		}
 		return model.Response{}, m.failNext
+	}
+	// Reasoning arrives before the visible text, exactly as a provider reports
+	// it: the model thinks, then writes.
+	for _, thought := range m.thoughts {
+		value := thought
+		if sender != nil {
+			if err := sender(nil, &value); err != nil {
+				return model.Response{}, err
+			}
+		}
 	}
 	answer := strings.Builder{}
 	for _, chunk := range m.chunks {
@@ -76,6 +87,43 @@ func TestStreamingDeltasReachTheSink(t *testing.T) {
 		t.Fatalf("deltas = %v", deltas)
 	}
 	if outcome.Text != "Hello" {
+		t.Fatalf("outcome text = %q", outcome.Text)
+	}
+}
+
+// Reasoning is working material, not answer text: it reaches the panel that
+// explains a round and never the answer area. It used to be dropped in the
+// adapter outright — the sender accepted only its first argument — which is why
+// a run could search twenty rounds with nothing on screen about why.
+func TestStreamingReasoningReachesTheWorkingSink(t *testing.T) {
+	mdl := &streamingModel{chunks: []string{"答案"}, thoughts: []string{"先查华雄", "再看五关"}}
+	runner := buildRunner(t, mdl, nil, Config{})
+
+	var mu sync.Mutex
+	var thoughts []string
+	var answers []string
+	ctx := WithDeltaSink(t.Context(), func(text string) {
+		mu.Lock()
+		answers = append(answers, text)
+		mu.Unlock()
+	})
+	ctx = WithReasoningSink(ctx, func(text string) {
+		mu.Lock()
+		thoughts = append(thoughts, text)
+		mu.Unlock()
+	})
+
+	outcome, err := runner.Invoke(ctx, &Input{RunID: "run-thought", UserMessage: "hi"}, nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if got := strings.Join(thoughts, ""); got != "先查华雄再看五关" {
+		t.Fatalf("thoughts = %q, want the model's reasoning", got)
+	}
+	if got := strings.Join(answers, ""); got != "答案" {
+		t.Fatalf("answers = %q, want only the visible text", got)
+	}
+	if outcome.Text != "答案" {
 		t.Fatalf("outcome text = %q", outcome.Text)
 	}
 }
