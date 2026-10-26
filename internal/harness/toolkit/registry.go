@@ -215,10 +215,32 @@ func (r *Registry) RegisterDeferred(capability Capability) error {
 
 // Has reports whether a tool name is known to the registry.
 func (r *Registry) Has(tool string) bool {
+	if r == nil {
+		return false
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	_, ok := r.owner[tool]
 	return ok
+}
+
+// HasDeferred reports whether the registry holds a tool it does not offer yet.
+//
+// It is the condition under which a search tool is worth its schema: an eager
+// surface is fully visible to the model, so searching it can only return a
+// calling contract the prompt already carries.
+func (r *Registry) HasDeferred() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, enabled := range r.enabled {
+		if !enabled {
+			return true
+		}
+	}
+	return false
 }
 
 // Enable activates tools by name and returns their specs, so the caller can

@@ -29,6 +29,12 @@ func TestErrorClassification(t *testing.T) {
 		// The code alone is not evidence: another provider's unrelated 2064 must
 		// not be read as an over-window prompt.
 		{errors.New("openai API error: bad request (2064)"), false, false},
+		// A stream that stops without its terminal frame is replayable while
+		// nothing reached the sinks; treating it as final failed the whole run.
+		{errors.New("stream ended before [DONE] or finish_reason (events=4 choices_events=3 content_chunks=0)"), true, false},
+		{errors.New("ollama: stream ended before done"), true, false},
+		{errors.New("bedrock: stream ended before messageStop"), true, false},
+		{errors.New("failed to scan response body: unexpected EOF"), true, false},
 		{nil, false, false},
 	}
 	for _, testCase := range cases {

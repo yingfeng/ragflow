@@ -62,6 +62,39 @@ func TestBuildAgenticReferenceRetainsWebChunkCitations(t *testing.T) {
 	}
 }
 
+// TestChunkIDHandlesReachTheReference: the tools print `chunk_id="..."` next to
+// the `ref="n"` handle, and a model that copies the wrong attribute writes a
+// marker like "[ID:2f4f73f8e245db19]". It was invisible to both scanners (the
+// handle scan needs digits, the provenance scan needs the `chunk_id:` field), so
+// the answer shipped literal markers and an empty reference list.
+func TestChunkIDHandlesReachTheReference(t *testing.T) {
+	answer := "| 程远志 | 黄巾、大兴山 | \"被云长刀起处，挥为两段\"[ID:2f4f73f8e245db19] |\n"
+
+	if got := chunkIDHandles(answer); len(got) != 1 || got[0] != "2f4f73f8e245db19" {
+		t.Fatalf("chunkIDHandles = %v, want the one cited chunk id", got)
+	}
+	// A numeric body is a handle number, not a chunk id.
+	if got := chunkIDHandles("fact [ID:12]"); len(got) != 0 {
+		t.Errorf("chunkIDHandles([ID:12]) = %v, want none", got)
+	}
+
+	resolved := []string{"2f4f73f8e245db19", "68cb3744396e2b3b"}
+	marked := rewriteChunkIDHandles(answer+"华雄[ID:68cb3744396e2b3b] 未解析[ID:ffffffffffffffff]", resolved)
+	if strings.Contains(marked, "2f4f73f8e245db19") || !strings.Contains(marked, "[ID:0]") {
+		t.Errorf("first citation was not numbered: %q", marked)
+	}
+	if !strings.Contains(marked, "[ID:1]") {
+		t.Errorf("second citation was not numbered: %q", marked)
+	}
+	if strings.Contains(marked, "ffffffffffffffff") {
+		t.Errorf("an unresolved chunk-id marker survived: %q", marked)
+	}
+	// Already-canonical handles must not be touched.
+	if got := rewriteChunkIDHandles("fact [ID:3]", resolved); got != "fact [ID:3]" {
+		t.Errorf("numeric handle was rewritten: %q", got)
+	}
+}
+
 func TestSentenceSplit_PlainText(t *testing.T) {
 	result := sentenceSplit("Hello world. This is a test.")
 	if len(result) < 2 {

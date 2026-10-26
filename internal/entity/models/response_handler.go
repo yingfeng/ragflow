@@ -84,9 +84,14 @@ func HandleStreamingResponse(body io.Reader, modelUsage *common.ModelUsage, chat
 	var streamUsage *TokenUsage
 	accumulatedToolCalls := make(map[int]map[string]any)
 	sawTerminal := false
+	// Counters for the "ended without a terminal frame" diagnostic. The shape of
+	// the last frames is the only evidence of why a stream stopped, and it is not
+	// recoverable after the body is closed.
+	events, choicesEvents, contentChunks := 0, 0, 0
 
 	var streamModel string
 	done, err := ParseSSEStream[map[string]any](body, func(event map[string]any) error {
+		events++
 		if u, ok := cfg.StreamParser(event); ok {
 			streamUsage = u
 		}
@@ -109,6 +114,23 @@ func HandleStreamingResponse(body io.Reader, modelUsage *common.ModelUsage, chat
 		choices, ok := event["choices"].([]any)
 		if !ok || len(choices) == 0 {
 			return nil
+		}
+		choicesEvents++
+
+		// The terminal frame does not have to carry a delta. A provider that ends
+		// the stream with finish_reason instead of [DONE] — MiniMax is one — sends
+		// it in a choice that may hold nothing else, so the finish_reason has to be
+		// read before the delta guard below. Reading it after the guard turned a
+		// completed stream into "ended before [DONE] or finish_reason" whenever the
+		// provider omitted the empty delta.
+		for _, rawChoice := range choices {
+			choice, ok := rawChoice.(map[string]any)
+			if !ok {
+				continue
+			}
+			if finishReason, ok := choice["finish_reason"].(string); ok && finishReason != "" {
+				sawTerminal = true
+			}
 		}
 
 		firstChoice, ok := choices[0].(map[string]any)
@@ -137,13 +159,10 @@ func HandleStreamingResponse(body io.Reader, modelUsage *common.ModelUsage, chat
 		}
 
 		if content, ok := delta["content"].(string); ok && content != "" {
+			contentChunks++
 			if err := sender(&content, nil); err != nil {
 				return err
 			}
-		}
-
-		if finishReason, ok := firstChoice["finish_reason"].(string); ok && finishReason != "" {
-			sawTerminal = true
 		}
 
 		return nil
@@ -157,7 +176,10 @@ func HandleStreamingResponse(body io.Reader, modelUsage *common.ModelUsage, chat
 	}
 
 	if !done && !sawTerminal {
-		return fmt.Errorf("stream ended before [DONE] or finish_reason")
+		// The counters are what distinguishes a provider that stopped mid-answer
+		// from one that sent a frame the handler could not read as a terminal
+		// mark, and the payload is gone by the time this error surfaces.
+		return fmt.Errorf("stream ended before [DONE] or finish_reason (events=%d choices_events=%d content_chunks=%d)", events, choicesEvents, contentChunks)
 	}
 
 	if streamUsage != nil {

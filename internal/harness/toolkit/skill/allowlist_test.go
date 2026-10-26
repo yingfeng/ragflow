@@ -15,7 +15,7 @@ func (s stubLoader) Load(context.Context, string) (Skill, error) { return s.item
 
 func loadSkill(t *testing.T, item Skill) *toolkit.Allowlist {
 	t.Helper()
-	capability := New(stubLoader{item: item})
+	capability := New(context.Background(), stubLoader{item: item})
 	ctx := toolkit.WithAllowlist(context.Background())
 	if _, err := capability.Invoke(ctx, toolkit.Call{Tool: "skill_load", Arguments: `{"name":"` + item.Name + `"}`}); err != nil {
 		t.Fatalf("load skill: %v", err)

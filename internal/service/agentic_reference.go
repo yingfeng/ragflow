@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"go.uber.org/zap"
@@ -28,6 +29,99 @@ import (
 	"ragflow/internal/engine"
 	enginetypes "ragflow/internal/engine/types"
 )
+
+// chunkIDHandleRE matches a citation marker whose body is a chunk id instead of
+// a handle number ("[ID:2f4f73f8e245db19]").
+//
+// Every passage a tool prints carries `chunk_id="..."` next to the `ref="n"`
+// handle, and a model that copies the wrong attribute writes the chunk id inside
+// the marker the prompt asks for. Nothing downstream could read that: the handle
+// scan needs digits, and the provenance scan needs the `chunk_id:` field. The
+// marker therefore reached the UI as literal text and the reference payload
+// shipped empty, so the citation was unopenable.
+var chunkIDHandleRE = regexp.MustCompile(`\[ID:\s*([A-Za-z0-9_-]{6,})\]`)
+
+// chunkIDHandles returns the chunk ids the answer wrote inside citation markers,
+// in first-appearance order, deduplicated. A pure-digit body is a handle number,
+// not a chunk id, and is left to CitedIDsFromMarkers.
+func chunkIDHandles(answer string) []string {
+	if answer == "" || !strings.Contains(answer, "[ID:") {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	for _, m := range chunkIDHandleRE.FindAllStringSubmatch(answer, -1) {
+		id := m[1]
+		if isAllDigits(id) {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// rewriteChunkIDHandles replaces every chunk-id marker with the marker numbering
+// the reference payload ships, and drops a marker naming a chunk that did not
+// resolve — the same rule ResolveCitations applies to unresolvable handles, since
+// a marker must never point at an index that holds some other passage.
+func rewriteChunkIDHandles(answer string, publishable []string) string {
+	if answer == "" || len(publishable) == 0 || !strings.Contains(answer, "[ID:") {
+		return answer
+	}
+	pos := make(map[string]int, len(publishable))
+	for i, id := range publishable {
+		if _, dup := pos[id]; !dup {
+			pos[id] = i
+		}
+	}
+	return chunkIDHandleRE.ReplaceAllStringFunc(answer, func(m string) string {
+		sub := chunkIDHandleRE.FindStringSubmatch(m)
+		if len(sub) < 2 || isAllDigits(sub[1]) {
+			return m
+		}
+		n, ok := pos[sub[1]]
+		if !ok {
+			return ""
+		}
+		return fmt.Sprintf("[ID:%d]", n)
+	})
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeCitedIDs appends the ids of extra that cited does not hold yet, keeping
+// first-appearance order: the payload's numbering is that order.
+func mergeCitedIDs(cited, extra []string) []string {
+	if len(extra) == 0 {
+		return cited
+	}
+	seen := make(map[string]struct{}, len(cited)+len(extra))
+	for _, id := range cited {
+		seen[id] = struct{}{}
+	}
+	for _, id := range extra {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		cited = append(cited, id)
+	}
+	return cited
+}
 
 // buildAgenticReference turns the answer's citations into the reference payload
 // the naive pipeline ships, and rewrites the answer's markers to that payload's
@@ -72,22 +166,14 @@ func (s *ChatPipelineService) buildAgenticReference(ctx context.Context, tenantI
 	// can only name a passage that actually reached the context.
 	cited := agentic_rag.CitedIDsFromMarkers(normalized, registry)
 	byHandles := len(cited) > 0
-	if !byHandles {
-		// Fallback: an answer that named passages by raw chunk_id. A
-		// document-level question has no [ID:n] handle to write.
-		cited = agentic_rag.ExtractCitedChunkIDs(normalized)
-	} else {
-		seen := make(map[string]bool, len(cited))
-		for _, id := range cited {
-			seen[id] = true
-		}
-		for _, id := range agentic_rag.ExtractCitedChunkIDs(normalized) {
-			if !seen[id] {
-				cited = append(cited, id)
-				seen[id] = true
-			}
-		}
-	}
+	// Two more ways an answer names its sources: a raw chunk id inside the marker
+	// ([ID:2f4f73f8e245db19], the chunk_id printed next to every passage) and the
+	// `chunk_id: <id>` provenance field a document-level answer uses instead of a
+	// handle. Both are merged in first-appearance order, which is the order the
+	// reference payload ships in.
+	handleChunkIDs := chunkIDHandles(normalized)
+	cited = mergeCitedIDs(cited, handleChunkIDs)
+	cited = mergeCitedIDs(cited, agentic_rag.ExtractCitedChunkIDs(normalized))
 	if len(cited) == 0 {
 		return map[string]interface{}{}, normalized
 	}
@@ -135,11 +221,15 @@ func (s *ChatPipelineService) buildAgenticReference(ctx context.Context, tenantI
 		// first-citation order ("[ID:0]"), the numbering the payload ships.
 		marked, _ = agentic_rag.ResolveCitations(normalized, registry, resolved)
 	}
+	// A chunk id inside a marker is rewritten to the same numbering, so the
+	// marker the model wrote becomes the marker the client can resolve.
+	marked = rewriteChunkIDHandles(marked, resolved)
 	marked = agentic_rag.InsertCitationMarkers(marked, resolved)
 	common.InfoCtx(ctx, "agentic citations built",
 		zap.Int("cited", len(cited)),
 		zap.Int("resolved", len(resolved)),
 		zap.Bool("by_handle", byHandles),
+		zap.Int("chunk_id_handles", len(handleChunkIDs)),
 		zap.Int("final_bytes", len(marked)))
 	return map[string]interface{}{
 		"chunks":   chunksFormat(ordered),

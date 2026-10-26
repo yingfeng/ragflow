@@ -4403,6 +4403,22 @@ func BuildChatConfig(dialog *entity.Chat, config map[string]interface{}) *modelM
 		}
 		if v, ok := dialog.LLMSetting["thinking"].(bool); ok {
 			cfg.Thinking = &v
+		} else if s, ok := dialog.LLMSetting["thinking"].(string); ok {
+			// The agent LLM component stores this switch as "enabled"/"disabled"
+			// and the chat dialog stores it as a bool. Reading only the bool left
+			// the parameter out of the request for every dialog written in the
+			// string form, so the provider applied its own default: measured on the
+			// harness path with thinking="disabled" stored in llm_setting, MiniMax
+			// spent ~2000 completion tokens per working round against ~440 on the
+			// agentic path, which does translate the string.
+			switch strings.ToLower(strings.TrimSpace(s)) {
+			case "enabled", "on", "true":
+				enabled := true
+				cfg.Thinking = &enabled
+			case "disabled", "off", "false":
+				disabled := false
+				cfg.Thinking = &disabled
+			}
 		}
 		if v, ok := chatConfigPositiveInt(dialog.LLMSetting["max_tokens"]); ok {
 			i := v

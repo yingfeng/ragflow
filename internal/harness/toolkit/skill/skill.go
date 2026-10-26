@@ -71,11 +71,30 @@ type Loader interface {
 // Capability exposes skill tools.
 type Capability struct {
 	loader Loader
+	// catalog reports whether the run holds a skill the model may discover. It is
+	// resolved once, when the capability is built, so the tool surface stays fixed
+	// for the run: a surface that appeared mid-run would rewrite the cached prompt
+	// prefix, and one that disappeared would leave a call the model already made.
+	catalog bool
 }
 
 // New builds the capability.
-func New(loader Loader) *Capability {
-	return &Capability{loader: loader}
+func New(ctx context.Context, loader Loader) *Capability {
+	capability := &Capability{loader: loader}
+	capability.catalog = len(discoverable(capability.list(ctx))) > 0
+	return capability
+}
+
+// list returns the loader's catalog, treating an unreachable source as empty.
+func (c *Capability) list(ctx context.Context) []Skill {
+	if c.loader == nil {
+		return nil
+	}
+	skills, err := c.loader.List(ctx)
+	if err != nil {
+		return nil
+	}
+	return skills
 }
 
 // Name implements toolkit.Capability.
@@ -141,7 +160,15 @@ func (c *Capability) SystemNote(ctx context.Context) string {
 func (*Capability) ToolRisk(string) toolkit.Risk { return toolkit.RiskReadOnly }
 
 // Tools implements toolkit.Capability.
-func (*Capability) Tools() []model.ToolSpec {
+//
+// The catalog tools exist only when there is something to discover. A run whose
+// skills are all auto_load policies has an empty catalog, and skill_list would
+// answer "no skills installed": a schema carried in every round's prompt plus the
+// round the model spends asking it, both to learn nothing.
+func (c *Capability) Tools() []model.ToolSpec {
+	if !c.catalog {
+		return nil
+	}
 	return []model.ToolSpec{
 		{
 			Name:        "skill_list",
@@ -205,13 +232,7 @@ func (c *Capability) Invoke(ctx context.Context, call toolkit.Call) (toolkit.Res
 // many entries it withheld, because a silently short list reads like "there is
 // nothing else".
 func renderCatalog(skills []Skill) string {
-	visible := make([]Skill, 0, len(skills))
-	for _, item := range skills {
-		if item.DisableModelInvocation || item.AutoLoad {
-			continue
-		}
-		visible = append(visible, item)
-	}
+	visible := discoverable(skills)
 	if len(visible) == 0 {
 		return "no skills installed"
 	}
@@ -235,6 +256,19 @@ func renderCatalog(skills []Skill) string {
 		builder.WriteString(fmt.Sprintf("\n[%d more skill(s) omitted: catalog budget reached]\n", len(visible)-written))
 	}
 	return strings.TrimSpace(builder.String())
+}
+
+// discoverable keeps the entries the model may find on its own: the manifest has
+// not hidden them, and their body is not already in the system prompt.
+func discoverable(skills []Skill) []Skill {
+	out := make([]Skill, 0, len(skills))
+	for _, item := range skills {
+		if item.DisableModelInvocation || item.AutoLoad {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func render(item Skill) string {

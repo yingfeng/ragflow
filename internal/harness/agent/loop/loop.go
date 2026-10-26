@@ -21,6 +21,9 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
+	"ragflow/internal/common"
 	"ragflow/internal/harness/agent/definition"
 	"ragflow/internal/harness/agent/model"
 	agentctx "ragflow/internal/harness/context"
@@ -829,6 +832,25 @@ func Build(cfg Config) (*Runner, error) {
 			Decision:   fmt.Sprintf("%d calls", len(calls)),
 			DurationMS: time.Since(start).Milliseconds(),
 		})
+		// One line per tool round: which tools, how many, and how much text they
+		// put into the transcript. Round count alone says "slow" without saying
+		// why — a run that reads ten passages one call at a time and a run that
+		// takes ten genuinely different lookups look identical from the outside,
+		// and only this line separates them.
+		resultBytes := 0
+		for _, result := range results {
+			resultBytes += len(result.Content)
+		}
+		names := make([]string, 0, len(calls))
+		for _, call := range calls {
+			names = append(names, call.Tool)
+		}
+		common.InfoCtx(ctx, "harness tool round",
+			zap.Int("round", state.Entry.Round),
+			zap.Int("calls", len(calls)),
+			zap.String("tools", strings.Join(names, ",")),
+			zap.Int("result_bytes", resultBytes),
+			zap.Int("evidence_total", len(state.Evidence)))
 		return state, nil
 	})
 
@@ -1275,11 +1297,16 @@ func IsResumed(ctx context.Context) bool {
 // registerRuntimeCapabilities installs the capabilities the loop itself depends
 // on. A host-provided tool_search wins, so a deployment can replace the search
 // strategy without forking the loop.
+//
+// tool_search is offered only when something is actually deferred. Every
+// capability this deployment registers eagerly, so the model already sees the
+// whole surface; the tool would then cost its schema in every round's prompt and
+// the round spent searching, to return contracts the prompt already carries.
 func registerRuntimeCapabilities(registry *toolkit.Registry) {
 	if registry == nil {
 		return
 	}
-	if !registry.Has(toolsearch.ToolName) {
+	if registry.HasDeferred() && !registry.Has(toolsearch.ToolName) {
 		_ = registry.Register(toolsearch.New(registry))
 	}
 	if !registry.Has("read_spill") {

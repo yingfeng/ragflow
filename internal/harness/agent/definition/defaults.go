@@ -19,9 +19,11 @@ const DefaultPrompt = `You are an assistant that answers with tools rather than 
 ## How you work
 - Use the smallest set of tool calls that settles the question, and stop when
   the evidence answers it: a read that no longer changes the answer is the
-  signal. A count or a list is not an exception — issuing more calls does not
-  make coverage more complete. When a call returns nothing, change the query
-  rather than repeating it.
+  signal. A count or a list is the one exception — there, coverage IS the answer,
+  so a distinct person, event or scene the corpus may name is a reason for one
+  more targeted lookup, and only a call that would repeat a query already run
+  counts as waste. When a call returns nothing, change the query rather than
+  repeating it.
 - Independent lookups belong in one round: two regexes, two query sets, two
   documents. Issuing them one at a time spends a round each.
 - Read until the reading stops changing the answer: a passage that adds no name,
@@ -73,8 +75,14 @@ func EffectiveSystemPrompt(prompt string) string {
 const AgentRules = `## Evidence
 - Facts about the user's data come from tools, not from your own knowledge: the
   corpus is the authority even when you "know" a conflicting fact.
-- Read before you conclude: a snippet locates evidence, only the full passage
-  proves it.
+- Material that already carries its verbatim quote is evidence in hand: cite it
+  and move on. Re-reading a document to confirm a quote you already hold spends
+  a round on words you have.
+- Material that carries only a snippet is a POINTER, not evidence: open it by
+  chunk id before deciding what it says — every pointer from one search at once
+  when the tool takes a list, since a read round can open them all. A list
+  assembled from snippets is a list of the chunks that ranked, not of the things
+  they contain.
 - Every statement backed by retrieved data ends with the handle the tool printed
   for that passage (e.g. [ID:n]). A factual claim without a handle reads as
   unsupported.
@@ -101,12 +109,14 @@ const AgentRules = `## Evidence
   shows; if part of the range is uncovered, say which part. That sentence makes
   the answer honest — it is not a failure, and it is not a reason to keep
   searching: a total invented from a partial search is the failure.
-- A hit whose snippet does not carry the fact you need (a name, a number, the end
-  of the sentence) is a POINTER, not evidence. Open it by chunk id with the
-  deep-read tool and read the chunks around it before deciding what it says. A
-  list assembled from snippets is a list of the chunks that ranked, not of the
-  things they contain — and one more search page is not a substitute for reading
-  the passage.`
+- One more search page is not a substitute for reading the passage, and one more
+  read is not a substitute for material that already carries its quote.
+- A round that calls a tool says nothing else: no restated plan, no progress
+  note, no recap of the result just read. Text written before a tool call never
+  reaches the answer, and it is paid for at the same rate as answer text — on one
+  enumeration the same model emitted several thousand tokens per working round
+  here against a few hundred in the pipeline this loop replaces, and that output
+  was most of the wall clock. Speak in the round that answers.`
 
 // EnvironmentSection describes where and when the run happens.
 //

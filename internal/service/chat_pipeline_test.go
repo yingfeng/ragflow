@@ -138,6 +138,41 @@ func TestBuildChatConfig_GenerationConfigReachesModel(t *testing.T) {
 	}
 }
 
+// TestBuildChatConfig_ThinkingString pins the string form of the switch. The
+// chat dialog writes "enabled"/"disabled" while the agent LLM component writes a
+// bool; reading only the bool dropped the parameter from the request, so the
+// provider applied its own default and the run paid for reasoning nobody asked
+// for (~2000 completion tokens per working round on the harness path against
+// ~440 on the path that translates the string).
+func TestBuildChatConfig_ThinkingString(t *testing.T) {
+	for _, tc := range []struct {
+		stored string
+		want   bool
+	}{
+		{"disabled", false},
+		{"enabled", true},
+		{" Disabled ", false},
+		{"off", false},
+		{"on", true},
+	} {
+		chat := dialForTest("llm-1")
+		chat.LLMSetting = entity.JSONMap{"thinking": tc.stored}
+		cfg := BuildChatConfig(chat, nil)
+		if cfg.Thinking == nil {
+			t.Fatalf("thinking=%q: parameter was dropped from the request", tc.stored)
+		}
+		if *cfg.Thinking != tc.want {
+			t.Fatalf("thinking=%q: want %v, got %v", tc.stored, tc.want, *cfg.Thinking)
+		}
+	}
+	// An unrecognised string stays unset rather than guessing a default.
+	chat := dialForTest("llm-1")
+	chat.LLMSetting = entity.JSONMap{"thinking": "auto"}
+	if cfg := BuildChatConfig(chat, nil); cfg.Thinking != nil {
+		t.Fatalf("thinking=auto: want it left unset, got %v", *cfg.Thinking)
+	}
+}
+
 // --- P1 Timer + decorateAnswer tests (P0/P1/P7 surface) ---
 
 // TestDecorateAnswer_TimerFormatAlwaysEmitted pins the Markdown

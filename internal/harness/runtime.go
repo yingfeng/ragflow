@@ -363,8 +363,10 @@ func registerCapabilities(ctx context.Context, registry *toolkit.Registry, cfg R
 	// Skills are always registered: the built-in set (the retrieval policy that
 	// every turn runs under) ships with the binary, so a deployment without a
 	// skills directory still has policy. Installed skills layer over it, and the
-	// agent's selection narrows only that installed layer.
-	if err := registry.Register(skill.New(skillLayers(cfg))); err != nil {
+	// agent's selection narrows only that installed layer. The capability decides
+	// whether its catalog tools are offered at all, so a run whose only skills are
+	// auto_load policies gets the policy without the discovery round.
+	if err := registry.Register(skill.New(ctx, skillLayers(cfg))); err != nil {
 		return nil, err
 	}
 	if cfg.Interactor != nil {

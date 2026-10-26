@@ -9,6 +9,7 @@ import (
 	"ragflow/internal/common"
 	"ragflow/internal/entity"
 	providermodel "ragflow/internal/entity/models"
+	"ragflow/internal/harness/agent/definition"
 	"ragflow/internal/harness/agent/loop"
 	harnessmodel "ragflow/internal/harness/agent/model"
 )
@@ -369,6 +370,88 @@ func TestHarnessTurnCarriesTheChatFailoverModels(t *testing.T) {
 	}
 }
 
+// TestHarnessTurnCarriesTheChatGenerationSettings pins that the conversation's
+// llm_setting reaches the harness run. It used to stop at the naive and agentic
+// paths, so turning thinking off in the UI changed nothing here and the catalog
+// default (adaptive for MiniMax-M3) kept every round reasoning.
+func TestHarnessTurnCarriesTheChatGenerationSettings(t *testing.T) {
+	executor := &fakeHarnessTurn{result: harnessTurnResult{Answer: "ok"}}
+	svc := &ChatPipelineService{harness: executor}
+	chat := harnessTestChat()
+	chat.LLMSetting = entity.JSONMap{
+		"temperature": 0.5,
+		"max_tokens":  512,
+		"thinking":    false,
+	}
+
+	out, err := svc.harnessTurn(context.Background(), "user-1", chat, []map[string]interface{}{
+		{"role": "user", "content": "hi"},
+	}, false, nil)
+	if err != nil {
+		t.Fatalf("harnessTurn: %v", err)
+	}
+	collectChatResults(t, out)
+
+	req := executor.calls[0]
+	if req.Sampling == nil {
+		t.Fatalf("Sampling = nil, want the chat's generation settings")
+	}
+	if req.Sampling.Temperature == nil || *req.Sampling.Temperature != 0.5 {
+		t.Errorf("temperature = %v, want 0.5", req.Sampling.Temperature)
+	}
+	if req.Sampling.Thinking == nil || *req.Sampling.Thinking {
+		t.Errorf("thinking = %v, want an explicit false", req.Sampling.Thinking)
+	}
+	if req.MaxOutputTokens != 512 {
+		t.Errorf("max output tokens = %d, want 512", req.MaxOutputTokens)
+	}
+}
+
+// TestHarnessTurnLeavesGenerationUnpinnedWithoutChatSettings: a chat that pins
+// nothing must keep the catalog defaults rather than pinning zero values.
+func TestHarnessTurnLeavesGenerationUnpinnedWithoutChatSettings(t *testing.T) {
+	executor := &fakeHarnessTurn{result: harnessTurnResult{Answer: "ok"}}
+	svc := &ChatPipelineService{harness: executor}
+
+	out, err := svc.harnessTurn(context.Background(), "user-1", harnessTestChat(), []map[string]interface{}{
+		{"role": "user", "content": "hi"},
+	}, false, nil)
+	if err != nil {
+		t.Fatalf("harnessTurn: %v", err)
+	}
+	collectChatResults(t, out)
+
+	req := executor.calls[0]
+	if req.Sampling != nil || req.MaxOutputTokens != 0 {
+		t.Fatalf("sampling = %+v, max output tokens = %d, want both unset", req.Sampling, req.MaxOutputTokens)
+	}
+}
+
+// TestMergeSamplingLetsTheAgentPinWinPerField: pinning one field on the agent
+// must not freeze the controls its users still own.
+func TestMergeSamplingLetsTheAgentPinWinPerField(t *testing.T) {
+	chatTemperature := 0.4
+	pinnedTemperature := 0.0
+	chatThinking := false
+	merged := mergeSampling(
+		&definition.SamplingConfig{Temperature: &chatTemperature, Thinking: &chatThinking},
+		&definition.SamplingConfig{Temperature: &pinnedTemperature},
+	)
+	if merged.Temperature == nil || *merged.Temperature != pinnedTemperature {
+		t.Errorf("temperature = %v, want the agent's pin", merged.Temperature)
+	}
+	if merged.Thinking == nil || *merged.Thinking {
+		t.Errorf("thinking = %v, want the chat's setting", merged.Thinking)
+	}
+
+	if got := mergeSampling(nil, nil); got != nil {
+		t.Errorf("mergeSampling(nil, nil) = %+v, want nil", got)
+	}
+	if got := mergeSampling(&definition.SamplingConfig{}, nil); got == nil {
+		t.Error("mergeSampling(chat, nil) dropped the chat settings")
+	}
+}
+
 func TestHarnessTurnErrorMessageExplainsAProviderFailure(t *testing.T) {
 	// The production text: internal node names with the provider's own message
 	// buried inside.
@@ -386,6 +469,27 @@ func TestHarnessTurnErrorMessageExplainsAProviderFailure(t *testing.T) {
 	}
 	if !strings.Contains(message, "settings") {
 		t.Errorf("message = %q, want an actionable next step", message)
+	}
+}
+
+func TestHarnessTurnErrorMessageAsksResendWhenTheStreamStops(t *testing.T) {
+	// The production text: the provider closed the stream before its terminal
+	// frame, so nothing is wrong with the chat's configuration and switching
+	// models is not the fix.
+	err := errors.New(`all 1 tasks failed in step 8:  think=*pregel.RetryExhaustedError(node think failed after 3 attempts: loop: model call failed: stream ended before [DONE] or finish_reason (events=4 choices_events=3 content_chunks=0))`)
+
+	message := harnessTurnErrorMessage(err)
+	if !strings.Contains(message, "stopped before the answer was complete") {
+		t.Errorf("message = %q, want the cause", message)
+	}
+	if !strings.Contains(message, "Send the message again") {
+		t.Errorf("message = %q, want a resend as the next step", message)
+	}
+	if strings.Contains(message, "settings") {
+		t.Errorf("message = %q, did not stop a dropped stream from reading as a config problem", message)
+	}
+	if strings.Contains(message, "pregel") || strings.Contains(message, "tasks failed") {
+		t.Errorf("message = %q, leaked harness internals", message)
 	}
 }
 

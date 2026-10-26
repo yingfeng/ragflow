@@ -70,6 +70,46 @@ func TestBundledCarriesTheRetrievalPolicy(t *testing.T) {
 	}
 }
 
+// TestCatalogToolsNeedSomethingToDiscover: with only auto_load policies the
+// catalog answers "no skills installed", so the discovery tools are not offered
+// at all — their schemas and the round spent calling them buy nothing.
+func TestCatalogToolsNeedSomethingToDiscover(t *testing.T) {
+	autoOnly := New(context.Background(), mapLoader{
+		"policy": {Name: "policy", AutoLoad: true, Body: "always apply this"},
+	})
+	if tools := autoOnly.Tools(); len(tools) != 0 {
+		t.Fatalf("tools = %v, want none when every skill is auto_load", tools)
+	}
+
+	withProcedure := New(context.Background(), mapLoader{
+		"policy":    {Name: "policy", AutoLoad: true, Body: "always apply this"},
+		"procedure": {Name: "procedure", Body: "load me on demand"},
+	})
+	offered := make(map[string]struct{}, 2)
+	for _, spec := range withProcedure.Tools() {
+		offered[spec.Name] = struct{}{}
+	}
+	for _, want := range []string{"skill_list", "skill_load"} {
+		if _, ok := offered[want]; !ok {
+			t.Errorf("tools = %v, want %s once a procedure is installed", offered, want)
+		}
+	}
+}
+
+// TestBundledSetIsPolicyWithoutCatalog pins the deployment's own skill set: the
+// retrieval policy stays in the system prompt, and nothing else is offered. A
+// chat turn measured 16 rounds this way is the baseline this guards.
+func TestBundledSetIsPolicyWithoutCatalog(t *testing.T) {
+	capability := New(context.Background(), MergedLoader{Layers: []Loader{Bundled()}})
+	if tools := capability.Tools(); len(tools) != 0 {
+		t.Fatalf("tools = %v, want none for the bundled set alone", tools)
+	}
+	note := capability.SystemNote(context.Background())
+	if !strings.Contains(note, "## Retrieval tools") || !strings.Contains(note, "list_chunks") {
+		t.Fatalf("note lost the bundled retrieval policy: %q", note)
+	}
+}
+
 func TestBundledRejectsTraversal(t *testing.T) {
 	for _, name := range []string{"../bundled/retrieval", "a/b", "", ".."} {
 		if _, err := Bundled().Load(context.Background(), name); err == nil {
@@ -160,7 +200,7 @@ func TestSelectedLoaderIsACatalogGate(t *testing.T) {
 // TestSystemNoteCarriesOnlyAutoLoadedBodies: the note is paid for on every
 // round, so a procedure must stay behind skill_load.
 func TestSystemNoteCarriesOnlyAutoLoadedBodies(t *testing.T) {
-	capability := New(mapLoader{
+	capability := New(context.Background(), mapLoader{
 		"policy":    {Name: "policy", AutoLoad: true, Body: "always apply this"},
 		"procedure": {Name: "procedure", Body: "load me on demand"},
 	})
@@ -178,7 +218,7 @@ func TestSystemNoteCarriesOnlyAutoLoadedBodies(t *testing.T) {
 // out, and the order does not depend on map iteration.
 func TestSystemNoteIsBoundedAndStable(t *testing.T) {
 	huge := strings.Repeat("x", MaxSystemNoteChars*2)
-	capability := New(mapLoader{
+	capability := New(context.Background(), mapLoader{
 		"a": {Name: "a", AutoLoad: true, Body: huge},
 		"b": {Name: "b", AutoLoad: true, Body: huge},
 	})

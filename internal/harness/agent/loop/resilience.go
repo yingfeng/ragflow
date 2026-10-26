@@ -83,6 +83,15 @@ var retryableMarkers = []string{
 	"502",
 	"503",
 	"504",
+	// A stream that stops before its terminal frame is a transport failure, not
+	// an answer: the provider closed the response without [DONE] or
+	// finish_reason. Replaying it is free while nothing has reached the sinks,
+	// and callModelStreamingWith already refuses to replay once text was shown —
+	// without these markers a single dropped stream failed the whole run.
+	"stream ended before",
+	"stream ended prematurely",
+	"incomplete stream",
+	"unexpected eof",
 }
 
 var promptTooLongMarkers = []string{

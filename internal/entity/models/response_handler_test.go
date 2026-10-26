@@ -79,3 +79,49 @@ func TestHandleStreamingResponseTruncatedStream(t *testing.T) {
 		t.Fatalf("expected truncation error, got %v", err)
 	}
 }
+
+// TestHandleStreamingResponseTerminalChoiceWithoutDelta verifies the terminal
+// frame is recognised even when the choice carries nothing but finish_reason.
+// MiniMax closes a stream with finish_reason and no [DONE], and that last frame
+// is not required to repeat an empty delta; reading the delta first turned every
+// such completed stream into a truncation error.
+func TestHandleStreamingResponseTerminalChoiceWithoutDelta(t *testing.T) {
+	cases := map[string]string{
+		"no delta key":     "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n",
+		"null delta":       "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: {\"choices\":[{\"delta\":null,\"finish_reason\":\"stop\"}]}\n",
+		"tool_calls":       "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n",
+		"second choice":    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}},{\"finish_reason\":\"stop\"}]}\n",
+		"usage only first": "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n",
+	}
+	for name, sse := range cases {
+		t.Run(name, func(t *testing.T) {
+			var content []string
+			err := HandleStreamingResponse(
+				io.NopCloser(bytes.NewBufferString(sse)),
+				nil,
+				nil,
+				OpenAIParserConfig,
+				func(answer *string, _ *string) error {
+					if answer != nil && *answer != "" {
+						content = append(content, *answer)
+					}
+					return nil
+				},
+			)
+			if name == "usage only first" {
+				// A trailing usage chunk is not a terminal mark: the answer is
+				// still incomplete without [DONE] or finish_reason.
+				if err == nil {
+					t.Fatal("a usage-only trailing chunk was accepted as a terminal frame")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("HandleStreamingResponse: %v", err)
+			}
+			if got := strings.Join(content, ""); got != "hi[DONE]" {
+				t.Errorf("content=%q, want the streamed answer then [DONE]", got)
+			}
+		})
+	}
+}

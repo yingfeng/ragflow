@@ -132,10 +132,17 @@ type harnessTurnRequest struct {
 	// FallbackModelRefs are the chat's configured failover models, tried in
 	// order when the primary one fails.
 	FallbackModelRefs []string
-	Question          string
-	History           []harnessmodel.Message
-	Datasets          []string
-	WebSearch         agentic_rag.WebSearchFunc
+	// Sampling is the conversation's generation settings, read from the chat's
+	// llm_setting. It is the base the agent definition's own pin overrides, the
+	// same rule the agentic path applies to a template pin: one conversation
+	// switch has to mean the same thing on every path.
+	Sampling *definition.SamplingConfig
+	// MaxOutputTokens caps one completion, from the same llm_setting.
+	MaxOutputTokens int
+	Question        string
+	History         []harnessmodel.Message
+	Datasets        []string
+	WebSearch       agentic_rag.WebSearchFunc
 	// OnApproval reports a tool call that needs a human. The run blocks while the
 	// verdict is outstanding, so the callback must return immediately.
 	OnApproval func(event harnessApprovalEvent)
@@ -208,6 +215,54 @@ func harnessModelChain(ctx context.Context, resolver harness.ModelResolver, req 
 	return failoverCompleter{models: models}, nil
 }
 
+// chatGeneration reads the conversation's generation settings for a harness run.
+// It goes through BuildChatConfig so the chat's llm_setting means the same thing
+// here as on the naive and agentic paths; a switch that only moves two of three
+// paths is a switch the user cannot trust.
+func chatGeneration(chat *entity.Chat) (*definition.SamplingConfig, int) {
+	cfg := BuildChatConfig(chat, nil)
+	if cfg == nil {
+		return nil, 0
+	}
+	sampling := &definition.SamplingConfig{
+		Temperature: cfg.Temperature,
+		TopP:        cfg.TopP,
+		Thinking:    cfg.Thinking,
+	}
+	if sampling.Temperature == nil && sampling.TopP == nil && sampling.Thinking == nil {
+		sampling = nil
+	}
+	maxTokens := 0
+	if cfg.MaxTokens != nil {
+		maxTokens = *cfg.MaxTokens
+	}
+	return sampling, maxTokens
+}
+
+// mergeSampling layers the conversation's settings under the agent definition's
+// own pin: a field the agent pins is the agent's, everything else follows the
+// chat. Without this, pinning sampling on an agent would also freeze the
+// controls its users expect to own.
+func mergeSampling(chat, pinned *definition.SamplingConfig) *definition.SamplingConfig {
+	if pinned == nil {
+		return chat
+	}
+	if chat == nil {
+		return pinned
+	}
+	merged := *pinned
+	if merged.Temperature == nil {
+		merged.Temperature = chat.Temperature
+	}
+	if merged.TopP == nil {
+		merged.TopP = chat.TopP
+	}
+	if merged.Thinking == nil {
+		merged.Thinking = chat.Thinking
+	}
+	return &merged
+}
+
 // harnessTurnErrorMessage turns a run failure into something a user can act on.
 //
 // The raw text names the harness's own nodes ("all 1 tasks failed in step 1:
@@ -222,6 +277,10 @@ func harnessTurnErrorMessage(err error) string {
 	lower := strings.ToLower(message)
 
 	var cause string
+	// advice is what the user should do next. It follows the cause because a
+	// dropped stream is worth resending, while a quota or credential failure is
+	// not: resending only spends the same error again.
+	advice := "Choose another model in this chat's settings and send again."
 	switch {
 	case strings.Contains(lower, "insufficient balance"), strings.Contains(lower, "insufficient_quota"),
 		strings.Contains(lower, "quota exceeded"), strings.Contains(lower, "no remaining"):
@@ -233,6 +292,10 @@ func harnessTurnErrorMessage(err error) string {
 		cause = "the selected model is rate limited"
 	case strings.Contains(lower, "timeout"), strings.Contains(lower, "deadline exceeded"):
 		cause = "the selected model did not answer in time"
+	case strings.Contains(lower, "stream ended before"), strings.Contains(lower, "stream ended prematurely"),
+		strings.Contains(lower, "incomplete stream"):
+		cause = "the selected model's response stream stopped before the answer was complete"
+		advice = "Send the message again."
 	}
 	if cause == "" {
 		// Nothing recognisable: hand over the original rather than hide it.
@@ -242,7 +305,7 @@ func harnessTurnErrorMessage(err error) string {
 	if detail := providerErrorText(message); detail != "" {
 		cause = fmt.Sprintf("%s (%s)", cause, detail)
 	}
-	return cause + ". Choose another model in this chat's settings and send again."
+	return cause + ". " + advice
 }
 
 // providerErrorText keeps the provider's own wording: it is what tells an
@@ -345,10 +408,14 @@ func (harnessRuntimeExecutor) Run(ctx context.Context, req harnessTurnRequest) (
 		AgentVersionID: resolved.VersionID,
 		AgentName:      resolved.Definition.Name,
 		SystemPrompt:   prompt,
-		Sampling:       resolved.Definition.Sampling,
-		PolicyConfig:   resolved.Definition.Policy,
-		MaxRounds:      resolved.Definition.Policy.MaxRounds,
-		SkillsRoot:     harnessSettings.SkillsRoot,
+		// The conversation's settings are the base; the agent's own pin wins
+		// field by field, so a pinned agent stays reproducible while an
+		// unpinned one follows the chat.
+		Sampling:        mergeSampling(req.Sampling, resolved.Definition.Sampling),
+		MaxOutputTokens: req.MaxOutputTokens,
+		PolicyConfig:    resolved.Definition.Policy,
+		MaxRounds:       resolved.Definition.Policy.MaxRounds,
+		SkillsRoot:      harnessSettings.SkillsRoot,
 		// Skills come from the caller's own skillspace, narrowed to what this
 		// agent selected. The built-in retrieval policy applies regardless.
 		SkillLoader:   NewHarnessSkillLoader(req.UserID, req.TenantID),
@@ -553,6 +620,10 @@ func (s *ChatPipelineService) harnessTurn(
 			})
 		}
 
+		// The turn runs under the chat's generation settings, not the model
+		// catalog's defaults: a switch the naive and agentic paths honour has to
+		// bind this path too.
+		sampling, maxOutputTokens := chatGeneration(chat)
 		result, err := executor.Run(turnCtx, harnessTurnRequest{
 			TenantID:  chat.TenantID,
 			UserID:    userID,
@@ -562,6 +633,8 @@ func (s *ChatPipelineService) harnessTurn(
 			// The chat's own failover list, so a dead provider costs one call
 			// here exactly as it does on the agentic path.
 			FallbackModelRefs: agenticFailoverModelIDs(chat),
+			Sampling:          sampling,
+			MaxOutputTokens:   maxOutputTokens,
 			Question:          question,
 			History:           history,
 			Datasets:          datasets,
