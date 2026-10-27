@@ -380,6 +380,12 @@ export default {
   fetchVersionList: (id: string) => `${restAPIv1}/agents/${id}/versions`,
   fetchVersion: (agentId: string, versionId: string) =>
     `${restAPIv1}/agents/${agentId}/versions/${versionId}`,
+  deleteVersion: (agentId: string, versionId: string) =>
+    `${restAPIv1}/agents/${agentId}/versions/${versionId}`,
+  updateVersion: (agentId: string, versionId: string) =>
+    `${restAPIv1}/agents/${agentId}/versions/${versionId}`,
+  applyVersion: (agentId: string, versionId: string) =>
+    `${restAPIv1}/agents/${agentId}/versions/${versionId}/apply`,
   getAgent: (id: string) => `${restAPIv1}/agents/${id}`,
   uploadAgentFile: (id?: string) => `${restAPIv1}/agents/${id}/upload`,
   createAgentSession: (agentId: string) =>

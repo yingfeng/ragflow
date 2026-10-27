@@ -66,9 +66,11 @@ import (
 // version (it falls through to GetLatest).
 func makeCanvasWithDSL(t *testing.T, canvasID, userID, tenantID, versionID string, dsl map[string]any) {
 	t.Helper()
-	dao.DB.Create(&entity.User{ID: userID, Nickname: "owner", Email: userID + "@test.com"})
-	dao.DB.Create(&entity.Tenant{ID: tenantID, Name: sptr(tenantID)})
-	dao.DB.Create(&entity.UserTenant{ID: tenantID + "-" + userID, UserID: userID, TenantID: tenantID, Role: "owner", Status: sptr("1")})
+	dao.DB.Where("id = ?", userID).FirstOrCreate(&entity.User{ID: userID, Nickname: "owner", Email: userID + "@test.com"})
+	dao.DB.Where("id = ?", tenantID).FirstOrCreate(&entity.Tenant{ID: tenantID, Name: sptr(tenantID)})
+	dao.DB.Where("user_id = ? AND tenant_id = ?", userID, tenantID).FirstOrCreate(&entity.UserTenant{
+		ID: tenantID + "-" + userID, UserID: userID, TenantID: tenantID, Role: "owner", Status: sptr("1"),
+	})
 	dao.DB.Create(&entity.UserCanvas{
 		ID:             canvasID,
 		UserID:         userID,
@@ -546,20 +548,21 @@ func TestRunAgent_RealCanvas_WaitForUserResume(t *testing.T) {
 					"component_name": "Begin",
 					"params":         map[string]any{},
 				},
-				"downstream": []any{"message_0"},
+				"downstream": []any{"user_fill_up_0"},
 			},
 			"message_0": map[string]any{
 				"obj": map[string]any{
 					"component_name": "Message",
 					"params":         map[string]any{"text": "got: {{user_fill_up_0@user_input}}"},
 				},
-				"upstream": []any{"begin_0", "user_fill_up_0"},
+				"upstream": []any{"user_fill_up_0"},
 			},
 			"user_fill_up_0": map[string]any{
 				"obj": map[string]any{
 					"component_name": "UserFillUp",
 					"params":         map[string]any{"enable_tips": true},
 				},
+				"upstream":   []any{"begin_0"},
 				"downstream": []any{"message_0"},
 			},
 		},
@@ -780,6 +783,7 @@ func TestRunAgent_RealCanvas_WaitForUserResume_EventSemantics(t *testing.T) {
 					"component_name": "UserFillUp",
 					"params":         map[string]any{"enable_tips": true},
 				},
+				"upstream":   []any{"begin_0"},
 				"downstream": []any{"message_0"},
 			},
 			"message_0": map[string]any{
@@ -787,7 +791,7 @@ func TestRunAgent_RealCanvas_WaitForUserResume_EventSemantics(t *testing.T) {
 					"component_name": "Message",
 					"params":         map[string]any{"text": "got: {{user_fill_up_0@user_input}}"},
 				},
-				"upstream": []any{"begin_0", "user_fill_up_0"},
+				"upstream": []any{"user_fill_up_0"},
 			},
 		},
 		"path": []any{"begin_0", "user_fill_up_0", "message_0"},
