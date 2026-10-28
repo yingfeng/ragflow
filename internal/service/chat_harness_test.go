@@ -206,7 +206,32 @@ func TestHarnessTurnRejectsAConversationWithoutAQuestion(t *testing.T) {
 	}
 }
 
+// seedHarnessChatDatasets makes the thread's datasets reachable for its user.
+// AsyncChat validates dataset access before it dispatches, so a fixture that
+// names datasets without seeding them reads as a denied request.
+func seedHarnessChatDatasets(t *testing.T) {
+	t.Helper()
+
+	db := setupServiceTestDB(t)
+	pushServiceDB(t, db)
+	status := string(entity.StatusValid)
+	if err := db.Create(&entity.UserTenant{
+		ID: "member-user-1", UserID: "user-1", TenantID: "tenant-1", Role: "owner", Status: &status,
+	}).Error; err != nil {
+		t.Fatalf("seed tenant membership: %v", err)
+	}
+	for _, id := range []string{"kb-1", "kb-2"} {
+		if err := db.Create(&entity.Knowledgebase{
+			ID: id, TenantID: "tenant-1", CreatedBy: "user-1", Name: id,
+			ChunkNum: 1, Permission: string(entity.TenantPermissionMe), Status: &status,
+		}).Error; err != nil {
+			t.Fatalf("seed dataset %s: %v", id, err)
+		}
+	}
+}
+
 func TestAsyncChatRoutesAnAgentThreadToTheHarness(t *testing.T) {
+	seedHarnessChatDatasets(t)
 	executor := &fakeHarnessTurn{result: harnessTurnResult{Answer: "agent answer"}}
 	svc := &ChatPipelineService{harness: executor}
 
