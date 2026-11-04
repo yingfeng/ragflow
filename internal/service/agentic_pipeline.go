@@ -107,7 +107,7 @@ func (s *ChatPipelineService) agenticRag(
 	go func() {
 		defer close(out)
 
-		runCtx, cancel := context.WithTimeout(ctx, agenticRunTimeout)
+		runCtx, cancel := context.WithTimeoutCause(ctx, agenticRunTimeout, fmt.Errorf("agentic run timed out after %s", agenticRunTimeout))
 		defer cancel()
 		// The run's evidence registry: every tool result stamps its passages with
 		// the [ID:n] handle the model cites, and buildAgenticReference resolves
@@ -128,9 +128,8 @@ func (s *ChatPipelineService) agenticRag(
 		}
 		// Per-turn token accounting. Every LLM call inside the run records its
 		// usage into this sink (models.EinoChatModel does it for both the
-		// non-streaming and streaming paths), which is the only place the cost of
-		// an agentic turn exists: chat completions carries no usage field, so a
-		// caller cannot recover it from the answer.
+		// non-streaming and streaming paths). Its totals are emitted on the final
+		// result and stored with the assistant message.
 		runCtx = tokenizer.WithRunUsage(runCtx)
 		runCtx = tokenizer.WithRunAttrs(runCtx, &tokenizer.RunAttrs{UserID: userID})
 		turnStarted := time.Now()
@@ -142,8 +141,8 @@ func (s *ChatPipelineService) agenticRag(
 		// its compile step; the agentic path has no canvas, so attach it here.
 		runState := runtime.NewCanvasState("", chat.ID)
 		if userID != "" {
-			runState.Sys["user_id"] = userID
-			runState.Sys["tenant_id"] = chat.TenantID
+			runState.SetSys("user_id", userID)
+			runState.SetSys("tenant_id", chat.TenantID)
 		}
 		runCtx = runtime.WithState(runCtx, runState)
 		// A result is abandoned only when the CALLER is gone. runCtx is not the
@@ -153,7 +152,7 @@ func (s *ChatPipelineService) agenticRag(
 		// answer the run had just built and shipped an empty reply. Delivery is
 		// tried first and unconditionally, because out is buffered and the
 		// consumer always drains it.
-		emitResult := func(result AsyncChatResult) bool {
+		sendResult := func(result AsyncChatResult) bool {
 			select {
 			case out <- result:
 				return true
@@ -165,6 +164,32 @@ func (s *ChatPipelineService) agenticRag(
 			case <-ctx.Done():
 				return false
 			}
+		}
+		var answerFilter, reasoningFilter citationStreamFilter
+		emitResult := func(result AsyncChatResult) bool {
+			if !quote {
+				// Flush before a boundary so buffered text stays in its section.
+				if result.StartToThink || result.EndToThink || result.Final {
+					if text := reasoningFilter.flush(); text != "" {
+						if !sendResult(AsyncChatResult{Reasoning: text}) {
+							return false
+						}
+					}
+					if text := answerFilter.flush(); text != "" {
+						if !sendResult(AsyncChatResult{Answer: text}) {
+							return false
+						}
+					}
+				}
+				if !result.Final && (result.Answer != "" || result.Reasoning != "") {
+					result.Answer = answerFilter.write(result.Answer)
+					result.Reasoning = reasoningFilter.write(result.Reasoning)
+					if result.Answer == "" && result.Reasoning == "" {
+						return true
+					}
+				}
+			}
+			return sendResult(result)
 		}
 
 		chain, chainErr := s.agenticModelChain(runCtx, userID, chat)
@@ -294,7 +319,7 @@ func (s *ChatPipelineService) agenticRag(
 				zap.Any("tool_errors", toolErrors),
 				zap.String("error", runErr.Error()),
 			}, usageFields...)...)
-			emitResult(AsyncChatResult{Answer: fmt.Sprintf("**ERROR**: %s", runErr.Error()), Final: true})
+			emitResult(AsyncChatResult{Answer: fmt.Sprintf("**ERROR**: %s", runtime.MarkdownSafeErrorText(runErr)), Final: true})
 			return
 		}
 		common.InfoCtx(ctx, "agentic turn done", append([]zap.Field{
@@ -308,7 +333,7 @@ func (s *ChatPipelineService) agenticRag(
 
 		// Citations off means neither the [ID:N] markers nor the reference
 		// payload, matching what the regular pipeline ships when quote is
-		// false. The answer text is still whatever the agent wrote.
+		// false.
 		answer := final
 		if reasoning.Len() > 0 {
 			answer = agentSessionMessageContent("\n\n"+final, reasoning.String())
@@ -316,8 +341,11 @@ func (s *ChatPipelineService) agenticRag(
 		reference := map[string]interface{}{}
 		if quote {
 			reference, answer = s.buildAgenticReference(ctx, chat.TenantID, chatDatasetIDs(chat), answer, registry)
-		} else if len(agentic_rag.CitedIDsFromMarkers(answer, registry)) > 0 || len(agentic_rag.ExtractCitedChunkIDs(answer)) > 0 {
-			common.InfoCtx(ctx, "agentic citations suppressed by quote=false")
+		} else {
+			if len(agentic_rag.CitedIDsFromMarkers(answer, registry)) > 0 || len(agentic_rag.ExtractCitedChunkIDs(answer)) > 0 {
+				common.InfoCtx(ctx, "agentic citations suppressed by quote=false")
+			}
+			answer = stripCitations(answer)
 		}
 		// What the turn cost, on the wire for the same reason the log line
 		// exists: nothing else tells the client. The chat page renders it under
@@ -346,11 +374,10 @@ func (s *ChatPipelineService) agenticRag(
 
 // agenticUsageFields renders a turn's LLM cost as structured log fields.
 //
-// The chat-completions response carries no usage, and conversation storage has
-// no token column, so this log line is the only per-question cost record: it is
-// what a benchmark run aggregates and what a support investigation greps. The
-// per-call breakdown goes to the debug log to keep the INFO line one line per
-// turn.
+// The final response and stored message carry token totals. The log also records
+// call counts and per-phase totals for benchmarks and support investigations.
+// The per-call breakdown goes to the debug log to keep the INFO line one line
+// per turn.
 //
 // usage_missing_calls counts calls whose provider reported no usable split.
 // They are counted rather than silently folded into the totals, so "cheap"
@@ -417,7 +444,7 @@ func agenticUsageFields(ctx context.Context, usage *tokenizer.RunUsage) []zap.Fi
 // model choice to every chat model owned by the tenant: a failover chain is
 // exactly the list the dialog's author chose, and nothing else.
 func (s *ChatPipelineService) agenticModelChain(ctx context.Context, userID string, chat *entity.Chat) ([]*modelModule.ChatModel, error) {
-	access := ModelAccess{UserID: userID, TenantID: chat.TenantID}
+	access := Identity{UserID: userID, TenantID: chat.TenantID}
 	primary, err := s.agenticPrimaryModel(ctx, access, chat)
 	if err != nil {
 		return nil, err
@@ -447,7 +474,7 @@ func (s *ChatPipelineService) agenticModelChain(ctx context.Context, userID stri
 
 // agenticPrimaryModel resolves the dialog's own model, or the tenant default
 // when it selected none.
-func (s *ChatPipelineService) agenticPrimaryModel(ctx context.Context, access ModelAccess, chat *entity.Chat) (*modelModule.ChatModel, error) {
+func (s *ChatPipelineService) agenticPrimaryModel(ctx context.Context, access Identity, chat *entity.Chat) (*modelModule.ChatModel, error) {
 	var (
 		model *modelModule.ChatModel
 		err   error

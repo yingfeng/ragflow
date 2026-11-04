@@ -103,9 +103,19 @@ func (l *HarnessSkillLoader) snapshot(ctx context.Context) (*skillSnapshot, erro
 // resolve walks every readable space and picks the current version of each
 // skill.
 func (l *HarnessSkillLoader) resolve(ctx context.Context) (*skillSnapshot, error) {
-	spaceIDs, err := accessibleSkillSpaceIDs(ctx, l.userID, permission.OperationRead)
+	scope, err := permission.NewDatabaseChecker(dao.DB).Scope(
+		permission.WithIdentity(ctx, l.userID, l.tenantID),
+		permission.ScopeQuery{
+			Kind:      permission.ResourceKindSkillSpace,
+			Operation: permission.OperationRead,
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("skill: list readable spaces: %w", err)
+	}
+	var spaceIDs []string
+	if scope.Mode == permission.ScopeIDs {
+		spaceIDs = scope.ResourceIDs
 	}
 	sort.Strings(spaceIDs)
 

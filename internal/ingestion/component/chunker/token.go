@@ -271,9 +271,28 @@ func decodeChunkerFromUpstream(inputs map[string]any) (schema.ChunkerFromUpstrea
 	if err := out.Validate(); err != nil {
 		return out, err
 	}
+	if err := validateUpstreamMediaRefs(out.JSONResult); err != nil {
+		return out, err
+	}
+	if err := validateUpstreamMediaRefs(out.Chunks); err != nil {
+		return out, err
+	}
 	materializeTableText(out.JSONResult)
 	materializeTableText(out.Chunks)
 	return out, nil
+}
+
+// validateUpstreamMediaRefs rejects any present but unusable reference at the
+// chunker input boundary. Chunkers merge items and keep only the first media
+// attachment, so validating when an item is consumed would make the failure
+// depend on input order; every present reference must be checked first.
+func validateUpstreamMediaRefs(items []schema.ChunkDoc) error {
+	for i := range items {
+		if ref := items[i].MediaRef; ref != nil && !ref.Valid() {
+			return fmt.Errorf("chunker: item %d has an invalid media_ref", i)
+		}
+	}
+	return nil
 }
 
 func stripChunkerRuntimeTimestamps(inputs map[string]any) map[string]any {
@@ -305,9 +324,21 @@ func cropTitleChunks(ctx context.Context, engine deepdoctype.PDFEngine, chunks [
 		normalizeTitleChunkMaps(chunks)
 		return chunks
 	}
+	for i := range docs {
+		// Only this bridge receives IDs finalized by the title-family
+		// builder. Mark them for the shared crop helper without extending
+		// ID trust to General/Token chunks decoded from upstream input.
+		if docs[i].ID != "" {
+			if docs[i].Extra == nil {
+				docs[i].Extra = make(map[string]json.RawMessage)
+			}
+			docs[i].Extra[titleMediaContextIDKey] = json.RawMessage("true")
+		}
+	}
 	cropped := cropImageChunks(ctx, engine, docs)
 	for i := range cropped {
 		clearStructuralLayout(&cropped[i])
+		delete(cropped[i].Extra, titleMediaContextIDKey)
 	}
 	return schema.ChunkDocsToMaps(cropped)
 }
@@ -664,8 +695,12 @@ func (c *TokenChunkerComponent) invokeJSONPayload(ctx context.Context, items []s
 		// context_below) then .strip() — so a context that carries nothing but
 		// a position tag counts as empty. The context is folded into Text once,
 		// at chunkOutputs, so the decision is made on that merged text here
-		// without duplicating the fold.
-		if strings.TrimSpace(removeTag(schema.ContextualText(m))) == "" {
+		// without duplicating the fold. Inline bytes, an uploaded ID or a
+		// deferred reference also make the chunk retrievable; dropping it here
+		// would lose the image before the materializer can resolve or reject it.
+		// Position-only media without a crop result is dropped here; crop above
+		// already attempted the on-demand PDF handoff.
+		if strings.TrimSpace(removeTag(schema.ContextualText(m))) == "" && !hasMediaPayload(m) {
 			continue
 		}
 		materialized = append(materialized, materializeMediaContext(m))
@@ -830,6 +865,7 @@ func buildChunkDoc(it schema.ChunkDoc, ckType, text, ctxAbove, ctxBelow string) 
 		PDFPositions: it.PDFPositions,
 		Positions:    it.Positions,
 		Image:        it.Image,
+		MediaRef:     it.MediaRef,
 		PageNumber:   it.PageNumber,
 		Sheet:        it.Sheet,
 		SheetIndex:   it.SheetIndex,

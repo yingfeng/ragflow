@@ -43,7 +43,7 @@ func NewHarnessModelResolver() harness.ModelResolver {
 func (r harnessModelResolver) Resolve(ctx context.Context, tenantID, userID, modelRef string) (harnessmodel.ChatCompleter, error) {
 	// The same access the pipeline builds for its own model calls: the user is
 	// part of it, because provider selection and API keys resolve per user.
-	access := ModelAccess{UserID: userID, TenantID: tenantID}
+	access := Identity{UserID: userID, TenantID: tenantID}
 	if modelRef == "" {
 		return r.factory.NewDefaultChatModel(ctx, access)
 	}

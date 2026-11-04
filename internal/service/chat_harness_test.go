@@ -234,8 +234,9 @@ func TestAsyncChatRoutesAnAgentThreadToTheHarness(t *testing.T) {
 	seedHarnessChatDatasets(t)
 	executor := &fakeHarnessTurn{result: harnessTurnResult{Answer: "agent answer"}}
 	svc := &ChatPipelineService{harness: executor}
+	ctx := serviceTestContext(t, "user-1", "tenant-1")
 
-	out, err := svc.AsyncChat(context.Background(), "user-1", harnessTestChat(), []map[string]interface{}{
+	out, err := svc.AsyncChat(ctx, "user-1", harnessTestChat(), []map[string]interface{}{
 		{"role": "user", "content": "hi"},
 	}, false, nil)
 	if err != nil {

@@ -42,12 +42,12 @@ func (h *HarnessAgentHandler) Register(group *gin.RouterGroup) {
 func (h *HarnessAgentHandler) getAgent(c *gin.Context) {
 	user, code, message := GetUser(c)
 	if code != common.CodeSuccess {
-		common.ErrorWithCode(c, code, message)
+		common.RespondError(c, code, message)
 		return
 	}
 	agentID := c.Param("agent_id")
 	if agentID == "" {
-		common.ResponseWithCodeData(c, common.CodeParamError, nil, "agent_id is required")
+		common.RespondError(c, common.CodeParamError, "agent_id is required")
 		return
 	}
 	detail, err := h.agents.Detail(c.Request.Context(), user.ID, agentID)
@@ -55,7 +55,7 @@ func (h *HarnessAgentHandler) getAgent(c *gin.Context) {
 		h.fail(c, err)
 		return
 	}
-	common.ResponseWithCodeData(c, common.CodeSuccess, detail, "")
+	common.RespondSuccess(c, detail, "")
 }
 
 // updateAgent replaces the definition with the body and answers with the version
@@ -63,17 +63,17 @@ func (h *HarnessAgentHandler) getAgent(c *gin.Context) {
 func (h *HarnessAgentHandler) updateAgent(c *gin.Context) {
 	user, code, message := GetUser(c)
 	if code != common.CodeSuccess {
-		common.ErrorWithCode(c, code, message)
+		common.RespondError(c, code, message)
 		return
 	}
 	agentID := c.Param("agent_id")
 	if agentID == "" {
-		common.ResponseWithCodeData(c, common.CodeParamError, nil, "agent_id is required")
+		common.RespondError(c, common.CodeParamError, "agent_id is required")
 		return
 	}
 	var body definition.Definition
 	if err := c.ShouldBindJSON(&body); err != nil {
-		common.ResponseWithCodeData(c, common.CodeParamError, nil, "invalid agent definition: "+err.Error())
+		common.RespondError(c, common.CodeParamError, "invalid agent definition: "+err.Error())
 		return
 	}
 	detail, err := h.agents.Update(c.Request.Context(), user.ID, agentID, user.ID, body)
@@ -81,7 +81,7 @@ func (h *HarnessAgentHandler) updateAgent(c *gin.Context) {
 		h.fail(c, err)
 		return
 	}
-	common.ResponseWithCodeData(c, common.CodeSuccess, detail, "")
+	common.RespondSuccess(c, detail, "")
 }
 
 // fail maps the service's errors onto the codes a client can act on. Validation
@@ -90,14 +90,14 @@ func (h *HarnessAgentHandler) updateAgent(c *gin.Context) {
 func (h *HarnessAgentHandler) fail(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound):
-		common.ResponseWithCodeData(c, common.CodeNotFound, nil, "agent not found")
+		common.RespondError(c, common.CodeNotFound, "agent not found")
 	case errors.Is(err, service.ErrAgentNameTaken):
-		common.ResponseWithCodeData(c, common.CodeDataError, nil, "agent name is already used")
+		common.RespondError(c, common.CodeDataError, "agent name is already used")
 	case errors.Is(err, service.ErrNoChange):
-		common.ResponseWithCodeData(c, common.CodeDataError, nil, "agent definition is unchanged")
+		common.RespondError(c, common.CodeDataError, "agent definition is unchanged")
 	case errors.Is(err, definition.ErrEmptyPrompt), errors.Is(err, definition.ErrEmptyName):
-		common.ResponseWithCodeData(c, common.CodeDataError, nil, err.Error())
+		common.RespondError(c, common.CodeDataError, err.Error())
 	default:
-		common.ResponseWithCodeData(c, common.CodeServerError, nil, err.Error())
+		common.RespondError(c, common.CodeServerError, err.Error())
 	}
 }

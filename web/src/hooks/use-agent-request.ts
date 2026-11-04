@@ -18,6 +18,7 @@ import { FileUploadProps } from '@/components/file-upload';
 import { useHandleFilterSubmit } from '@/components/list-filter-bar/use-handle-filter-submit';
 import message from '@/components/ui/message';
 import { AgentCategory, AgentGlobals } from '@/constants/agent';
+import { Permission } from '@/ee/constants/team';
 import { ListDeletionKey } from '@/constants/list-deletion';
 import { useFetchTenantInfo } from '@/hooks/use-user-setting-request';
 import {
@@ -34,10 +35,7 @@ import {
   ITraceData,
   IWebhookTrace,
 } from '@/interfaces/database/agent';
-import {
-  IAgentWebhookTraceRequest,
-  IDebugSingleRequestBody,
-} from '@/interfaces/request/agent';
+import { IAgentWebhookTraceRequest } from '@/interfaces/request/agent';
 import i18n from '@/locales/config';
 import { IInputs } from '@/pages/agent/interface';
 import { useGetSharedChatSearchParams } from '@/pages/next-chats/hooks/use-send-shared-message';
@@ -68,6 +66,8 @@ import {
   useGetPaginationWithRouter,
   useHandleSearchChange,
 } from './logic-hooks';
+import { useSessionList } from './use-session-list';
+import { PipelineVersionKeys } from './use-pipeline-version-request';
 
 export const enum AgentApiAction {
   FetchAgentListByPage = 'fetchAgentListByPage',
@@ -102,11 +102,14 @@ export const enum AgentApiAction {
   CreateAgentSession = 'createAgentSession',
   DeleteAgentSession = 'deleteAgentSession',
   FetchSessionByIdManually = 'fetchSessionByIdManually',
+  FetchCanvasPresence = 'fetchCanvasPresence',
+  JoinCanvasPresence = 'joinCanvasPresence',
+  HeartbeatCanvasPresence = 'heartbeatCanvasPresence',
+  LeaveCanvasPresence = 'leaveCanvasPresence',
   FetchAgentLog = 'fetchAgentLog',
   FetchSharedAgent = 'fetchSharedAgent',
   FetchAgentTags = 'fetchAgentTags',
   UpdateAgentTags = 'updateAgentTags',
-  FetchPipelineNodes = 'fetchPipelineNodes',
   FetchBuiltinPipelineList = 'fetchBuiltinPipelineList',
   FetchBuiltinPipelineDetail = 'fetchBuiltinPipelineDetail',
 }
@@ -141,6 +144,8 @@ export const AgentKeys = {
     [AgentApiAction.FetchInputForm, agentId, componentId] as const,
   versionList: (agentId?: string) =>
     [AgentApiAction.FetchVersionList, agentId] as const,
+  canvasVersionList: (canvasId?: string) =>
+    ['canvasVersionList', canvasId] as const,
   version: (agentId?: string, versionId?: string) =>
     [AgentApiAction.FetchVersion, agentId, versionId] as const,
 };
@@ -323,6 +328,9 @@ export const useUpdateAgentSetting = () => {
         queryClient.invalidateQueries({
           queryKey: AgentKeys.list(),
         });
+        queryClient.invalidateQueries({
+          queryKey: PipelineVersionKeys.catalog(),
+        });
       }
       return ret?.data?.code;
     },
@@ -346,6 +354,9 @@ export const useDeleteAgent = () => {
           queryKey: AgentKeys.list(),
         });
         queryClient.invalidateQueries({
+          queryKey: PipelineVersionKeys.catalog(),
+        });
+        queryClient.invalidateQueries({
           queryKey: AgentKeys.filters(),
         });
         queryClient.invalidateQueries({
@@ -353,7 +364,7 @@ export const useDeleteAgent = () => {
         });
         markListItemsDeleted(ListDeletionKey.AgentList);
       }
-      return data?.data ?? false;
+      return data?.code;
     },
   });
 
@@ -377,7 +388,7 @@ export const useFetchAgentTags = (canvasCategory?: string) => {
         },
         true,
       );
-      return data?.data ?? [];
+      return Array.isArray(data?.data) ? data.data : [];
     },
   });
   return { data, loading };
@@ -474,9 +485,9 @@ export const useResetAgent = () => {
 };
 
 // Every create flow (blank, template, JSON import, built-in pipeline copy)
-// navigates to the new canvas on success, and the list-page queries refetch on
-// remount (gcTime: 0) — so creation intentionally invalidates nothing.
+// navigates to the new canvas; invalidate the cached metadata catalog too.
 export const useCreateAgent = (showMessage: boolean = true) => {
+  const queryClient = useQueryClient();
   const {
     data,
     isPending: loading,
@@ -490,8 +501,11 @@ export const useCreateAgent = (showMessage: boolean = true) => {
       canvas_category?: string;
     }) => {
       const { data = {} } = await agentService.createAgent(params);
-      if (data.code === 0 && showMessage) {
-        message.success(i18n.t('message.created'));
+      if (data.code === 0) {
+        queryClient.invalidateQueries({
+          queryKey: PipelineVersionKeys.catalog(),
+        });
+        if (showMessage) message.success(i18n.t('message.created'));
       }
       return data;
     },
@@ -540,6 +554,11 @@ export const useSaveAgent = (
       if (data.code === 0) {
         if (showMessage) {
           message.success(i18n.t('message.modified'));
+        }
+        if (!params.autosave || params.release) {
+          queryClient.invalidateQueries({
+            queryKey: PipelineVersionKeys.catalog(),
+          });
         }
         // Every save can prune the oldest unpublished versions server-side,
         // so the version history list must refetch even when autosave skips
@@ -726,35 +745,6 @@ export const useTestDbConnect = () => {
   return { data, loading, testDbConnect: mutateAsync };
 };
 
-export const useDebugSingle = () => {
-  const { id } = useParams();
-  const {
-    data,
-    isPending: loading,
-    mutateAsync,
-  } = useMutation({
-    mutationKey: [AgentApiAction.DebugSingle],
-    mutationFn: async (params: IDebugSingleRequestBody) => {
-      const ret = await agentService.debugSingle(
-        {
-          agentId: id as string,
-          componentId: params.component_id,
-          data: {
-            params: params.params,
-          },
-        },
-        true,
-      );
-      if (ret?.data?.code !== 0) {
-        message.error(ret?.data?.message);
-      }
-      return ret?.data?.data;
-    },
-  });
-
-  return { data, loading, debugSingle: mutateAsync };
-};
-
 export const useFetchInputForm = (componentId?: string) => {
   const { id } = useParams();
 
@@ -799,30 +789,28 @@ export const useFetchVersionList = () => {
   return { data, loading };
 };
 
-// useFetchCanvasVersionList lists the published versions of an arbitrary canvas
-// (dataflow or agent) by id. Unlike useFetchVersionList it takes the canvas id
-// explicitly (not from route params) so the document pipeline dialog can load
-// versions for the currently selected dataflow canvas. The backend returns them
-// newest-first (design section 7/E1) and includes the free-text alias (A2/F1).
+// Row shape of a published canvas version, newest-first (design section 7/E1),
+// including the free-text alias (A2/F1).
+export interface ICanvasVersionRow {
+  id: string;
+  title: string;
+  created_at: string;
+  release?: boolean;
+  alias?: string;
+}
+
+// Lists versions for document status displays. Parser selection uses the
+// lightweight catalog instead. No initialData so pending and empty differ.
 export const useFetchCanvasVersionList = (canvasId?: string) => {
   const {
     data,
     isFetching: loading,
     isError,
-  } = useQuery<
-    Array<{
-      id: string;
-      title: string;
-      created_at: string;
-      release?: boolean;
-      alias?: string;
-    }>
-  >({
-    queryKey: ['canvasVersionList', canvasId],
-    initialData: [],
+  } = useQuery({
+    queryKey: AgentKeys.canvasVersionList(canvasId),
     gcTime: 0,
     enabled: !!canvasId,
-    queryFn: async () => {
+    queryFn: async (): Promise<ICanvasVersionRow[]> => {
       if (!canvasId) return [];
       const { data } = await agentService.fetchVersionList(canvasId);
       return data?.data ?? [];
@@ -857,15 +845,15 @@ export const useDeleteVersion = () => {
       return data?.code === 0;
     },
     onSuccess: (_result, variables) => {
-      // Invalidate both version-list caches so the deleted version disappears
-      // without a manual refresh: the version dialog reads
-      // AgentKeys.versionList (canvas id from route params) and the document
-      // pipeline dialog reads the canvasVersionList key.
+      // Refresh version history, document status, and the parser catalog.
       queryClient.invalidateQueries({
         queryKey: AgentKeys.versionList(variables.canvasId),
       });
       queryClient.invalidateQueries({
-        queryKey: ['canvasVersionList', variables.canvasId],
+        queryKey: AgentKeys.canvasVersionList(variables.canvasId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: PipelineVersionKeys.catalog(),
       });
     },
   });
@@ -896,6 +884,9 @@ export const useApplyVersion = () => {
         queryKey: AgentKeys.versionList(canvasId),
       });
       queryClient.invalidateQueries({ queryKey: AgentKeys.detail(canvasId) });
+      queryClient.invalidateQueries({
+        queryKey: PipelineVersionKeys.catalog(),
+      });
     },
   });
 
@@ -929,13 +920,44 @@ export const useUpdateVersion = () => {
         queryKey: AgentKeys.versionList(variables.canvasId),
       });
       queryClient.invalidateQueries({
-        queryKey: ['canvasVersionList', variables.canvasId],
+        queryKey: AgentKeys.canvasVersionList(variables.canvasId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: PipelineVersionKeys.catalog(),
       });
     },
   });
 
   return { loading, isError, updateVersion: mutateAsync };
 };
+
+// Shared query options for a single canvas version's detail (IFlow, dsl
+// included). Both useFetchVersion (canvas version dialog) and
+// useFetchPipelineDslByPipelineId (operator tabs) must cache the same shape
+// under AgentKeys.version so they can share the entry safely.
+const canvasVersionQuery = (agentId?: string, versionId?: string) => ({
+  queryKey: AgentKeys.version(agentId, versionId),
+  gcTime: 0,
+  // A pruned version never recovers on retry, and each attempt would
+  // re-fire the error path.
+  retry: false,
+  queryFn: async (): Promise<IFlow | undefined> => {
+    if (!agentId || !versionId) return undefined;
+
+    // Consumers render their own error/empty state, so suppress the global
+    // notification whose "no permission" wording misleads here.
+    const { data } = await agentService.fetchVersion(
+      { agentId, versionId, skipGlobalErrorNotification: true },
+      true,
+    );
+
+    if (data?.code !== 0) {
+      throw new Error(data?.message);
+    }
+
+    return data?.data ?? undefined;
+  },
+});
 
 export const useFetchVersion = (
   version_id?: string,
@@ -950,33 +972,8 @@ export const useFetchVersion = (
     isFetching: loading,
     isError,
   } = useQuery({
-    queryKey: AgentKeys.version(id, version_id),
-    initialData: undefined,
-    gcTime: 0,
-    // A pruned version never recovers on retry, and each attempt would
-    // re-fire the global error notification.
-    retry: false,
+    ...canvasVersionQuery(id, version_id),
     enabled: !!id && !!version_id,
-    queryFn: async () => {
-      if (!id || !version_id) return undefined;
-
-      // The dialog renders its own error state, so suppress the global
-      // notification whose "no permission" wording misleads here.
-      const { data } = await agentService.fetchVersion(
-        {
-          agentId: id,
-          versionId: version_id,
-          skipGlobalErrorNotification: true,
-        },
-        true,
-      );
-
-      if (data?.code !== 0) {
-        throw new Error(data?.message);
-      }
-
-      return data?.data ?? undefined;
-    },
   });
 
   return { data, loading, isError };
@@ -995,6 +992,7 @@ export const useFetchAgentLog = (searchParams: IAgentLogsRequest) => {
     queryFn: async () => {
       const { data } = await fetchAgentLogsByCanvasId(id as string, {
         ...searchParams,
+        include_reference: true,
       });
 
       return { total: data?.total ?? 0, sessions: data?.data ?? [] };
@@ -1004,35 +1002,41 @@ export const useFetchAgentLog = (searchParams: IAgentLogsRequest) => {
   return { data, loading, refetch };
 };
 
+export const AgentSessionKeys = {
+  all: [AgentApiAction.FetchSessionsByCanvasId] as const,
+  list: (
+    canvasId?: string,
+    tenantId?: string,
+    operatorPermission?: Permission,
+  ) =>
+    [...AgentSessionKeys.all, canvasId, tenantId, operatorPermission] as const,
+};
+
 export const useFetchSessionsByCanvasId = () => {
   const { id: canvasId } = useParams();
   const { data: tenantInfo } = useFetchTenantInfo();
+  const { data: agentDetail } = useFetchAgent();
+  const operatorPermission = agentDetail?.operator_permission;
 
-  const { data, isFetching: loading } = useQuery<IAgentLogsResponse>({
-    queryKey: [AgentApiAction.FetchSessionsByCanvasId, canvasId],
-    initialData: { total: 0, sessions: [] } as IAgentLogsResponse,
-    gcTime: 0,
-    enabled: !!canvasId && !isEmpty(tenantInfo),
-    queryFn: async () => {
-      if (!canvasId) {
-        return { total: 0, sessions: [] };
-      }
-
-      const { data } = await fetchAgentLogsByCanvasId(canvasId, {
-        page: 1,
-        page_size: 100,
-        exp_user_id: tenantInfo.tenant_id,
+  return useSessionList<IAgentLogResponse>({
+    queryKey: AgentSessionKeys.list(
+      canvasId,
+      tenantInfo.tenant_id,
+      operatorPermission,
+    ),
+    enabled:
+      !!canvasId && !isEmpty(tenantInfo) && operatorPermission !== undefined,
+    fetchPage: async (params) => {
+      const shouldListAllSessions = operatorPermission !== Permission.Read;
+      const { data } = await fetchAgentLogsByCanvasId(canvasId!, {
+        ...params,
+        include_history: false,
+        ...(shouldListAllSessions ? {} : { exp_user_id: tenantInfo.tenant_id }),
       });
 
-      return { total: data?.total ?? 0, sessions: data?.data ?? [] };
+      return { total: data?.total ?? 0, items: data?.data ?? [] };
     },
   });
-
-  return {
-    data: data?.sessions ?? [],
-    loading,
-    total: data?.total ?? 0,
-  };
 };
 
 export const useFetchExternalAgentInputs = () => {
@@ -1189,7 +1193,7 @@ export const useCancelDataflow = () => {
       if (ret?.data?.code === 0) {
         message.success('success');
       } else {
-        message.error(ret?.data?.data);
+        message.error(ret?.data?.message);
       }
       return ret?.data?.code;
     },
@@ -1382,7 +1386,7 @@ export function useCreateAgentSession() {
 
       if (data.code === 0) {
         queryClient.invalidateQueries({
-          queryKey: [AgentApiAction.FetchSessionsByCanvasId],
+          queryKey: AgentSessionKeys.all,
         });
         return data.data;
       }
@@ -1414,7 +1418,7 @@ export function useDeleteAgentSession() {
 
       if (data.code === 0) {
         queryClient.invalidateQueries({
-          queryKey: [AgentApiAction.FetchSessionsByCanvasId],
+          queryKey: AgentSessionKeys.all,
         });
       }
 
@@ -1439,7 +1443,10 @@ export function useFetchSessionManually() {
         return null;
       }
 
-      const { data } = await fetchAgentLogsById(canvasId, sessionId);
+      const { data } = await fetchAgentLogsById(canvasId, sessionId, {
+        include_reference: true,
+        include_prompt: true,
+      });
 
       return data?.data;
     },
@@ -1464,25 +1471,32 @@ export const useExportAgentLog = () => {
   return { exportLogs: mutateAsync, loading };
 };
 
+// useFetchPipelineDslByPipelineId loads the DSL that backs the pipeline
+// operator tabs. Builtin pipelines have no version concept and are fetched
+// directly; a dataflow pipeline is versioned, so its DSL comes from the
+// selected canvas version — without a version id nothing is fetched and the
+// tabs stay hidden.
 export const useFetchPipelineDslByPipelineId = (
   pipelineId?: string,
+  versionId?: string,
   isBuiltin = false,
 ) => {
-  const { data: dsl, isFetching: loading } = useQuery({
-    queryKey: isBuiltin
-      ? BuiltinPipelineKeys.detail(pipelineId!)
-      : [AgentApiAction.FetchPipelineNodes, pipelineId],
-    initialData: {},
+  const { data: builtinDsl, isFetching: builtinLoading } = useQuery({
+    queryKey: BuiltinPipelineKeys.detail(pipelineId!),
     gcTime: 0,
-    enabled: !!pipelineId,
-    queryFn: async () => {
-      const { data } = isBuiltin
-        ? await agentService.getBuiltinPipeline(pipelineId!)
-        : await agentService.getAgent(pipelineId!);
-      const flow = data?.data;
-      return flow?.dsl ?? {};
+    enabled: isBuiltin && !!pipelineId,
+    queryFn: async (): Promise<DSL | undefined> => {
+      const { data } = await agentService.getBuiltinPipeline(pipelineId!);
+      return data?.data?.dsl;
     },
   });
+  const { data: version, isFetching: versionLoading } = useQuery({
+    ...canvasVersionQuery(pipelineId, versionId),
+    enabled: !isBuiltin && !!pipelineId && !!versionId,
+  });
 
-  return { dsl, loading };
+  return {
+    dsl: isBuiltin ? builtinDsl : version?.dsl,
+    loading: isBuiltin ? builtinLoading : versionLoading,
+  };
 };

@@ -21,6 +21,7 @@ import "encoding/json"
 // Chat chat model (mapped to dialog table)
 type Chat struct {
 	ID       string `gorm:"column:id;primaryKey;size:32" json:"id"`
+	UserID   string `gorm:"column:user_id;size:32;not null;default:'';index" json:"user_id"`
 	TenantID string `gorm:"column:tenant_id;size:32;not null;index" json:"tenant_id"`
 	// AgentID links this thread to the harness agent that runs it. Empty means a
 	// plain chat: the pipeline owns the turn, and there is no agent record at
@@ -76,15 +77,14 @@ type ChatListItem struct {
 	TenantAvatar *string `gorm:"column:tenant_avatar" json:"tenant_avatar,omitempty"`
 }
 
-// ChatSession chat session model. Message and Reference are hydrated from
-// their ordered child tables.
+// ChatSession chat session model. Messages are hydrated from
+// the ordered message table.
 type ChatSession struct {
-	ID        string          `gorm:"column:id;primaryKey;size:32" json:"id"`
-	DialogID  string          `gorm:"column:dialog_id;size:32;not null;index" json:"dialog_id"`
-	Name      *string         `gorm:"column:name;size:255;index" json:"name,omitempty"`
-	Message   json.RawMessage `gorm:"-" json:"message,omitempty"`
-	Reference json.RawMessage `gorm:"-" json:"reference"`
-	UserID    *string         `gorm:"column:user_id;size:255;index" json:"user_id,omitempty"`
+	ID       string          `gorm:"column:id;primaryKey;size:32" json:"id"`
+	DialogID string          `gorm:"column:dialog_id;size:32;not null;index" json:"dialog_id"`
+	Name     *string         `gorm:"column:name;size:255;index" json:"name,omitempty"`
+	Message  json.RawMessage `gorm:"-" json:"message,omitempty"`
+	UserID   *string         `gorm:"column:user_id;size:255;index" json:"user_id,omitempty"`
 	BaseModel
 }
 

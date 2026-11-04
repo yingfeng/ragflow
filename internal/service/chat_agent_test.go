@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -92,8 +91,9 @@ func TestBuildCreateAgentDefinition(t *testing.T) {
 func TestCreateChatWithAgentCreatesThreadAndAgent(t *testing.T) {
 	db := setupChatAgentServiceTestDB(t)
 	svc := NewChatService()
+	ctx := serviceTestContext(t, "tenant-1", "tenant-1")
 
-	result, code, err := svc.Create(context.Background(), "tenant-1", map[string]interface{}{
+	result, code, err := svc.Create(ctx, map[string]interface{}{
 		"name":  "research buddy",
 		"agent": map[string]interface{}{"policy": map[string]interface{}{"approval": "ask"}},
 	})
@@ -141,8 +141,9 @@ func TestCreateChatWithAgentCreatesThreadAndAgent(t *testing.T) {
 func TestCreatePlainChatLeavesNoAgent(t *testing.T) {
 	db := setupChatAgentServiceTestDB(t)
 	svc := NewChatService()
+	ctx := serviceTestContext(t, "tenant-1", "tenant-1")
 
-	result, _, err := svc.Create(context.Background(), "tenant-1", map[string]interface{}{"name": "plain"})
+	result, _, err := svc.Create(ctx, map[string]interface{}{"name": "plain"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -162,8 +163,9 @@ func TestCreatePlainChatLeavesNoAgent(t *testing.T) {
 func TestCreateChatWithInvalidAgentCreatesNothing(t *testing.T) {
 	db := setupChatAgentServiceTestDB(t)
 	svc := NewChatService()
+	ctx := serviceTestContext(t, "tenant-1", "tenant-1")
 
-	_, _, err := svc.Create(context.Background(), "tenant-1", map[string]interface{}{
+	_, _, err := svc.Create(ctx, map[string]interface{}{
 		"name":  "bad agent",
 		"agent": map[string]interface{}{"policy": map[string]interface{}{"approval": "whenever"}},
 	})
@@ -194,8 +196,9 @@ func TestCreateChatWithAgentSuffixesTakenName(t *testing.T) {
 		t.Fatalf("seed agent: %v", err)
 	}
 	svc := NewChatService()
+	ctx := serviceTestContext(t, "tenant-1", "tenant-1")
 
-	result, _, err := svc.Create(context.Background(), "tenant-1", map[string]interface{}{
+	result, _, err := svc.Create(ctx, map[string]interface{}{
 		"name":  "research buddy",
 		"agent": map[string]interface{}{},
 	})

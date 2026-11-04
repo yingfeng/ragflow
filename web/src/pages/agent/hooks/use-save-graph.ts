@@ -7,11 +7,13 @@ import {
   useResetAgent,
   useSaveAgent,
 } from '@/hooks/use-agent-request';
+import { useFetchCanvasPresence } from '@/ee/hooks/use-agent-presence';
 import {
   GlobalVariableType,
   RAGFlowNodeType,
 } from '@/interfaces/database/agent';
 import { formatDate } from '@/utils/date';
+import { canEditAgent } from '@/ee/pages/agent/can-edit-agent';
 import i18n from '@/locales/config';
 import { useDebounceEffect } from 'ahooks';
 import { useCallback, useEffect, useState } from 'react';
@@ -38,6 +40,7 @@ export const useSaveGraph = (
       },
       release?: boolean,
       autosave?: boolean,
+      alias?: string,
     ) => {
       if (!id) {
         return;
@@ -52,11 +55,15 @@ export const useSaveGraph = (
       if (release) {
         params.release = 'true';
       }
-      // Design §5.1: the debounced auto-save path passes autosave:true so the
-      // backend refreshes only the live draft and never mints a new version.
-      // An explicit (manual) Save omits this flag.
+      // Both the debounced auto-save and the explicit Save button pass
+      // autosave:true so the backend refreshes only the live draft and never
+      // mints a new version. Only publishing (release) writes a version row,
+      // optionally carrying an alias into user_canvas_version.
       if (autosave) {
         params.autosave = true;
+      }
+      if (alias) {
+        params.alias = alias;
       }
 
       return saveAgent(params);
@@ -105,7 +112,7 @@ export const useSaveGraphBeforeOpeningDebugDrawer = (show: () => void) => {
         );
         return;
       }
-      const saveRet = await saveGraph(nextNodes);
+      const saveRet = await saveGraph(nextNodes, undefined, undefined, true);
       if (saveRet?.code === 0) {
         // Call the reset api before opening the run drawer each time
         const resetRet = await resetAgent();
@@ -156,6 +163,7 @@ export const useWatchAgentChange = (chatDrawerVisible: boolean) => {
   const edges = useGraphStore((state) => state.edges);
   const { saveGraph } = useSaveGraph(false, true);
   const { data: flowDetail } = useFetchAgent();
+  const { data: presence } = useFetchCanvasPresence();
 
   const setSaveTime = useCallback((updateTime: number) => {
     setTime(formatDate(updateTime));
@@ -173,7 +181,8 @@ export const useWatchAgentChange = (chatDrawerVisible: boolean) => {
         agentLoaded: Boolean(flowDetail?.id),
         nodeCount: nodes.length,
         edgeCount: edges.length,
-      })
+      }) ||
+      !canEditAgent(presence.operator_permission ?? 0)
     ) {
       return;
     }
@@ -189,6 +198,7 @@ export const useWatchAgentChange = (chatDrawerVisible: boolean) => {
     nodes.length,
     saveGraph,
     setSaveTime,
+    presence.operator_permission,
   ]);
 
   useDebounceEffect(

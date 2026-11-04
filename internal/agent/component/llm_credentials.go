@@ -28,7 +28,7 @@ func resolveTenantLLMConfig(ctx context.Context, db *gorm.DB, driver, modelID, a
 		common.Debug("llm credentials: no canvas state in ctx")
 		return apiKey, baseURL
 	}
-	tid, _ := state.Sys["tenant_id"].(string)
+	tid, _ := state.GetSysString("tenant_id")
 	if tid == "" {
 		common.Debug("llm credentials: state.Sys has no tenant_id")
 		return apiKey, baseURL
@@ -123,7 +123,13 @@ func resolveTenantModelInstanceCredentials(ctx context.Context, db *gorm.DB, tid
 		zap.String("model", modelName),
 		zap.String("instance", instanceName))
 
-	provider, err := dao.NewTenantModelProviderDAO().GetByTenantIDAndProviderName(ctx, db, tid, providerName)
+	owner, ownerErr := dao.NewUserTenantDAO().GetOwnerByTenantID(ctx, db, tid)
+	if ownerErr != nil {
+		common.Debug("llm credentials: new-table fallback: tenant owner lookup failed", zap.String("tenant", tid), zap.Error(ownerErr))
+		return "", baseURL, false
+	}
+	ownerUserID := owner.UserID
+	provider, err := dao.NewTenantModelProviderDAO().GetByTenantIDAndUserIDAndProviderName(ctx, db, tid, ownerUserID, providerName)
 	if err != nil || provider == nil {
 		common.Debug("llm credentials: new-table fallback: provider not found", zap.String("provider", providerName), zap.Error(err))
 		return "", baseURL, false
@@ -197,7 +203,7 @@ func resolveTenantModelByID(ctx context.Context, db *gorm.DB, modelRef, apiKey, 
 	if err != nil || state == nil {
 		return "", "", apiKey, baseURL, false, nil
 	}
-	tid, _ := state.Sys["tenant_id"].(string)
+	tid, _ := state.GetSysString("tenant_id")
 	if tid == "" {
 		return "", "", apiKey, baseURL, false, nil
 	}
